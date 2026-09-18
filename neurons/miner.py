@@ -43,10 +43,10 @@ class ChipForgeMiner:
     
     def __init__(self, config):
         self.config = config
-        self.wallet = bt.wallet(config=config)
-        self.subtensor = bt.subtensor(config=config)
+        self.wallet = bt.Wallet(config=config)
+        self.subtensor = bt.Subtensor(config=config)
         self.metagraph = self.subtensor.metagraph(config.netuid)
-        self.axon = bt.axon(wallet=self.wallet, config=config)
+        self.axon = bt.Axon(wallet=self.wallet, config=config)
         
         # Challenge storage
         self.challenge_dir = Path('./downloaded_active_challenge')
@@ -374,13 +374,19 @@ class ChipForgeMiner:
 def get_config():
     """Get miner configuration"""
     
+    # bittensor>=10 ships with CLI parsing disabled by default
+    # (BT_NO_PARSE_CLI_ARGS defaults to "true"), in which case bt.Config(parser)
+    # silently returns only defaults (wallet "default", netuid None, ...).
+    # Opt back in unless the operator has explicitly overridden it.
+    os.environ.setdefault("BT_NO_PARSE_CLI_ARGS", "false")
+
     parser = argparse.ArgumentParser(description="ChipForge Subnet Miner")
     
     # Add bittensor arguments
-    bt.wallet.add_args(parser)
-    bt.subtensor.add_args(parser)
+    bt.Wallet.add_args(parser)
+    bt.Subtensor.add_args(parser)
     bt.logging.add_args(parser)
-    bt.axon.add_args(parser)
+    bt.Axon.add_args(parser)
     
     parser.add_argument("--netuid", type=int, required=True,
                        help="Subnet netuid")
@@ -388,7 +394,7 @@ def get_config():
                        default="http://localhost:8000",
                        help="Challenge server API URL")
     
-    config = bt.config(parser)
+    config = bt.Config(parser)
     
     return config
 

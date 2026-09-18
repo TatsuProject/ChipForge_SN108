@@ -32,7 +32,7 @@ class SolutionSubmitter:
     
     def __init__(self, config):
         self.config = config
-        self.wallet = bt.wallet(config=config)
+        self.wallet = bt.Wallet(config=config)
         self.api_url = config.api_url
         
         # Load private key for signatures
