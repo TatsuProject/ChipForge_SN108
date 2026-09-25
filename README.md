@@ -49,7 +49,7 @@ https://docs.learnbittensor.org/btcli
 
 ```bash
 # Clone the repository
-git clone https://github.com/TatsuProject/ChipForge_SN84
+git clone https://github.com/TatsuProject/ChipForge_SN108
 cd chipforge-subnet
 
 # Create an isolated environment (Python 3.12 recommended)
