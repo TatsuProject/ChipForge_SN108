@@ -52,9 +52,35 @@ https://docs.learnbittensor.org/btcli
 git clone https://github.com/TatsuProject/ChipForge_SN108
 cd chipforge-subnet
 
-# Install dependencies
+# Create an isolated environment (Python 3.12 recommended)
+conda create -n chipforge-subnet python=3.12
+conda activate chipforge-subnet
+
+# Install dependencies (Bittensor 10.x classic SDK)
 pip install -r requirements.txt
 pip install -e .
+```
+
+`requirements.txt` lists the direct dependencies and pins the Bittensor stack
+(`bittensor==10.5.0`, `bittensor-wallet==4.1.0`, `bittensor-cli==9.23.2`,
+`async-substrate-interface==2.2.1`). `requirements-lock.txt` is the exact
+resolved set the test-suite was last run against, if you need a reproducible
+install:
+
+```bash
+pip install -r requirements-lock.txt
+```
+
+> Bittensor 11 removed the `axon`/`dendrite`/`Synapse` networking layer that
+> the miner and validator use, so this repo intentionally stays on the 10.x
+> line.
+
+#### Running the tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest                                   # unit + loopback transport tests
+CHIPFORGE_LIVE_TESTS=1 pytest -m live    # optional: hits testnet (netuid 440 by default)
 ```
 
 #### Running a Miner

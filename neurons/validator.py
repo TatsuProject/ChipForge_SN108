@@ -7,6 +7,7 @@ Main validator entry point with modular architecture
 import bittensor as bt
 from chipforge.protocol import SimpleMessage
 
+import os
 import asyncio
 import aiohttp
 import logging
@@ -99,10 +100,10 @@ class ChipForgeValidator:
     
     def __init__(self, config):
         self.config = config
-        self.wallet = bt.wallet(config=config)
-        self.subtensor = bt.subtensor(config=config)
+        self.wallet = bt.Wallet(config=config)
+        self.subtensor = bt.Subtensor(config=config)
         self.metagraph = self.subtensor.metagraph(config.netuid)
-        self.dendrite = bt.dendrite(wallet=self.wallet)
+        self.dendrite = bt.Dendrite(wallet=self.wallet)
         
         # Initialize components
         self.state = ValidatorState()
@@ -800,13 +801,19 @@ class ChipForgeValidator:
 
 def get_config():
     """Get validator configuration"""
+    # bittensor>=10 ships with CLI parsing disabled by default
+    # (BT_NO_PARSE_CLI_ARGS defaults to "true"), in which case bt.Config(parser)
+    # silently returns only defaults (wallet "default", netuid None, ...).
+    # Opt back in unless the operator has explicitly overridden it.
+    os.environ.setdefault("BT_NO_PARSE_CLI_ARGS", "false")
+
     parser = argparse.ArgumentParser(description="ChipForge Subnet Validator")
     
     # Add bittensor arguments
-    bt.wallet.add_args(parser)
-    bt.subtensor.add_args(parser)
+    bt.Wallet.add_args(parser)
+    bt.Subtensor.add_args(parser)
     bt.logging.add_args(parser)
-    bt.axon.add_args(parser)
+    bt.Axon.add_args(parser)
     
     # Add custom arguments
     parser.add_argument("--challenge_api_url", type=str, default="http://localhost:8000",
@@ -819,7 +826,7 @@ def get_config():
                        help="Percentage of emissions given to the winner miner (0-100). Remainder is burned. Default: 10")
 
     # Parse arguments and create config
-    config = bt.config(parser)  # Pass parser, not args
+    config = bt.Config(parser)  # Pass parser, not args
     
     return config
 

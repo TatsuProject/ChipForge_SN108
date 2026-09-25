@@ -31,6 +31,10 @@ def read_requirements(path):
         processed_requirements = []
 
         for req in requirements:
+            req = req.strip()
+            # Skip blank lines and comments
+            if not req or req.startswith("#"):
+                continue
             # For git or other VCS links
             if req.startswith("git+") or "@" in req:
                 pkg_name = re.search(r"(#egg=)([\w\-_]+)", req)
@@ -72,7 +76,7 @@ setup(
     include_package_data=True,
     author_email="contact@chipforge.subnet",
     license="MIT",
-    python_requires=">=3.8",
+    python_requires=">=3.9",
     install_requires=requirements,
     classifiers=[
         "Development Status :: 4 - Beta",
@@ -83,10 +87,10 @@ setup(
         "Topic :: System :: Hardware",
         "License :: OSI Approved :: MIT License",
         "Programming Language :: Python :: 3 :: Only",
-        "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
         "Topic :: Scientific/Engineering",
         "Topic :: Scientific/Engineering :: Mathematics",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
