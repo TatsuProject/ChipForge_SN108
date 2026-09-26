@@ -116,7 +116,7 @@ class BatchProcessor:
             # CRITICAL: Fetch FRESH baseline BEFORE evaluation (it may have changed since last check)
             logger.info(f"Fetching fresh baseline score for challenge {challenge_id} before evaluation")
             try:
-                challenge_info = await self.api_client.get_challenge_info(challenge_id)
+                challenge_info = await self.api_client.get_challenge_info(challenge_id, fresh=True)
                 if challenge_info and 'winner_baseline_score' in challenge_info:
                     fresh_baseline = challenge_info['winner_baseline_score']
                     if self.state.winner_baseline_score != fresh_baseline:

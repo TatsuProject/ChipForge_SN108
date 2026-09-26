@@ -105,3 +105,50 @@ Owner decisions this branch follows:
 ### B.6 EDA server: no API key (companion change in `chipforge_eda_server`, branch `remove-api-key`)
 - The gateway no longer checks `EDA_API_KEY`/`X-API-Key` (owner decision), and it gains `GET /health` for the pre-flight check. The validator never sent a key, so nothing changes on the client.
 - **Operator note:** the gateway runs the uploaded evaluator's `run.py` as root. **Allow port 8080 only from your validator** (security group or firewall), or bind `127.0.0.1:8080` when co-located.
+
+---
+
+## Phase C: challenge-server integration
+
+### C.1 One signing helper, v2 request-bound signatures (v1 kept for older servers)
+- **Problem:**
+  - The signing, parameter and header setup was copied into 6 functions, and the retry loop into 3.
+  - v1 signatures cover only `hotkey + timestamp`, travel in the URL, and could be replayed for 10 minutes on any endpoint.
+  - Signatures, messages and full form data were logged at INFO.
+- **Fix/Now:**
+  - Every challenge-server call goes through `_auth()` + `_signed()`: a fresh signature and nonce per attempt, and retries on network errors / 5xx only (not on 404/409).
+  - `SIGNATURE_MODE=both` (default) sends v1 query params **and** v2 headers:
+    - servers with v2 (challenge server `improvements/v2`) verify v2 (method, path, body digest, single-use nonce)
+    - older servers ignore the headers and verify v1
+  - Set `SIGNATURE_MODE=v2` once every server you use has v2; signatures then leave the URL entirely.
+  - No signatures or secrets in logs; form data only at DEBUG.
+- **Verified:** against the real server sandbox in `both` and `v2` modes: sync, batch, hash-verified downloads, test cases and signed `submit_score` (3/3).
+- **Changes existing flow?** No: works with the current production server unchanged.
+
+### C.2 `/validator/sync` with automatic fallback
+- **Problem:** each loop called `/challenges/active` twice, `/batch/current` every ~12 s, `/info` every ~60 s and bans every 10 min, about 700 requests per hour while idle.
+- **Fix/Now:**
+  - `get_active_challenge`, `get_challenge_info`, `get_current_batch` and `get_banned_coldkeys` keep their return shapes, so the validator loop is unchanged.
+  - When the server offers `/validator/sync`, all of them are answered from one cached call, revalidated with `ETag` (304) and refreshed per the server's `next_poll_seconds` (5–60 s).
+  - Older servers answer 404. The client then uses the individual endpoints, and re-checks for sync hourly.
+  - Right before evaluating, the baseline is fetched fresh (bypassing the cache).
+- **Changes existing flow?** Far fewer requests; same data.
+
+### C.3 Test cases re-downloaded only when they change
+- **Problem:** while the server's `download_new_testcases` flag was set (55-minute TTL), the zip was downloaded again every ~60 s, about 55 times.
+- **Fix/Now:**
+  - With sync, test cases are downloaded only when their version (the S3 ETag) changes. The version is stored next to the zip.
+  - On older servers, the flag triggers at most one download per 10 minutes.
+  - The zip is written atomically.
+- **Changes existing flow?** No.
+
+### C.4 Secrets and URLs from `.env`, not the command line
+- **Problem:** `--validator_secret_key` was required on the command line, visible to any user via `ps`, and the API URL defaulted to `http://localhost:8000`.
+- **Fix/Now:**
+  - `VALIDATOR_SECRET_KEY` and `CHALLENGE_API_URL` are read from the environment/`.env` (the flags still work and win).
+  - The default URL is `https://api.chipforge.io`.
+  - `start_validator.sh` no longer passes the secret.
+- **Changes existing flow?** No: `.env` already had both values.
+
+### C.5 Server values bounded
+- A `winner_reward_hours` above `MAX_WINNER_REWARD_HOURS` (default 720) is ignored in favour of the local value.

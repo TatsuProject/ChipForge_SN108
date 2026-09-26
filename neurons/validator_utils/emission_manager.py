@@ -63,7 +63,8 @@ class EmissionManager:
         Args:
             winner_reward_hours: Hours from challenge server, or None if not available
         """
-        if winner_reward_hours is not None and winner_reward_hours > 0:
+        max_hours = float(os.getenv('MAX_WINNER_REWARD_HOURS', '720'))
+        if winner_reward_hours is not None and 0 < winner_reward_hours <= max_hours:
             if self.total_hours_for_winner_reward != winner_reward_hours:
                 logger.info(f"Updating winner reward hours: {self.total_hours_for_winner_reward}h → {winner_reward_hours}h (from challenge server)")
                 self.total_hours_for_winner_reward = winner_reward_hours

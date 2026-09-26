@@ -866,10 +866,13 @@ def get_config():
     bt.Axon.add_args(parser)
     
     # Add custom arguments
-    parser.add_argument("--challenge_api_url", type=str, default="http://localhost:8000",
-                       help="Challenge server API URL")
-    parser.add_argument("--validator_secret_key", type=str, required=True,
-                       help="Validator secret key for API authentication")
+    parser.add_argument("--challenge_api_url", type=str,
+                       default=os.getenv("CHALLENGE_API_URL", "https://api.chipforge.io"),
+                       help="Challenge server API URL (default: CHALLENGE_API_URL env or https://api.chipforge.io)")
+    # Prefer VALIDATOR_SECRET_KEY in .env: command-line arguments are visible to every user via `ps`
+    parser.add_argument("--validator_secret_key", type=str, default=os.getenv("VALIDATOR_SECRET_KEY"),
+                       required=not os.getenv("VALIDATOR_SECRET_KEY"),
+                       help="Validator API key for the challenge server (default: VALIDATOR_SECRET_KEY env)")
     parser.add_argument("--netuid", type=int, required=True,
                        help="Subnet netuid")
     parser.add_argument("--miner_emission_percentage", type=float,

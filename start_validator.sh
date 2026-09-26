@@ -12,5 +12,4 @@ python neurons/validator.py \
     --wallet.name $WALLET_NAME \
     --wallet.hotkey $VALIDATOR_HOTKEY \
     --challenge_api_url $CHALLENGE_API_URL \
-    --validator_secret_key $VALIDATOR_SECRET_KEY \
     --logging.debug
