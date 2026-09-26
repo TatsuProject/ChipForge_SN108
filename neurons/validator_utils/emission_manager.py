@@ -5,13 +5,15 @@ Emission Manager for ChipForge Validator
 Handles emission phases based on challenge lifecycle
 """
 
-import json
 import os
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple
 from dotenv import load_dotenv
 load_dotenv()
+
+from .storage import atomic_write_json, data_path, load_json
+
 logger = logging.getLogger(__name__)
 
 
@@ -83,34 +85,33 @@ class EmissionManager:
     def load_state(self):
         """Load emission state from file"""
         try:
-            if os.path.exists('emission_state.json'):
-                with open('emission_state.json', 'r') as f:
-                    data = json.load(f)
-                    self.subnet_start_time = data.get('subnet_start_time')
-                    self.first_challenge_end_time = data.get('first_challenge_end_time')
-                    self.winner_reward_start_time = data.get('winner_reward_start_time')
-                    self.current_phase = data.get('current_phase', 'initial_burn')
-                    self.current_winner = data.get('current_winner')
-                    self.current_winner_score = data.get('current_winner_score', 0.0)
-                    self.winner_qualified_baseline = data.get('winner_qualified_baseline', 0.0)
-                    self.last_challenge_end_time = data.get('last_challenge_end_time')
+            data = load_json(data_path('emission_state.json'))
+            if data is not None:
+                self.subnet_start_time = data.get('subnet_start_time')
+                self.first_challenge_end_time = data.get('first_challenge_end_time')
+                self.winner_reward_start_time = data.get('winner_reward_start_time')
+                self.current_phase = data.get('current_phase', 'initial_burn')
+                self.current_winner = data.get('current_winner')
+                self.current_winner_score = data.get('current_winner_score', 0.0)
+                self.winner_qualified_baseline = data.get('winner_qualified_baseline', 0.0)
+                self.last_challenge_end_time = data.get('last_challenge_end_time')
                     
-                    # Restore winner reward hours if saved
-                    saved_hours = data.get('total_hours_for_winner_reward')
-                    if saved_hours is not None:
-                        self.total_hours_for_winner_reward = saved_hours
-                        self.initial_burn_days = self.total_hours_for_winner_reward / 24
-                        self.winner_reward_days = self.total_hours_for_winner_reward / 24
+                # Restore winner reward hours if saved
+                saved_hours = data.get('total_hours_for_winner_reward')
+                if saved_hours is not None:
+                    self.total_hours_for_winner_reward = saved_hours
+                    self.initial_burn_days = self.total_hours_for_winner_reward / 24
+                    self.winner_reward_days = self.total_hours_for_winner_reward / 24
                     
-                    # Convert ISO strings back to datetime objects
-                    if self.subnet_start_time:
-                        self.subnet_start_time = datetime.fromisoformat(self.subnet_start_time)
-                    if self.first_challenge_end_time:
-                        self.first_challenge_end_time = datetime.fromisoformat(self.first_challenge_end_time)
-                    if self.winner_reward_start_time:
-                        self.winner_reward_start_time = datetime.fromisoformat(self.winner_reward_start_time)
-                    if self.last_challenge_end_time:
-                        self.last_challenge_end_time = datetime.fromisoformat(self.last_challenge_end_time)
+                # Convert ISO strings back to datetime objects
+                if self.subnet_start_time:
+                    self.subnet_start_time = datetime.fromisoformat(self.subnet_start_time)
+                if self.first_challenge_end_time:
+                    self.first_challenge_end_time = datetime.fromisoformat(self.first_challenge_end_time)
+                if self.winner_reward_start_time:
+                    self.winner_reward_start_time = datetime.fromisoformat(self.winner_reward_start_time)
+                if self.last_challenge_end_time:
+                    self.last_challenge_end_time = datetime.fromisoformat(self.last_challenge_end_time)
                         
                 logger.info(f"Loaded emission state: phase={self.current_phase}, winner={self.current_winner[:12] + '...' if self.current_winner else 'None'}, score={self.current_winner_score}, qualified_baseline={self.winner_qualified_baseline}, reward_hours={self.total_hours_for_winner_reward}h")
         except Exception as e:
@@ -131,8 +132,7 @@ class EmissionManager:
                 'total_hours_for_winner_reward': self.total_hours_for_winner_reward,
                 'updated_at': datetime.now(timezone.utc).isoformat()
             }
-            with open('emission_state.json', 'w') as f:
-                json.dump(data, f, indent=2)
+            atomic_write_json(data_path('emission_state.json'), data)
         except Exception as e:
             logger.error(f"Error saving emission state: {e}")
     

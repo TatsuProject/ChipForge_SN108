@@ -1,25 +1,81 @@
 #!/usr/bin/env python3
 """
 Weight Manager for ChipForge Validator
-Handles weight setting and subnet interactions
+
+Every weight decision goes through two steps:
+
+  1. The validator picks a *target*: burn, or reward winner X (WeightTarget).
+  2. apply() turns the target into chain weights with ONE policy (build()):
+       - winner gets `miner_emission_percentage`, the rest goes to the burn UID
+       - burn when emissions are banned, the winner's coldkey is banned, or the
+         winner is no longer registered
+     and submits them only when they changed, or when a periodic refresh is due
+     (so the validator stays active on chain), and only when the chain's weights
+     rate limit allows it. A changed target that is rate limited stays pending and
+     is submitted as soon as the window reopens.
+
+The chain call runs in a worker thread so it never blocks the validator's event loop,
+and success is read from ExtrinsicResponse.success (the response object itself is
+always truthy).
 """
 
+import asyncio
 import logging
-import torch
-from typing import Dict, List, Optional, Set
-from dotenv import load_dotenv
-load_dotenv()
+import time
+from dataclasses import dataclass
+from typing import List, Optional, Set, Tuple
+
 logger = logging.getLogger(__name__)
+
+BURN_UID = 0
+
+
+@dataclass(frozen=True)
+class WeightTarget:
+    """What the validator wants to reward right now."""
+    winner_hotkey: Optional[str] = None   # None = burn
+    reason: str = ""
+
+    @classmethod
+    def burn(cls, reason: str = "") -> "WeightTarget":
+        return cls(None, reason)
+
+    @classmethod
+    def winner(cls, hotkey: str, reason: str = "") -> "WeightTarget":
+        return cls(hotkey, reason)
+
+
+def response_succeeded(response) -> bool:
+    """bittensor>=10 returns ExtrinsicResponse, which is always truthy (it defines
+    __len__ == 2). Read .success; accept plain bools / (success, msg) tuples too."""
+    if response is None:
+        return False
+    if hasattr(response, "success"):
+        return bool(response.success)
+    if isinstance(response, tuple) and response:
+        return bool(response[0])
+    return bool(response)
 
 
 class WeightManager:
-    """Manages weight setting on the blockchain"""
+    """Builds and submits weights on the blockchain"""
 
-    def __init__(self, wallet, subtensor, metagraph, config):
+    def __init__(self, wallet, subtensor, metagraph, config,
+                 miner_emission_percentage: float = 100.0, refresh_seconds: int = 1200):
         self.wallet = wallet
         self.subtensor = subtensor
         self.metagraph = metagraph
         self.config = config
+        self.miner_emission_percentage = max(0.0, min(100.0, float(miner_emission_percentage)))
+        self.refresh_seconds = refresh_seconds
+
+        self._last_applied: Optional[Tuple[Tuple[int, ...], Tuple[float, ...]]] = None
+        self._last_applied_at: float = 0.0
+        self._pending_logged: Optional[Tuple] = None
+
+    # ------------------------------------------------------------------
+    # Metagraph lookups
+    # ------------------------------------------------------------------
 
     def _get_coldkey_for_uid(self, uid: int) -> Optional[str]:
         """Resolve coldkey for a UID from the metagraph, if available."""
@@ -31,211 +87,118 @@ class WeightManager:
             logger.error(f"Error resolving coldkey for UID {uid}: {e}")
         return None
 
-    def _log_skipped_uids(self, skipped: List[tuple]) -> None:
-        for uid, coldkey in skipped:
-            logger.info(f"Skipping UID {uid} (coldkey {coldkey[:12]}...) - banned")
-
-    def set_burn_weights(self, banned_coldkeys: Optional[Set[str]] = None):
-        """Set weight 1.0 for uid 0 and 0.0 for all others to burn emissions.
-
-        Banned coldkeys are already given 0.0 here, but we still log them for
-        visibility so the per-cycle skip log is consistent.
-        """
-        try:
-            all_uids = list(range(len(self.metagraph.neurons)))
-
-            if not all_uids:
-                logger.error("No neurons found in metagraph")
-                return
-
-            if banned_coldkeys:
-                skipped = []
-                for uid in all_uids:
-                    if uid == 0:
-                        continue
-                    coldkey = self._get_coldkey_for_uid(uid)
-                    if coldkey and coldkey in banned_coldkeys:
-                        skipped.append((uid, coldkey))
-                self._log_skipped_uids(skipped)
-
-            # Set weight 1.0 for uid 0, 0.0 for all others
-            uids = [0] + [uid for uid in all_uids if uid != 0]
-            weights = [1.0] + [0.0] * (len(uids) - 1)
-
-            uids_tensor = torch.tensor(uids, dtype=torch.int64)
-            weights_tensor = torch.tensor(weights, dtype=torch.float32)
-
-            logger.info("Calling subtensor.set_weights for burn weights (wait_for_inclusion=True)")
-            success = self.subtensor.set_weights(
-                wallet=self.wallet,
-                netuid=self.config.netuid,
-                uids=uids_tensor,
-                weights=weights_tensor,
-                wait_for_inclusion=True,
-            )
-            logger.info(f"subtensor.set_weights returned for burn weights: success={success}")
-
-            if success:
-                logger.info("Successfully set burn weights (uid 0 = 1.0, others = 0.0)")
-            else:
-                logger.error("Failed to set burn weights")
-
-        except Exception as e:
-            logger.error(f"Error setting burn weights: {e}")
-
-    def set_winner_weights(
-        self,
-        winner_hotkey: str,
-        miner_emission_percentage: float = 100.0,
-        banned_coldkeys: Optional[Set[str]] = None,
-    ) -> bool:
-        """Set weights splitting emissions between winner and burn address (UID 0).
-
-        miner_emission_percentage: 0–100. E.g. 20 → 20% to winner, 80% burned.
-        If the winner's coldkey is in banned_coldkeys, all emissions are burned.
-        """
-        try:
-            miner_fraction = max(0.0, min(100.0, miner_emission_percentage)) / 100.0
-            burn_fraction = 1.0 - miner_fraction
-
-            winner_uid = self.get_hotkey_uid(winner_hotkey)
-            if winner_uid is None:
-                logger.warning(f"Winner {winner_hotkey[:12]}... not found on subnet, burning all emissions")
-                self.set_burn_weights(banned_coldkeys=banned_coldkeys)
-                return False
-
-            if banned_coldkeys:
-                winner_coldkey = self._get_coldkey_for_uid(winner_uid)
-                if winner_coldkey and winner_coldkey in banned_coldkeys:
-                    logger.warning(
-                        f"Winner UID {winner_uid} (coldkey {winner_coldkey[:12]}...) is banned - burning all emissions"
-                    )
-                    self.set_burn_weights(banned_coldkeys=banned_coldkeys)
-                    return False
-
-            if burn_fraction > 0:
-                uids = [0, winner_uid]
-                weights = [burn_fraction, miner_fraction]
-            else:
-                uids = [winner_uid]
-                weights = [1.0]
-
-            uids_tensor = torch.tensor(uids, dtype=torch.int64)
-            weights_tensor = torch.tensor(weights, dtype=torch.float32)
-
-            logger.info(f"Calling subtensor.set_weights for winner {winner_hotkey[:12]}... (wait_for_inclusion=True)")
-            success = self.subtensor.set_weights(
-                wallet=self.wallet,
-                netuid=self.config.netuid,
-                uids=uids_tensor,
-                weights=weights_tensor,
-                wait_for_inclusion=True,
-            )
-            logger.info(f"subtensor.set_weights returned for winner weights: success={success}")
-
-            if success:
-                logger.info(
-                    f"Set winner weights: {miner_emission_percentage:.0f}% to {winner_hotkey[:12]}... (UID {winner_uid}), "
-                    f"{100 - miner_emission_percentage:.0f}% burned (UID 0)"
-                )
-                return True
-            else:
-                logger.error("Failed to set winner weights")
-                return False
-
-        except Exception as e:
-            logger.error(f"Error setting winner weights: {e}")
-            return False
-
-    def set_weights(self, weights_dict: Dict[str, float], banned_coldkeys: Optional[Set[str]] = None) -> bool:
-        """Set weights on the blockchain"""
-        try:
-            if not weights_dict:
-                logger.warning("No weights to set")
-                return False
-
-            # Get UIDs from hotkeys
-            hotkeys = list(weights_dict.keys())
-            uid_mapping = self.get_uids_from_hotkeys(hotkeys)
-
-            if not uid_mapping:
-                logger.warning("No valid UIDs found for hotkeys")
-                return False
-
-            # Prepare weights for bittensor
-            uids = []
-            weights = []
-            skipped = []
-
-            for hotkey, weight in weights_dict.items():
-                if hotkey in uid_mapping:
-                    uid = uid_mapping[hotkey]
-                    if banned_coldkeys:
-                        coldkey = self._get_coldkey_for_uid(uid)
-                        if coldkey and coldkey in banned_coldkeys:
-                            skipped.append((uid, coldkey))
-                            continue
-                    uids.append(uid)
-                    weights.append(weight)
-
-            self._log_skipped_uids(skipped)
-
-            if not uids:
-                logger.warning("No valid UIDs to set weights for")
-                return False
-
-            # Convert to tensors
-            uids_tensor = torch.tensor(uids, dtype=torch.int64)
-            weights_tensor = torch.tensor(weights, dtype=torch.float32)
-
-            # Set weights on chain
-            success = self.subtensor.set_weights(
-                wallet=self.wallet,
-                netuid=self.config.netuid,
-                uids=uids_tensor,
-                weights=weights_tensor,
-                wait_for_inclusion=True,
-            )
-
-            if success:
-                logger.info(f"Successfully set weights for {len(uids)} UIDs")
-                return True
-            else:
-                logger.error("Failed to set weights on chain")
-                return False
-
-        except Exception as e:
-            logger.error(f"Error setting weights: {e}")
-            return False
-
-    def get_uids_from_hotkeys(self, hotkeys: List[str]) -> Dict[str, int]:
-        """Extract UIDs from hotkeys using metagraph"""
-        uid_mapping = {}
-
-        for hotkey in hotkeys:
-            for uid, neuron in enumerate(self.metagraph.neurons):
-                if neuron.hotkey == hotkey:
-                    uid_mapping[hotkey] = uid
-                    break
-
-        return uid_mapping
-
     def get_hotkey_uid(self, hotkey: str) -> Optional[int]:
         """Get UID for hotkey on current subnet"""
         try:
-            # Use your existing metagraph to find the UID
-            if hasattr(self, 'metagraph') and self.metagraph:
-                hotkeys = self.metagraph.hotkeys
-                if hotkey in hotkeys:
-                    uid = hotkeys.index(hotkey)
-                    logger.info(f"Found UID {uid} for hotkey {hotkey[:12]}...")
-                    return uid
-                else:
-                    logger.warning(f"Hotkey {hotkey[:12]}... not found in metagraph")
-                    return None
-            else:
-                logger.error("No metagraph available")
-                return None
+            hotkeys = list(getattr(self.metagraph, 'hotkeys', []) or [])
+            if hotkey in hotkeys:
+                return hotkeys.index(hotkey)
+            return None
         except Exception as e:
             logger.error(f"Error getting UID for hotkey: {e}")
             return None
+
+    # ------------------------------------------------------------------
+    # Policy
+    # ------------------------------------------------------------------
+
+    def build(self, target: WeightTarget, banned_coldkeys: Optional[Set[str]] = None,
+              ban_emissions: bool = False) -> Tuple[List[int], List[float], str]:
+        """Turn a target into (uids, weights, description). Pure: no chain calls."""
+        burn = ([BURN_UID], [1.0])
+
+        if ban_emissions:
+            return (*burn, f"burn (emissions banned by challenge server; {target.reason})")
+        if not target.winner_hotkey:
+            return (*burn, f"burn ({target.reason})")
+
+        hotkey = target.winner_hotkey
+        uid = self.get_hotkey_uid(hotkey)
+        if uid is None:
+            return (*burn, f"burn (winner {hotkey[:12]}... not registered on subnet)")
+        if uid == BURN_UID:
+            return (*burn, f"burn (winner {hotkey[:12]}... is the burn UID)")
+        coldkey = self._get_coldkey_for_uid(uid)
+        if banned_coldkeys and coldkey and coldkey in banned_coldkeys:
+            return (*burn, f"burn (winner UID {uid} coldkey {coldkey[:12]}... is banned)")
+
+        miner_fraction = self.miner_emission_percentage / 100.0
+        if miner_fraction >= 1.0:
+            return [uid], [1.0], f"winner UID {uid} ({hotkey[:12]}...) 100% ({target.reason})"
+        if miner_fraction <= 0.0:
+            return (*burn, f"burn (miner emission percentage is 0; winner UID {uid})")
+        return (
+            [BURN_UID, uid],
+            [round(1.0 - miner_fraction, 6), round(miner_fraction, 6)],
+            f"winner UID {uid} ({hotkey[:12]}...) {self.miner_emission_percentage:g}%, "
+            f"burn {100 - self.miner_emission_percentage:g}% ({target.reason})",
+        )
+
+    # ------------------------------------------------------------------
+    # Chain
+    # ------------------------------------------------------------------
+
+    def _own_uid(self) -> Optional[int]:
+        return self.get_hotkey_uid(self.wallet.hotkey.ss58_address)
+
+    def _rate_limit_allows(self) -> bool:
+        """True when the chain's weights rate limit allows a new set_weights call.
+        If it can't be determined, allow the attempt (the chain enforces it anyway)."""
+        try:
+            own_uid = self._own_uid()
+            if own_uid is None:
+                return True
+            since = self.subtensor.blocks_since_last_update(netuid=self.config.netuid, uid=own_uid)
+            limit = self.subtensor.weights_rate_limit(netuid=self.config.netuid)
+            if since is None or limit is None:
+                return True
+            return int(since) >= int(limit)
+        except Exception as e:
+            logger.debug(f"Could not read weights rate limit: {e}")
+            return True
+
+    def _submit(self, uids: List[int], weights: List[float]):
+        return self.subtensor.set_weights(
+            wallet=self.wallet,
+            netuid=self.config.netuid,
+            uids=uids,
+            weights=weights,
+            wait_for_inclusion=True,
+            wait_for_finalization=False,
+        )
+
+    async def apply(self, target: WeightTarget, banned_coldkeys: Optional[Set[str]] = None,
+                    ban_emissions: bool = False, force: bool = False) -> bool:
+        """Submit the weights for `target` if they changed or a refresh is due.
+        Returns True when the chain now has these weights (just set, or already set)."""
+        uids, weights, description = self.build(target, banned_coldkeys, ban_emissions)
+        key = (tuple(uids), tuple(weights))
+        changed = key != self._last_applied
+        refresh_due = (time.monotonic() - self._last_applied_at) >= self.refresh_seconds
+
+        if not (changed or refresh_due or force):
+            return True
+
+        if not self._rate_limit_allows():
+            if changed and self._pending_logged != key:
+                logger.info(f"Weights pending (chain rate limit): {description}")
+                self._pending_logged = key
+            return False
+
+        logger.info(f"Setting weights: {description}")
+        try:
+            response = await asyncio.to_thread(self._submit, uids, weights)
+        except Exception as e:
+            logger.error(f"set_weights raised: {e}")
+            return False
+
+        if response_succeeded(response):
+            self._last_applied = key
+            self._last_applied_at = time.monotonic()
+            self._pending_logged = None
+            logger.info(f"Weights set on chain: {description}")
+            return True
+
+        message = getattr(response, "message", response)
+        logger.error(f"Chain rejected set_weights ({description}): {message}")
+        return False

@@ -9,11 +9,11 @@ to a specific challenge_id. Persisted to its own JSON file so a transient
 server outage does not wipe the ban list.
 """
 
-import json
 import logging
-import os
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Tuple
+
+from .storage import atomic_write_json, data_path, load_json
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +22,7 @@ class BannedColdkeysManager:
     """Manages the banned-coldkey list and its persistence."""
 
     def __init__(self, file_path: str = "banned_coldkeys.json"):
-        self.file_path = file_path
+        self.file_path = data_path(file_path)
         # coldkey -> {"reason": ..., "banned_at": ...}
         self.permanent: Dict[str, Dict] = {}
         # challenge_id -> {coldkey -> {"reason": ..., "banned_at": ...}}
@@ -33,10 +33,9 @@ class BannedColdkeysManager:
 
     def load(self) -> None:
         try:
-            if not os.path.exists(self.file_path):
+            data = load_json(self.file_path)
+            if data is None:
                 return
-            with open(self.file_path, "r") as f:
-                data = json.load(f)
             self.permanent = data.get("permanent", {}) or {}
             self.challenge_scoped = data.get("challenge_scoped", {}) or {}
             self.synced_at = data.get("synced_at", {}) or {}
@@ -56,8 +55,7 @@ class BannedColdkeysManager:
                 "synced_at": self.synced_at,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
-            with open(self.file_path, "w") as f:
-                json.dump(data, f, indent=2)
+            atomic_write_json(self.file_path, data)
         except Exception as e:
             logger.error(f"Error saving banned coldkeys file {self.file_path}: {e}")
 

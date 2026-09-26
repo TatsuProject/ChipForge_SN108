@@ -13,17 +13,20 @@ from pathlib import Path
 from typing import Dict, Optional
 from dotenv import load_dotenv
 load_dotenv()
+from .weight_manager import WeightTarget
+
 logger = logging.getLogger(__name__)
 
 
 class BatchProcessor:
     """Handles batch processing logic for the validator"""
     
-    def __init__(self, api_client, state, emission_manager, weight_manager):
+    def __init__(self, api_client, state, emission_manager, set_weight_target):
         self.api_client = api_client
         self.state = state
         self.emission_manager = emission_manager
-        self.weight_manager = weight_manager
+        # Callable(WeightTarget): the validator applies it to the chain right after the batch
+        self.set_weight_target = set_weight_target
         
         # Directories
         self.base_dir = Path('./validator_data')
@@ -217,30 +220,10 @@ class BatchProcessor:
                 # Update emission manager with new winner + baseline snapshot they qualified against
                 self.emission_manager.update_winner(new_champion, new_best_score, evaluation_baseline_snapshot, winner_timestamp=None)
                 
-                # Check if new champion is on subnet and get UID
-                # Check emissions ban before setting weights
-                if self.state.ban_emissions:
-                    logger.warning(f"EMISSIONS BANNED by challenge server - burning instead of rewarding new champion {new_champion[:12]}...")
-                    self.weight_manager.set_burn_weights()
-                else:
-                    try:
-                        uid = self.weight_manager.get_hotkey_uid(new_champion)
-                        if uid is not None:
-                            # Set weights: 1.0 for new champion, 0.0 for others
-                            weights = {new_champion: 1.0}
-                            logger.info(f"Setting NEW CHAMPION weights: {new_champion[:12]}... (UID {uid}) = 1.0, score: {new_best_score}")
-                            
-                            weight_success = self.weight_manager.set_weights(weights)
-                            if not weight_success:
-                                logger.error("Failed to set weights, burning emissions")
-                                self.weight_manager.set_burn_weights()
-                        else:
-                            logger.warning(f"New champion {new_champion[:12]}... not found on subnet, burning emissions")
-                            self.weight_manager.set_burn_weights()
-                    except Exception as e:
-                        logger.error(f"Error getting UID for new champion: {e}, burning emissions")
-                        self.weight_manager.set_burn_weights()
-                    
+                # Reward the new champion. Bans, ban_emissions, the emission split and
+                # "not registered" are all handled when the weights are built and submitted.
+                self.set_weight_target(WeightTarget.winner(new_champion, f"new champion, score {new_best_score}"))
+
             else:
                 # No new champion found - check emission management policy
                 logger.info(f"No submissions beat challenge best of {current_best_score}")
@@ -248,40 +231,19 @@ class BatchProcessor:
                 # Get reward hotkey from emission manager (NO baseline check - winner already qualified)
                 reward_hotkey = self.emission_manager.get_reward_hotkey(current_best_hotkey, current_best_score)
                 should_burn = self.emission_manager.should_burn_emissions(current_best_score)
-                
+
                 if reward_hotkey and not should_burn:
-                    # Check emissions ban before continuing to reward
-                    if self.state.ban_emissions:
-                        logger.warning(f"EMISSIONS BANNED by challenge server - burning instead of rewarding {reward_hotkey[:12]}...")
-                        self.weight_manager.set_burn_weights()
-                    else:
-                        # Continue rewarding current winner/champion
-                        try:
-                            uid = self.weight_manager.get_hotkey_uid(reward_hotkey)
-                            if uid is not None:
-                                weights = {reward_hotkey: 1.0}
-                                logger.info(f"Challenge active, winner {reward_hotkey[:12]}... taking reward until next good submission")
-                                
-                                weight_success = self.weight_manager.set_weights(weights)
-                                if not weight_success:
-                                    logger.error("Failed to set weights, burning emissions")
-                                    self.weight_manager.set_burn_weights()
-                            else:
-                                logger.warning(f"Reward target {reward_hotkey[:12]}... not found on subnet, burning emissions")
-                                self.weight_manager.set_burn_weights()
-                        except Exception as e:
-                            logger.error(f"Error getting UID for reward target: {e}, burning emissions")
-                            self.weight_manager.set_burn_weights()
+                    logger.info(f"Challenge active, winner {reward_hotkey[:12]}... taking reward until next good submission")
+                    self.set_weight_target(WeightTarget.winner(reward_hotkey, "current winner"))
                 else:
-                    # Should burn emissions
                     if self.emission_manager.current_winner:
                         logger.info("Challenge active, submissions found but winner reward period expired - burning emissions")
                     else:
                         logger.info("Challenge active, submissions checking but no qualified winner - burning emissions")
-                    self.weight_manager.set_burn_weights()
-            
+                    self.set_weight_target(WeightTarget.burn("no qualified winner"))
+
             # Mark batch as processed
-            self.state.evaluated_batches.add(batch_id)
+            self.state.mark_batch_evaluated(batch_id)
             self.state.current_batch_id = None
             self.state.evaluation_in_progress = False
             self.state.save_state()

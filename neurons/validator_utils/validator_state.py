@@ -5,13 +5,14 @@ Validator State Management for ChipForge Validator
 Manages validator state and persistence
 """
 
-import json
-import os
 import logging
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 load_dotenv()
+
+from .storage import atomic_write_json, data_path, load_json
+
 logger = logging.getLogger(__name__)
 
 
@@ -19,11 +20,12 @@ class ValidatorState:
     """Manages validator state and persistence"""
     
     def __init__(self, state_file: str = "validator_state.json"):
-        self.state_file = state_file
+        self.state_file = data_path(state_file)
         self.current_batch_id: Optional[str] = None
         self.evaluation_in_progress: bool = False
         self.last_challenge_id: Optional[str] = None
-        self.evaluated_batches: set = set()
+        # Insertion-ordered (dict keys), so trimming keeps the most recent batch ids
+        self.evaluated_batches: Dict[str, None] = {}
         self.challenge_best_miners: Dict[str, Tuple[str, float]] = {}  # challenge_id -> (hotkey, score)
         self.active_challenges: Dict[str, Dict] = {}  # challenge_id -> challenge_info
         self.expired_challenges: List[str] = []
@@ -40,32 +42,31 @@ class ValidatorState:
     def load_state(self):
         """Load state from file"""
         try:
-            if os.path.exists(self.state_file):
-                with open(self.state_file, 'r') as f:
-                    data = json.load(f)
-                    self.current_batch_id = data.get('current_batch_id')
-                    self.evaluation_in_progress = data.get('evaluation_in_progress', False)
-                    self.last_challenge_id = data.get('last_challenge_id')
-                    self.evaluated_batches = set(data.get('evaluated_batches', []))
-                    self.challenge_best_miners = data.get('challenge_best_miners', {})
-                    self.active_challenges = data.get('active_challenges', {})
-                    self.expired_challenges = data.get('expired_challenges', [])
+            data = load_json(self.state_file)
+            if data is not None:
+                self.current_batch_id = data.get('current_batch_id')
+                self.evaluation_in_progress = data.get('evaluation_in_progress', False)
+                self.last_challenge_id = data.get('last_challenge_id')
+                self.evaluated_batches = dict.fromkeys(data.get('evaluated_batches', []))
+                self.challenge_best_miners = data.get('challenge_best_miners', {})
+                self.active_challenges = data.get('active_challenges', {})
+                self.expired_challenges = data.get('expired_challenges', [])
 
-                    current_challenge_best = data.get('current_challenge_best', [None, 0.0])
-                    self.current_challenge_best = (current_challenge_best[0], current_challenge_best[1])
+                current_challenge_best = data.get('current_challenge_best', [None, 0.0])
+                self.current_challenge_best = (current_challenge_best[0], current_challenge_best[1])
 
-                    self.current_challenge_expires_at = data.get('current_challenge_expires_at', None)
-                    if self.current_challenge_expires_at:
-                        self.current_challenge_expires_at = datetime.fromisoformat(self.current_challenge_expires_at)
+                self.current_challenge_expires_at = data.get('current_challenge_expires_at', None)
+                if self.current_challenge_expires_at:
+                    self.current_challenge_expires_at = datetime.fromisoformat(self.current_challenge_expires_at)
 
-                    self.current_challenge_best_timestamp = data.get('current_challenge_best_timestamp', None)
-                    if self.current_challenge_best_timestamp:
-                        self.current_challenge_best_timestamp = datetime.fromisoformat(self.current_challenge_best_timestamp)
+                self.current_challenge_best_timestamp = data.get('current_challenge_best_timestamp', None)
+                if self.current_challenge_best_timestamp:
+                    self.current_challenge_best_timestamp = datetime.fromisoformat(self.current_challenge_best_timestamp)
 
-                    self.winner_baseline_score = data.get('winner_baseline_score', 0.0)
-                    self.ban_emissions = data.get('ban_emissions', False)
-                    self.batch_download_window_seconds = data.get('batch_download_window_seconds', 0)
-                    self.batch_evaluation_window_seconds = data.get('batch_evaluation_window_seconds', 0)
+                self.winner_baseline_score = data.get('winner_baseline_score', 0.0)
+                self.ban_emissions = data.get('ban_emissions', False)
+                self.batch_download_window_seconds = data.get('batch_download_window_seconds', 0)
+                self.batch_evaluation_window_seconds = data.get('batch_evaluation_window_seconds', 0)
 
                 logger.info(f"Loaded validator state: batch={self.current_batch_id}, challenge={self.last_challenge_id}, baseline_score={self.winner_baseline_score}, ban_emissions={self.ban_emissions}")
                     
@@ -92,10 +93,16 @@ class ValidatorState:
                 'batch_evaluation_window_seconds': self.batch_evaluation_window_seconds,
                 'updated_at': datetime.now(timezone.utc).isoformat(),
             }
-            with open(self.state_file, 'w') as f:
-                json.dump(data, f, indent=2)
+            atomic_write_json(self.state_file, data)
         except Exception as e:
             logger.error(f"Error saving validator state: {e}")
+
+    def mark_batch_evaluated(self, batch_id: str, keep: int = 200):
+        """Remember a processed batch id (most recent `keep` ids are kept)."""
+        self.evaluated_batches.pop(batch_id, None)
+        self.evaluated_batches[batch_id] = None
+        while len(self.evaluated_batches) > keep:
+            self.evaluated_batches.pop(next(iter(self.evaluated_batches)))
     
     def update_best_miner(self, challenge_id: str, hotkey: str, score: float):
         """Update best miner for challenge and current challenge with timestamp"""
