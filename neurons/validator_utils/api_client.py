@@ -15,10 +15,10 @@ import re
 import json
 import secrets
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
-from typing import Dict, List, Optional, Any
+from typing import Dict, Optional, Any
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -667,7 +667,6 @@ class APIClient:
         """Original dummy evaluation for testing"""
         evaluations = {}
         for submission_id in submissions.keys():
-            import random
             evaluations[submission_id] = {
                 'overall_score': 0.0,
                 'functionality_score': 0.0,

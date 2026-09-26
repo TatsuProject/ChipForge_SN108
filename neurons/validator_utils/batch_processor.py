@@ -5,12 +5,10 @@ Batch Processor for ChipForge Validator
 Handles batch evaluation and processing logic
 """
 
-import asyncio
 import logging
 import traceback
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict
 from dotenv import load_dotenv
 load_dotenv()
 from .api_client import parse_server_time
@@ -59,50 +57,6 @@ class BatchProcessor:
         
         return submission_hotkeys
     
-    def calculate_weights_from_hotkeys(self, evaluations: Dict[str, Dict], submission_hotkeys: Dict[str, str]) -> Dict[str, float]:
-        """Calculate weights based on evaluation scores and map to miner hotkeys"""
-        if not evaluations or not submission_hotkeys:
-            return {}
-
-        # Create hotkey to best score mapping
-        hotkey_scores = {}
-
-        for submission_id, eval_data in evaluations.items():
-            miner_hotkey = submission_hotkeys.get(submission_id)
-            if miner_hotkey:
-                # GATE CHECK: Both functional_gate and overall_gate must be True
-                functional_gate = eval_data.get('functional_gate', False)
-                overall_gate = eval_data.get('overall_gate', False)
-
-                if not functional_gate or not overall_gate:
-                    logger.info(f"Submission {submission_id} FAILED gates - skipping from weight calculation")
-                    continue
-
-                score = eval_data['overall_score']
-                # Keep the best score for each miner
-                if miner_hotkey not in hotkey_scores or score > hotkey_scores[miner_hotkey]:
-                    hotkey_scores[miner_hotkey] = score
-
-        if not hotkey_scores:
-            return {}
-
-        # Sort miners by best score
-        sorted_miners = sorted(hotkey_scores.items(), key=lambda x: x[1], reverse=True)
-
-        # Winner-takes-all approach
-        weights = {}
-        for i, (hotkey, score) in enumerate(sorted_miners):
-            if i == 0:  # Highest score gets weight 1
-                weights[hotkey] = 1.0
-            else:  # All others get weight 0
-                weights[hotkey] = 0.0
-
-        winner_hotkey, winner_score = sorted_miners[0]
-        logger.info(f"Calculated weights: winner={winner_hotkey[:12]}... (score: {winner_score})")
-        logger.info(f"Total miners evaluated: {len(weights)}")
-
-        return weights
-    
     async def process_batch(self, challenge_id: str, batch: Dict) -> bool:
         """Process a complete batch evaluation with challenge-wide best score tracking"""
         batch_id = batch['batch_id']
@@ -128,20 +82,8 @@ class BatchProcessor:
                 else:
                     logger.warning(f"Could not fetch fresh baseline, using cached: {self.state.winner_baseline_score}")
 
-                # Refresh batch window config so the EDA timeout used for this batch matches the server
-                if challenge_info:
-                    new_dl = challenge_info.get('batch_download_window_seconds')
-                    new_eval = challenge_info.get('batch_evaluation_window_seconds')
-                    ws_changed = False
-                    if new_dl is not None and new_dl != self.state.batch_download_window_seconds:
-                        self.state.batch_download_window_seconds = new_dl
-                        ws_changed = True
-                    if new_eval is not None and new_eval != self.state.batch_evaluation_window_seconds:
-                        self.state.batch_evaluation_window_seconds = new_eval
-                        ws_changed = True
-                    if ws_changed:
-                        logger.info(f"Batch windows refreshed: download={self.state.batch_download_window_seconds}s, evaluation={self.state.batch_evaluation_window_seconds}s")
-                        self.state.save_state()
+                # Keep batch windows in sync with the server
+                self.state.update_batch_windows(challenge_info)
             except Exception as e:
                 logger.error(f"Error fetching fresh baseline: {e}, using cached: {self.state.winner_baseline_score}")
 
@@ -190,8 +132,7 @@ class BatchProcessor:
             if missing:
                 submission_hotkeys.update(self.extract_hotkeys_from_filenames(batch_id, missing))
 
-            current_best_score = self.state.current_challenge_best[1] if hasattr(self.state, 'current_challenge_best') else 0.0
-            current_best_hotkey = self.state.current_challenge_best[0] if hasattr(self.state, 'current_challenge_best') else None
+            current_best_hotkey, current_best_score = self.state.current_challenge_best
 
             logger.info(f"Current challenge best: {current_best_hotkey[:12] if current_best_hotkey else 'None'}... -> {current_best_score}")
 

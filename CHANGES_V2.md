@@ -152,3 +152,30 @@ Owner decisions this branch follows:
 
 ### C.5 Server values bounded
 - A `winner_reward_hours` above `MAX_WINNER_REWARD_HOURS` (default 720) is ignored in favour of the local value.
+
+---
+
+## Phase E: cleanup
+
+### E.1 torch removed
+- **Problem:** torch (several GB with its CUDA stack) was installed only to wrap two lists in tensors for `set_weights`.
+- **Fix/Now:** weights are passed as plain lists (bittensor 10 turns them into numpy arrays in `convert_and_normalize_weights_and_uids`). torch is removed from `requirements.txt`, and `requirements-lock.txt` was regenerated with the same versions for everything else: torch, triton, the CUDA/NVIDIA packages, sympy, mpmath, networkx, filelock and fsspec are gone. The test image went from 2.19 GB (with CPU-only torch) to 1.01 GB, and the suite passes with torch not installed.
+- **Changes existing flow?** No. Reinstall dependencies once (`pip install -r requirements.txt`); torch can be uninstalled.
+
+### E.2 Dead and duplicated code removed
+- **Removed:**
+  - `calculate_weights_from_hotkeys`, `mark_first_challenge_complete`, `BannedColdkeysManager.is_banned`
+  - the never-read state fields `challenge_best_miners`, `active_challenges`, `expired_challenges` (old state files still load; the keys are ignored)
+  - 19 always-true `hasattr(self.state, 'current_challenge_best')` checks
+  - lazily created loop attributes (now set in `__init__`)
+  - unused imports
+  - (Phase C removed the dead client methods)
+- **Merged:**
+  - the batch-window update written twice → `ValidatorState.update_batch_windows()`
+  - the two near-identical miner notifiers → one `_broadcast()`
+- **Changes existing flow?** No.
+
+### E.3 Miner notifications no longer block the validator
+- **Problem:** after every batch (and on a new challenge) the validator waited up to 60 s for every miner's axon to answer before continuing.
+- **Fix/Now:** notifications run as background tasks with `MINER_NOTIFY_TIMEOUT` (default 12 s), and missing answers are logged at DEBUG.
+- **Changes existing flow?** Miners get the same messages; the validator doesn't wait for them.

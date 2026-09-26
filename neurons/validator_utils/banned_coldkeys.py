@@ -11,7 +11,7 @@ server outage does not wipe the ban list.
 
 import logging
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, Optional, Set
 
 from .storage import atomic_write_json, data_path, load_json
 
@@ -111,20 +111,6 @@ class BannedColdkeysManager:
         if current_challenge_id and current_challenge_id in self.challenge_scoped:
             banned.update(self.challenge_scoped[current_challenge_id].keys())
         return banned
-
-    def is_banned(
-        self, coldkey: str, current_challenge_id: Optional[str] = None
-    ) -> Tuple[bool, str]:
-        """Return (banned, scope) for a coldkey. scope is 'permanent', 'challenge', or ''."""
-        if coldkey in self.permanent:
-            return True, "permanent"
-        if (
-            current_challenge_id
-            and current_challenge_id in self.challenge_scoped
-            and coldkey in self.challenge_scoped[current_challenge_id]
-        ):
-            return True, "challenge"
-        return False, ""
 
     def last_sync_age_seconds(self, challenge_id: str) -> Optional[float]:
         """Seconds since last successful sync for a challenge, or None if never."""

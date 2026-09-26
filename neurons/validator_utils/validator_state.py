@@ -7,7 +7,7 @@ Manages validator state and persistence
 
 import logging
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -26,9 +26,6 @@ class ValidatorState:
         self.last_challenge_id: Optional[str] = None
         # Insertion-ordered (dict keys), so trimming keeps the most recent batch ids
         self.evaluated_batches: Dict[str, None] = {}
-        self.challenge_best_miners: Dict[str, Tuple[str, float]] = {}  # challenge_id -> (hotkey, score)
-        self.active_challenges: Dict[str, Dict] = {}  # challenge_id -> challenge_info
-        self.expired_challenges: List[str] = []
         self.current_challenge_best: Tuple[Optional[str], float] = (None, 0.0)  # Current challenge only
         self.current_challenge_expires_at: Optional[datetime] = None
         self.current_challenge_best_timestamp: Optional[datetime] = None  # When current best was found
@@ -48,9 +45,6 @@ class ValidatorState:
                 self.evaluation_in_progress = data.get('evaluation_in_progress', False)
                 self.last_challenge_id = data.get('last_challenge_id')
                 self.evaluated_batches = dict.fromkeys(data.get('evaluated_batches', []))
-                self.challenge_best_miners = data.get('challenge_best_miners', {})
-                self.active_challenges = data.get('active_challenges', {})
-                self.expired_challenges = data.get('expired_challenges', [])
 
                 current_challenge_best = data.get('current_challenge_best', [None, 0.0])
                 self.current_challenge_best = (current_challenge_best[0], current_challenge_best[1])
@@ -81,9 +75,6 @@ class ValidatorState:
                 'evaluation_in_progress': self.evaluation_in_progress,
                 'last_challenge_id': self.last_challenge_id,
                 'evaluated_batches': list(self.evaluated_batches),
-                'challenge_best_miners': self.challenge_best_miners,
-                'active_challenges': self.active_challenges,
-                'expired_challenges': self.expired_challenges,
                 'current_challenge_best': list(self.current_challenge_best),
                 'current_challenge_expires_at': self.current_challenge_expires_at.isoformat() if self.current_challenge_expires_at else None,
                 'current_challenge_best_timestamp': self.current_challenge_best_timestamp.isoformat() if self.current_challenge_best_timestamp else None,
@@ -105,17 +96,24 @@ class ValidatorState:
             self.evaluated_batches.pop(next(iter(self.evaluated_batches)))
     
     def update_best_miner(self, challenge_id: str, hotkey: str, score: float):
-        """Update best miner for challenge and current challenge with timestamp"""
-        
-        # Update challenge-specific best
-        if challenge_id not in self.challenge_best_miners or score > self.challenge_best_miners[challenge_id][1]:
-            self.challenge_best_miners[challenge_id] = (hotkey, score)
-            logger.info(f"New best miner for {challenge_id}: {hotkey[:12]}... (score: {score})")
-        
-        # Update current challenge best with timestamp
+        """Record a new best miner for the current challenge (with the time it was found)."""
         if score > self.current_challenge_best[1]:
             self.current_challenge_best = (hotkey, score)
-            self.current_challenge_best_timestamp = datetime.now(timezone.utc)  # NEW: Track when winner found
-            logger.info(f"New current challenge best: {hotkey[:12]}... (score: {score}) at {self.current_challenge_best_timestamp}")
-        
+            self.current_challenge_best_timestamp = datetime.now(timezone.utc)
+            logger.info(f"New current challenge best for {challenge_id}: {hotkey[:12]}... (score: {score}) at {self.current_challenge_best_timestamp}")
         self.save_state()
+
+    def update_batch_windows(self, challenge_info: Optional[Dict]) -> bool:
+        """Adopt the server's batch download/evaluation windows. Returns True if changed."""
+        if not challenge_info:
+            return False
+        changed = False
+        for key in ('batch_download_window_seconds', 'batch_evaluation_window_seconds'):
+            value = challenge_info.get(key)
+            if value is not None and value != getattr(self, key):
+                logger.info(f"{key} updated: {getattr(self, key)} -> {value}")
+                setattr(self, key, value)
+                changed = True
+        if changed:
+            self.save_state()
+        return changed

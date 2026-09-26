@@ -145,16 +145,6 @@ class EmissionManager:
             self.save_state()
             logger.info("Initialized subnet start time")
     
-    def mark_first_challenge_complete(self, winner_hotkey: str):
-        """Mark first challenge as complete with winner"""
-        self.first_challenge_end_time = datetime.now(timezone.utc)
-        self.winner_reward_start_time = datetime.now(timezone.utc)
-        self.current_phase = "winner_reward"
-        self.current_winner = winner_hotkey
-        self.last_challenge_end_time = datetime.now(timezone.utc)
-        self.save_state()
-        logger.info(f"First challenge completed, winner: {winner_hotkey[:12]}...")
-    
     def update_winner(self, winner_hotkey: str, winner_score: float, qualified_baseline: float, winner_timestamp: Optional[datetime] = None):
         """
         Update current winner ONLY if it's a new winner or score improved.
@@ -335,7 +325,6 @@ class EmissionManager:
                 else:
                     # Winner period ended - ONLY clear winner, KEEP score for comparison
                     logger.info(f"Winner reward period EXPIRED for {self.current_winner[:12] if self.current_winner else 'Unknown'}... (score: {self.current_winner_score})")
-                    old_winner = self.current_winner
                     self.current_winner = None
                     # DO NOT reset current_winner_score - keep it for future comparisons
                     
