@@ -26,6 +26,7 @@ from validator_utils import (
     setup_validator_logging,
     BannedColdkeysManager,
 )
+from chipforge.heartbeat import heartbeat_loop
 from validator_utils.weight_manager import WeightTarget
 from validator_utils.api_client import parse_server_time
 
@@ -805,6 +806,9 @@ class ChipForgeValidator:
 
         # Initialize components that depend on the session
         self.initialize_components()
+
+        # Liveness file for the container healthcheck (goes stale if the loop blocks)
+        self._background(heartbeat_loop("validator", self._stop))
 
         # Add crash recovery logic here
         await self.recover_from_crash()

@@ -72,6 +72,11 @@ class WeightManager:
         self._last_applied: Optional[Tuple[Tuple[int, ...], Tuple[float, ...]]] = None
         self._last_applied_at: float = 0.0
         self._pending_logged: Optional[Tuple] = None
+        # Backoff after a failed submission (unregistered hotkey, RPC down, ...): the same
+        # weights are retried after 30s, 60s, ... up to 10 min instead of every loop.
+        self._failed_key: Optional[Tuple] = None
+        self._failures = 0
+        self._retry_at = 0.0
 
     # ------------------------------------------------------------------
     # Metagraph lookups
@@ -179,6 +184,9 @@ class WeightManager:
         if not (changed or refresh_due or force):
             return True
 
+        if key == self._failed_key and time.monotonic() < self._retry_at:
+            return False
+
         if not self._rate_limit_allows():
             if changed and self._pending_logged != key:
                 logger.info(f"Weights pending (chain rate limit): {description}")
@@ -189,16 +197,25 @@ class WeightManager:
         try:
             response = await asyncio.to_thread(self._submit, uids, weights)
         except Exception as e:
-            logger.error(f"set_weights raised: {e}")
+            self._record_failure(key)
+            logger.error(f"set_weights raised: {e} (retry in {self._retry_at - time.monotonic():.0f}s)")
             return False
 
         if response_succeeded(response):
             self._last_applied = key
             self._last_applied_at = time.monotonic()
             self._pending_logged = None
+            self._failed_key, self._failures = None, 0
             logger.info(f"Weights set on chain: {description}")
             return True
 
+        self._record_failure(key)
         message = getattr(response, "message", response)
-        logger.error(f"Chain rejected set_weights ({description}): {message}")
+        logger.error(f"Chain rejected set_weights ({description}): {message} "
+                     f"(retry in {self._retry_at - time.monotonic():.0f}s)")
         return False
+
+    def _record_failure(self, key: Tuple) -> None:
+        self._failures = self._failures + 1 if key == self._failed_key else 1
+        self._failed_key = key
+        self._retry_at = time.monotonic() + min(600, 30 * 2 ** (self._failures - 1))

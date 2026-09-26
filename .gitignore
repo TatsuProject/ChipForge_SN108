@@ -182,3 +182,8 @@ emission_state.json
 validator_state.json
 banned_coldkeys.json
 watchdog.py
+
+# Docker runtime state (make up / make backup-state)
+data/
+backups/
+heartbeat-*

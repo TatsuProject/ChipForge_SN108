@@ -1,0 +1,6 @@
+# Test image: runtime deps + pytest; the repo is mounted at /app by `make test`.
+FROM python:3.12-slim
+RUN apt-get update && apt-get install -y --no-install-recommends gcc build-essential \
+    && rm -rf /var/lib/apt/lists/*
+COPY requirements.txt requirements-dev.txt requirements-lock.txt /tmp/
+RUN pip install --no-cache-dir -r /tmp/requirements-dev.txt -c /tmp/requirements-lock.txt

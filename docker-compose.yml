@@ -1,0 +1,56 @@
+# ChipForge SN108. Run one role per machine:
+#   make up                 # validator (default)
+#   make up ROLE=miner      # miner
+#
+# Host networking: the validator reaches the EDA server on 127.0.0.1:8080 and the chain
+# directly; the miner's axon listens on AXON_PORT on the host. Linux hosts only.
+
+x-common: &common
+  build:
+    context: .
+    args:
+      UID: ${HOST_UID:-1000}
+      GID: ${HOST_GID:-1000}
+  image: chipforge-sn108:${IMAGE_TAG:-local}
+  env_file: .env
+  environment:
+    # In-container locations; set here so values meant for the host in .env can't override them
+    CHIPFORGE_DATA_DIR: /data
+    MINER_CHALLENGE_DIR: /data/downloaded_active_challenge
+    WALLET_PATH: /wallets
+  network_mode: host
+  restart: unless-stopped
+  stop_grace_period: 60s
+  volumes:
+    - ${DATA_DIR:-./data}:/data
+    - ${WALLET_DIR:-~/.bittensor/wallets}:/wallets:ro
+  logging:
+    driver: json-file
+    options:
+      max-size: "50m"
+      max-file: "5"
+
+services:
+  validator:
+    <<: *common
+    profiles: ["validator"]
+    container_name: chipforge-validator
+    command: ["validator"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "chipforge.heartbeat", "validator", "--max-age", "180"]
+      interval: 60s
+      timeout: 10s
+      start_period: 180s
+      retries: 3
+
+  miner:
+    <<: *common
+    profiles: ["miner"]
+    container_name: chipforge-miner
+    command: ["miner"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "chipforge.heartbeat", "miner", "--max-age", "180"]
+      interval: 60s
+      timeout: 10s
+      start_period: 180s
+      retries: 3

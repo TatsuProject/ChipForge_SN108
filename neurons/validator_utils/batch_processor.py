@@ -7,11 +7,11 @@ Handles batch evaluation and processing logic
 
 import logging
 import traceback
-from pathlib import Path
 from typing import Dict
 from dotenv import load_dotenv
 load_dotenv()
 from .api_client import parse_server_time
+from .storage import data_path
 from .weight_manager import WeightTarget
 
 logger = logging.getLogger(__name__)
@@ -28,7 +28,7 @@ class BatchProcessor:
         self.set_weight_target = set_weight_target
         
         # Directories
-        self.base_dir = Path('./validator_data')
+        self.base_dir = data_path('validator_data')
         self.submissions_dir = self.base_dir / 'submissions'
         self.submissions_dir.mkdir(parents=True, exist_ok=True)
     

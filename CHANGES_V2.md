@@ -244,3 +244,57 @@ Owner decisions this branch follows:
 - **Changes existing flow?** No: the documented invocation `miner_cli.py --wallet.name … submit file.zip` still works (tested). Submission signing is unchanged.
 
 **Tests:** `tests/test_miner.py` (URL resolution, atomic download and retry, zip limits, blacklist, immediate poll, CLI parsing, signature and size limit), plus a real axon/dendrite loopback test that a non-validator gets 403.
+
+---
+
+## Phase G: packaging, configuration, docs
+
+### G.1 Docker image and compose
+- **Problem:** operators installed Python, conda and several GB of dependencies by hand and ran the neurons under `nohup`. Nothing restarted them after a crash or reboot, logs grew without limit, and state was scattered in the repo directory.
+- **Fix/Now:**
+  - `Dockerfile`: `python:3.12-slim`, multi-stage, installed from `requirements-lock.txt`. The image is 586 MB, has no torch, and runs as a non-root user (the host's UID/GID, so `./data` stays owned by you).
+  - `docker-compose.yml` has one service per role (profiles `validator` / `miner`):
+    - host networking, `restart: unless-stopped`, 60 s stop grace, log rotation (5 × 50 MB)
+    - `.env` passed via `env_file`
+    - wallets mounted read-only at `/wallets`, state bind-mounted at `/data`
+  - In-container paths (`CHIPFORGE_DATA_DIR`, `MINER_CHALLENGE_DIR`, `WALLET_PATH`) are pinned in compose, so host values in `.env` can't break them.
+  - `docker/entrypoint.sh` builds the command line from `.env` (`NETUID`, `SUBTENSOR_NETWORK`, optional `SUBTENSOR_CHAIN_ENDPOINT`, `WALLET_NAME`, hotkeys, `AXON_PORT`, `BT_LOG_LEVEL`). Extra arguments are appended.
+- **Verified:** both images were started against testnet with a throwaway, unregistered wallet and a dead challenge-server URL:
+  - state, logs and `validator_data/` were written to `/data`
+  - the loop survived the unreachable server
+  - the healthcheck reported alive
+  - the miner axon answered a non-validator with HTTP 403
+  - SIGTERM stopped it cleanly
+- **Changes existing flow?** No. `start_validator.sh`, `start_miner.sh` and `submit_solution.sh` still work as before; Docker is an additional way to run.
+
+### G.2 Heartbeat healthcheck (`chipforge/heartbeat.py`)
+- Each neuron rewrites `<data dir>/heartbeat-<role>` every `HEARTBEAT_SECONDS` (30) from an asyncio task. The file goes stale if the event loop blocks or wedges, not only if the process dies.
+- `python -m chipforge.heartbeat validator --max-age 180` is the container healthcheck, also shown by `make status`.
+
+### G.3 Makefile
+- **Run the containers:** `make up | down | restart | logs | status` (`ROLE=miner` for the miner).
+- **Backups:** `make backup-state` writes a tarball of the data dir to `./backups`. It leaves out challenge packages and never prunes anything.
+- **Migration:** `make migrate-state` copies (never moves or overwrites) the old repo-root state files into `./data`, so a bare-metal validator continues where it left off.
+- **Miner CLI:** `make submit FILE=…` and `make cli ARGS="…"` run the miner CLI in the image.
+- **Tests:** `make test` runs the suite in a throwaway container as your user.
+- `DATA_DIR` is taken from `.env` if set there.
+
+### G.4 `.env.example` rewritten
+- It lists every setting the code reads, grouped as chain, wallet, challenge server, validator rewards, validator evaluation, miner, and storage/runtime, each with its default and what it does.
+- It no longer contains a placeholder secret (`VALIDATOR_SECRET_KEY=abc`) or an empty `NETUID`.
+- Inline comments were removed: some tools (`source .env` in the shell scripts) don't strip them.
+
+### G.5 Docs
+- **README:**
+  - Docker quick start
+  - What the validator does each cycle, and the reward rule (`MINER_EMISSION_PERCENTAGE`, burn to UID 0, no winner sync)
+  - EDA server hardening (no API key: keep 8080 private)
+  - Miner polling/download behaviour and the 50 MB limit
+  - `/validator/sync` in the API list
+  - Health-check commands
+  - `./start_miner` / `./start_validator` typos fixed
+- **`MINER_CLI_COMMANDS.md`:** flags usable on either side of the command, `--wallet.path`, signed history requests, what `download` now fetches, 50 MB, and the Docker usage.
+
+### G.6 Found while running the containers
+- **Filename fallback looked in the wrong directory:** `BatchProcessor` created and read `./validator_data/submissions` relative to the working directory, while the API client saves downloads under `CHIPFORGE_DATA_DIR`. With a data dir set, the filename fallback for hotkeys looked in the wrong place, and in the container the validator crashed at startup (read-only working dir). It now uses the data dir. Regression test added.
+- **Rejected weights were retried every loop:** a rejected or failed `set_weights` (unregistered hotkey, RPC down) was retried on every 10 s loop, one extrinsic each time. The same weights are now retried after 30 s, 60 s, 120 s … up to 10 minutes. Different weights (a new winner) are still tried immediately, and a success resets the backoff.

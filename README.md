@@ -33,10 +33,34 @@ ChipForge operates as a competitive platform where:
 
 ### Prerequisites
 
-- Python 3.12
+- Docker with the compose plugin (recommended), or Python 3.12
 - Bittensor wallet with registered hotkey
 - Access to Chipforge Challenge Server API
 - Chipforge EDA Server (for validators)
+
+### Running with Docker (recommended)
+
+All settings live in `.env`; [`.env.example`](.env.example) documents every one of them.
+
+```bash
+git clone https://github.com/TatsuProject/ChipForge_SN108
+cd ChipForge_SN108
+cp .env.example .env        # set NETUID, WALLET_NAME, hotkeys (+ VALIDATOR_SECRET_KEY for validators)
+
+make up                     # validator
+make up ROLE=miner          # miner
+make logs                   # follow logs        (add ROLE=miner for the miner)
+make status                 # container + heartbeat
+make restart / make down
+make backup-state           # tar.gz of ./data into ./backups
+```
+
+- **Wallets:** `WALLET_DIR` (default `~/.bittensor/wallets`) is mounted read-only. `WALLET_NAME` is the wallet's folder name inside it, not a path.
+- **State:** everything that must survive restarts (validator state, emission state, bans, downloaded submissions, logs, miner challenge packages) is kept in `./data` (`DATA_DIR`). Moving from a bare-metal validator? Run `make migrate-state` once: it copies (never moves) the old state files from the repo root into `./data`.
+- **Networking:** the containers use host networking (Linux). The validator reaches the EDA server at `EDA_SERVER_URL` (default `http://localhost:8080`); the miner's axon listens on `AXON_PORT` (default 8091), which must be reachable from the internet.
+- **Health:** each neuron rewrites a heartbeat file every 30 s from its event loop; the container is marked unhealthy if it goes stale for 3 minutes, and `restart: unless-stopped` brings it back after crashes and reboots. Logs are rotated (5 × 50 MB).
+- **Miner CLI in Docker:** `make submit FILE=solution.zip`, or any command with `make cli ARGS="status"`.
+- `make test` runs the test-suite in a throwaway container.
 
 ### For Miners
 
@@ -85,10 +109,15 @@ CHIPFORGE_LIVE_TESTS=1 pytest -m live    # optional: hits testnet (netuid 440 by
 
 #### Running a Miner
 
-Set parameters in .env file and run:
+Set parameters in `.env` (see `.env.example`) and run:
 ```bash
-./start_miner
+./start_miner.sh
 ```
+
+The miner polls the challenge server every `MINER_POLL_SECONDS` (default 300 s) and
+immediately when a validator announces a new challenge, then downloads and extracts the
+challenge package to `downloaded_active_challenge/<challenge_id>/`. A failed download is
+retried on the next poll. The axon only answers hotkeys with a validator permit.
 
 #### Running with nohup (background process)
 
@@ -138,7 +167,7 @@ python3 python_scripts/miner_cli.py status
 # List all your submissions
 python3 python_scripts/miner_cli.py submissions
 
-# Download challenge information and test cases
+# Download and extract the challenge package (spec, testbench) + challenge info
 python3 python_scripts/miner_cli.py download
 
 # Submit a solution (with validation)
@@ -163,9 +192,12 @@ You can also use the miner CLI directly with explicit arguments:
 python3 python_scripts/miner_cli.py submit solution.zip \
     --wallet.name YOUR_WALLET \
     --wallet.hotkey YOUR_HOTKEY \
-    --api_url http://your-api-url:8000 \
+    --api_url https://api.chipforge.io \
     --check_status
 ```
+
+`--wallet.name`, `--wallet.hotkey`, `--wallet.path` and `--api_url` can be given before or
+after the command.
 
 For more details, see [MINER_CLI_COMMANDS.md](MINER_CLI_COMMANDS.md).
 
@@ -178,7 +210,7 @@ Solutions must be packaged as ZIP files containing:
 - README with design description (optional)
 
 **Important Constraints:**
-- Maximum file size: **10MB**
+- Maximum file size: **50 MB**
 - File must be a valid ZIP archive
 - The miner CLI tool automatically validates these requirements before submission
 
@@ -194,11 +226,23 @@ Pull and run Chipforge EDA Server:
 ```
 https://github.com/TatsuProject/chipforge_eda_server
 ```
+The EDA server has no API key: keep its port (8080) closed to the internet, or bind it to
+`127.0.0.1` on the validator machine.
 
-Set parameters in .env file and run:
+Set parameters in `.env` (see `.env.example`; `VALIDATOR_SECRET_KEY` goes there, not on the
+command line) and run:
 ```bash
-./start_validator
+./start_validator.sh
 ```
+
+What the validator does each cycle:
+- polls the challenge server (`/validator/sync`, one cached request for challenge, batch, bans and test-case version),
+- downloads the exposed batch (each file's sha256 is checked against the hash the miner signed) and evaluates it on the EDA server within the batch's deadline,
+- submits scores, and if a submission beats the challenge's best qualified score, it becomes this validator's winner,
+- puts weights on chain immediately when the winner changes (within the chain's rate limit) and refreshes them every `WEIGHTS_REFRESH_SECONDS`: the winner gets `MINER_EMISSION_PERCENTAGE` percent, the rest is burned to UID 0.
+
+Each validator picks its winner from its own evaluations; there is no winner sync between
+validators or with the challenge server.
 
 #### Running with nohup (background process)
 
@@ -270,7 +314,7 @@ Each submission is evaluated across four key metrics:
 
 - Submissions are ranked by overall score
 - Only submissions that beat the current challenge-wide best score receive rewards
-- Weights are set to reward the highest-scoring submission
+- Weights reward the highest-scoring submission with `MINER_EMISSION_PERCENTAGE` of the validator's weight; the rest is burned
 - Emission burning occurs when no submissions exceed quality thresholds
 - The winner of a challenge will keep getting reward for specific time after challenge expiration
 
@@ -295,6 +339,7 @@ GET  /api/v1/challenges/{id}/submissions/hotkey/{hotkey}  # Check submissions
 ### Validator Endpoints
 
 ```
+GET  /api/v1/validator/sync                 # Challenge, batch, bans, test-case version in one call (ETag)
 GET  /api/v1/challenges/{id}/batch/current  # Get current evaluation batch
 GET  /api/v1/challenges/{id}/submissions/{submission_id}/download  # Download submission
 POST /api/v1/challenges/{id}/submissions/{submission_id}/submit_score  # Submit evaluation
@@ -306,7 +351,7 @@ POST /api/v1/challenges/{id}/submissions/{submission_id}/submit_score  # Submit 
 
 The subnet uses a dynamic batch system:
 - Submissions are grouped into evaluation batches
-- Each batch has a download window (10 minutes) and evaluation window (20 minutes)
+- Each batch has a download window and an evaluation window; the lengths come from the challenge server
 - Only one batch is exposed to validators at a time
 - Batches transition: EXPOSED → EVALUATING → COMPLETED
 
@@ -329,8 +374,12 @@ The subnet uses a dynamic batch system:
 ### Health Checks
 
 ```bash
-# Check challenge server health
-curl http://challenge-server:8000/health
+# Challenge server
+curl https://api.chipforge.io/health
+# EDA server (validators)
+curl http://localhost:8080/health
+# Validator / miner under Docker
+make status
 ```
 
 ## Troubleshooting
@@ -345,7 +394,7 @@ curl http://challenge-server:8000/health
 2. **Submission Upload Failed**
    - Use `miner_cli.py submit solution.zip --dry_run` to validate before submitting
    - Check ZIP file format and contents
-   - Verify file size limits (10MB maximum - enforced by miner CLI)
+   - Verify file size limits (50 MB maximum - checked by the miner CLI before uploading)
    - Ensure proper authentication headers
    - Check wallet configuration in `.env` file or command-line arguments
 

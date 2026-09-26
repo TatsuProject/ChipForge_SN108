@@ -6,6 +6,7 @@ Receives challenge notifications and manages challenge downloads
 
 import bittensor as bt
 from chipforge.protocol import SimpleMessage
+from chipforge.heartbeat import heartbeat_loop
 from dotenv import load_dotenv
 import os
 import asyncio
@@ -343,6 +344,7 @@ class ChipForgeMiner:
         logger.info(f"Waiting for synapses from validators...")
 
         polling_task = asyncio.create_task(self.poll_for_challenges())
+        heartbeat_task = asyncio.create_task(heartbeat_loop("miner", self._stop))
         try:
             while not self._stop.is_set():
                 await self.maybe_sync_metagraph()
@@ -353,6 +355,7 @@ class ChipForgeMiner:
         finally:
             self.request_stop()
             polling_task.cancel()
+            heartbeat_task.cancel()
             self.axon.stop()
             logger.info("ChipForge Miner stopped")
 

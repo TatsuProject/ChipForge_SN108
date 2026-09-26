@@ -60,3 +60,10 @@ async def test_deadline_passed_to_eda(processor):
     await bp.process_batch("c1", {"batch_id": "b3", "evaluation_ends_at": "2026-09-26T12:00:00+00:00"})
     deadline = api.evaluate_submissions_with_eda_server.call_args.kwargs["deadline"]
     assert deadline.isoformat() == "2026-09-26T12:00:00+00:00"
+
+
+def test_submissions_dir_follows_data_dir(processor, tmp_path):
+    """The filename fallback must look where the API client saves downloads (found by
+    running the container with CHIPFORGE_DATA_DIR=/data and a read-only working dir)."""
+    bp, _, _ = processor
+    assert bp.submissions_dir == tmp_path / "validator_data" / "submissions"

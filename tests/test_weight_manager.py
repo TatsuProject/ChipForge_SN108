@@ -74,12 +74,34 @@ async def test_apply_submits_lists_without_waiting_for_finalization():
     assert kwargs["netuid"] == 108 and kwargs["wait_for_finalization"] is False
 
 
-async def test_rejected_extrinsic_is_a_failure_and_is_retried():
+async def test_rejected_extrinsic_is_a_failure_and_is_retried_after_backoff(monkeypatch):
+    import validator_utils.weight_manager as wm_mod
+    clock = [1000.0]
+    monkeypatch.setattr(wm_mod.time, "monotonic", lambda: clock[0])
     wm, subtensor = _manager(response=ExtrinsicResponse(False, "rejected"))
     assert await wm.apply(WeightTarget.winner("hk_winner")) is False
+    assert await wm.apply(WeightTarget.winner("hk_winner")) is False     # next loop: backing off
+    assert subtensor.set_weights.call_count == 1
+    clock[0] += 31
     subtensor.set_weights.return_value = ExtrinsicResponse(True, "ok")
     assert await wm.apply(WeightTarget.winner("hk_winner")) is True
     assert subtensor.set_weights.call_count == 2
+
+
+async def test_backoff_grows_and_a_new_target_is_tried_at_once(monkeypatch):
+    import validator_utils.weight_manager as wm_mod
+    clock = [1000.0]
+    monkeypatch.setattr(wm_mod.time, "monotonic", lambda: clock[0])
+    wm, subtensor = _manager(response=ExtrinsicResponse(False, "not registered"))
+    delays = []
+    for _ in range(6):
+        await wm.apply(WeightTarget.burn())
+        delays.append(wm._retry_at - clock[0])
+        clock[0] = wm._retry_at
+    assert delays == [30, 60, 120, 240, 480, 600]                         # capped at 10 minutes
+    assert subtensor.set_weights.call_count == 6
+    await wm.apply(WeightTarget.winner("hk_winner"))                      # different weights
+    assert subtensor.set_weights.call_count == 7
 
 
 async def test_unchanged_weights_are_not_resubmitted():

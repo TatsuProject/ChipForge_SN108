@@ -1,6 +1,7 @@
 # neurons/validator_utils/logging_config.py
 
 import logging
+import os
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from datetime import datetime
@@ -16,7 +17,7 @@ def setup_validator_logging(log_level: str = "INFO"):
         log_level: Logging level (DEBUG, INFO, WARNING, ERROR)
     """
     # Create logs directory if it doesn't exist
-    log_dir = Path("logs")
+    log_dir = Path(os.getenv("CHIPFORGE_DATA_DIR", ".")).expanduser() / "logs"
     log_dir.mkdir(exist_ok=True, parents=True)
     
     # Convert log level string to logging constant
