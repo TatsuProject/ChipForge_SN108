@@ -54,3 +54,54 @@ Owner decisions this branch follows:
 - **Problem:** only Ctrl-C was handled, so `docker stop` / `kill` killed the process mid-cycle.
 - **Fix/Now:** SIGTERM and SIGINT stop the loop after the current step and save state before exiting.
 - **Changes existing flow?** No.
+
+---
+
+## Phase B: evaluation correctness (protects miners)
+
+### B.1 A validator that can't evaluate no longer claims batches
+- **Problem:**
+  - With the test-case zip missing, the validator ran a *dummy evaluator* and sent zeros for the whole batch.
+  - With the EDA server down, every submission became a failed evaluation.
+  - Either way the batch was claimed, and each failure used up one of the miner's 3 rebatch attempts. After 3, the submission becomes `EXHAUSTED`.
+- **Fix/Now:**
+  - Before downloading a batch, the validator checks that the EDA server is reachable (`GET /health`) and that the test cases are present. If either fails it **skips the batch** (logged as an error) so other validators handle it, and it keeps rewarding or burning per its reward window.
+  - With the test cases missing, the evaluator returns nothing instead of zeros.
+  - The dummy evaluator only runs when `USE_DUMMY_EVALUATION=true`.
+- **Changes existing flow?** Yes, intentionally: a broken validator stops harming miners.
+
+### B.2 EDA results read correctly
+- **Problem:** the EDA server reports `result` (`ACCEPTED`/`REJECTED`/`ERROR`) and `error.fault`/`retryable`, which the client ignored. A system error (`overall: null`) crashed the notes formatting and fell back to a generic failure.
+- **Fix/Now:**
+  - `ERROR` (fault `system`: toolchain, bundle, infrastructure) is never the miner's score. It is sent as a retryable failed evaluation with the EDA error code in the details.
+  - `REJECTED` (fault `miner`) is a real 0 with the reason (code, stage, message) in the notes and details, so miners see why.
+- **Changes existing flow?** Miner-fault rejections now show the reason. Scoring is unchanged.
+
+### B.3 EDA time budget follows the server's deadline
+- **Problem:**
+  - Up to 8 requests were sent at once to an EDA server with fewer lanes, so queue time counted against each timeout.
+  - The batch timeout ran from when the validator picked up the batch, not from the server's `evaluation_ends_at`. A late pick-up could finish after the window closed and get 403 on every score.
+- **Fix/Now:**
+  - At most `EDA_MAX_CONCURRENCY` (default 4) requests in flight.
+  - Each request's timeout is the time left until `evaluation_ends_at` minus `EDA_DEADLINE_BUFFER_SECONDS` (default 90, kept for submitting scores). The batch timeout is `evaluation_ends_at` minus 15 s.
+  - A batch closing in under `MIN_BATCH_SECONDS` (default 180) is skipped.
+  - Falls back to the old window-based budget when the server gives no deadline.
+- **Changes existing flow?** Fewer timeouts; no late submissions.
+
+### B.4 Rewarded hotkey from the batch, downloads verified
+- **Problem:** the rewarded miner's hotkey was parsed out of the download filename, and that filename was used as a local path without cleaning it. Downloads weren't checked.
+- **Fix/Now:**
+  - The hotkey comes from the batch entry (challenge server `06218ec`+), with filename parsing only as a fallback for older servers.
+  - Each download is checked against the `file_hash` the miner signed, and a mismatch is discarded.
+  - Files are saved under a sanitized basename.
+- **Changes existing flow?** No, apart from rejecting tampered files.
+
+### B.5 Leaner EDA calls
+- **Before:** each evaluation opened a new HTTP session, wrote the ZIP to a temp file just to read it back, and re-read the test-case zip from disk.
+- **Now:** one shared session, bytes sent directly, test cases read once per batch.
+- Also fixed: `check_testcase_files_exist` referenced an undefined `file_path`, and the validator data directory now follows `CHIPFORGE_DATA_DIR`.
+- **Changes existing flow?** No.
+
+### B.6 EDA server: no API key (companion change in `chipforge_eda_server`, branch `remove-api-key`)
+- The gateway no longer checks `EDA_API_KEY`/`X-API-Key` (owner decision), and it gains `GET /health` for the pre-flight check. The validator never sent a key, so nothing changes on the client.
+- **Operator note:** the gateway runs the uploaded evaluator's `run.py` as root. **Allow port 8080 only from your validator** (security group or firewall), or bind `127.0.0.1:8080` when co-located.

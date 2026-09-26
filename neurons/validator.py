@@ -29,6 +29,7 @@ from validator_utils import (
     BannedColdkeysManager,
 )
 from validator_utils.weight_manager import WeightTarget
+from validator_utils.api_client import parse_server_time
 
 # Configure logging with daily rotation
 setup_validator_logging(log_level="INFO")
@@ -334,6 +335,22 @@ class ChipForgeValidator:
             # Don't raise exception - this is a non-critical update check
 
     
+    def _target_current_challenge_reward(self):
+        """Weight target while no batch is being evaluated: keep rewarding the current
+        challenge winner during its reward window, otherwise burn."""
+        current_best_hotkey, current_best_score = self.state.current_challenge_best
+        if self.emission_manager.should_burn_emissions(current_best_score):
+            logger.info("Burning emissions - no submissions in current challenge")
+            self.burn_weights("no reward target")
+            return
+        reward_hotkey = self.emission_manager.get_reward_hotkey(current_best_hotkey, current_best_score)
+        if reward_hotkey:
+            logger.info(f"Setting current challenge winner weights: {reward_hotkey[:12]}...")
+            self.set_weights_with_ban_check(context="current challenge winner", winner_hotkey=reward_hotkey)
+        else:
+            logger.info("No qualified winner for rewards - burning emissions")
+            self.burn_weights("no reward target")
+
     async def run_evaluation_cycle(self):
         """Main evaluation cycle with dynamic scheduling"""
         try:
@@ -695,41 +712,40 @@ class ChipForgeValidator:
 
             if not batch or already_processed_batch:
                 # No batch available
-                current_challenge_score = self.state.current_challenge_best[1] if hasattr(self.state, 'current_challenge_best') else 0.0
-                
-                if self.emission_manager.should_burn_emissions(current_challenge_score):
-                    logger.info("Burning emissions - no submissions in current challenge")
-                    self.burn_weights("no reward target")
-                else:
-                    # Get reward hotkey with score comparison
-                    current_best_hotkey = self.state.current_challenge_best[0] if hasattr(self.state, 'current_challenge_best') else None
-                    current_best_score = self.state.current_challenge_best[1] if hasattr(self.state, 'current_challenge_best') else 0.0
-
-                    reward_hotkey = self.emission_manager.get_reward_hotkey(current_best_hotkey, current_best_score)
-                    if reward_hotkey:
-                        logger.info(f"Setting current challenge winner weights: {reward_hotkey[:12]}...")
-                        self.set_weights_with_ban_check(context="current challenge winner", winner_hotkey=reward_hotkey)
-                    else:
-                        logger.info("No qualified winner for rewards - burning emissions")
-                        self.burn_weights("no reward target")
+                self._target_current_challenge_reward()
                 return
 
             batch_id = batch['batch_id']
             logger.info(f"Processing batch {batch_id} with {len(batch.get('submissions', []))} submissions")
 
-            # Process the batch
-            logger.info(f"Starting to process batch {batch_id}")
-            # Compute batch processing timeout: (server download + evaluation window) - 45s safety buffer
-            # so we finish before the challenge server closes the batch evaluation window.
-            _BATCH_SAFETY_BUFFER = 45
-            dl_window = self.state.batch_download_window_seconds
-            eval_window = self.state.batch_evaluation_window_seconds
-            if dl_window > 0 and eval_window > 0:
-                batch_timeout = (dl_window + eval_window) - _BATCH_SAFETY_BUFFER
-                logger.info(f"Batch timeout derived from server config: {batch_timeout}s (download={dl_window}s + evaluation={eval_window}s - buffer={_BATCH_SAFETY_BUFFER}s)")
+            # Pre-flight: never claim a batch we can't evaluate (other validators will). Claiming
+            # it anyway would record failed evaluations and use up the miners' rebatch attempts.
+            if not await self.api_client.eda_server_ready():
+                logger.error(f"EDA server not reachable - skipping batch {batch_id}")
+                self._target_current_challenge_reward()
+                return
+            if not self.api_client.check_testcase_files_exist(challenge_id):
+                logger.error(f"Test cases for {challenge_id} unavailable - skipping batch {batch_id}")
+                self._target_current_challenge_reward()
+                return
+
+            # Time budget: the server's evaluation deadline for this batch, not our pickup time
+            _BATCH_SAFETY_BUFFER = 15
+            _MIN_BATCH_SECONDS = int(os.getenv("MIN_BATCH_SECONDS", "180"))
+            deadline = parse_server_time(batch.get('evaluation_ends_at'))
+            if deadline is not None:
+                batch_timeout = (deadline - datetime.now(timezone.utc)).total_seconds() - _BATCH_SAFETY_BUFFER
+                if batch_timeout < _MIN_BATCH_SECONDS:
+                    logger.warning(f"Batch {batch_id} closes in {batch_timeout:.0f}s - too late to evaluate, skipping")
+                    self._target_current_challenge_reward()
+                    return
+                logger.info(f"Batch timeout from server deadline: {batch_timeout:.0f}s")
             else:
-                batch_timeout = self.batch_processing_timeout
-                logger.info(f"Batch timeout using hardcoded fallback: {batch_timeout}s")
+                dl_window = self.state.batch_download_window_seconds
+                eval_window = self.state.batch_evaluation_window_seconds
+                batch_timeout = (dl_window + eval_window - 45) if dl_window > 0 and eval_window > 0 \
+                    else self.batch_processing_timeout
+                logger.info(f"Batch timeout from batch windows (no server deadline): {batch_timeout:.0f}s")
             try:
                 success = await asyncio.wait_for(
                     self.batch_processor.process_batch(challenge_id, batch),

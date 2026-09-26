@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Dict, Optional
 from dotenv import load_dotenv
 load_dotenv()
+from .api_client import parse_server_time
 from .weight_manager import WeightTarget
 
 logger = logging.getLogger(__name__)
@@ -157,9 +158,11 @@ class BatchProcessor:
                 logger.warning(f"No submissions downloaded for batch {batch_id}")
                 return False
 
-            # Evaluate with EDA server
+            # Evaluate with EDA server, within the server's evaluation deadline for this batch
             logger.info(f"Evaluating {len(downloaded_submissions)} submissions with EDA server")
-            evaluations = await self.api_client.evaluate_submissions_with_eda_server(challenge_id, downloaded_submissions)
+            evaluations = await self.api_client.evaluate_submissions_with_eda_server(
+                challenge_id, downloaded_submissions, deadline=parse_server_time(batch.get('evaluation_ends_at'))
+            )
             if not evaluations:
                 logger.error(f"No evaluations received from EDA server")
                 return False
@@ -177,8 +180,15 @@ class BatchProcessor:
 
             logger.info(f"Successfully submitted {len(successful_submissions)} evaluations")
 
-            # Extract hotkeys from filenames
-            submission_hotkeys = self.extract_hotkeys_from_filenames(batch_id, successful_submissions)
+            # Miner hotkeys: from the batch entries (challenge server provides them), falling
+            # back to parsing the downloaded filenames for older servers
+            submission_hotkeys = {
+                s['submission_id']: s['hotkey'] for s in batch.get('submissions', [])
+                if s.get('hotkey') and s['submission_id'] in successful_submissions
+            }
+            missing = {k: v for k, v in successful_submissions.items() if k not in submission_hotkeys}
+            if missing:
+                submission_hotkeys.update(self.extract_hotkeys_from_filenames(batch_id, missing))
 
             current_best_score = self.state.current_challenge_best[1] if hasattr(self.state, 'current_challenge_best') else 0.0
             current_best_hotkey = self.state.current_challenge_best[0] if hasattr(self.state, 'current_challenge_best') else None

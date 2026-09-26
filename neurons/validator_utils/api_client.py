@@ -8,9 +8,10 @@ Handles all API communications with challenge server and EDA server
 import asyncio
 import aiohttp
 import aiofiles
+import hashlib
 import logging
-import tempfile
 import os
+import re
 import json
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -20,7 +21,24 @@ import zipfile
 from dotenv import load_dotenv
 load_dotenv()
 
+from .storage import data_path
+
 logger = logging.getLogger(__name__)
+
+_SAFE_FILENAME = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
+
+
+def safe_filename(name: Optional[str], fallback: str) -> str:
+    """A server-provided filename reduced to a plain basename; anything else -> fallback."""
+    base = os.path.basename((name or "").strip().strip('"'))
+    return base if base and base not in (".", "..") and _SAFE_FILENAME.match(base) else fallback
+
+
+def parse_server_time(value) -> Optional[datetime]:
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")) if value else None
+    except ValueError:
+        return None
 
 
 class APIClient:
@@ -43,8 +61,12 @@ class APIClient:
         # Validator authentication
         self.validator_hotkey = self.wallet.hotkey.ss58_address
         
+        self.eda_max_concurrency = max(1, int(os.getenv("EDA_MAX_CONCURRENCY", "4")))
+        # Seconds kept free before the server's evaluation deadline for submitting scores
+        self.eda_deadline_buffer = int(os.getenv("EDA_DEADLINE_BUFFER_SECONDS", "90"))
+
         # Directories
-        self.base_dir = Path('./validator_data')
+        self.base_dir = data_path('validator_data')
         self.submissions_dir = self.base_dir / 'submissions'
         self.submissions_dir.mkdir(parents=True, exist_ok=True)
 
@@ -214,6 +236,9 @@ class APIClient:
         
         logger.info(f"Downloading {len(submissions)} submissions in parallel")
         
+        # Hash the miner signed, when the server provides it (challenge server >= 2026-09)
+        expected_hash = {s['submission_id']: s.get('file_hash') for s in submissions}
+
         # Create download tasks
         tasks = []
         for submission in submissions:
@@ -231,7 +256,12 @@ class APIClient:
             elif result is not None and isinstance(result, dict):
                 # Handle new return format with content, filename, and submission_id
                 content = result['content']
-                filename = result['filename']
+                filename = safe_filename(result.get('filename'), f"{submission_id}.zip")
+
+                expected = expected_hash.get(submission_id)
+                if expected and hashlib.sha256(content).hexdigest() != expected:
+                    logger.error(f"Download of {submission_id} does not match the hash the miner signed - discarded")
+                    continue
                 downloaded[submission_id] = content
                 
                 logger.info(f"Successfully downloaded {submission_id}: {len(content)} bytes")
@@ -470,154 +500,118 @@ class APIClient:
         
         return submission_hotkeys
     
-    async def evaluate_submissions_with_eda_server(self, challenge_id: str, submissions: Dict[str, bytes]) -> Dict[str, Dict]:
-        """Send submissions to EDA server for evaluation with test cases - PARALLEL VERSION"""
-        logger.info(f"Evaluating {len(submissions)} submissions with EDA server using test cases")
-        
-        # Fallback to dummy evaluation if configured
+    async def eda_server_ready(self) -> bool:
+        """Pre-flight: is the EDA server reachable? Any HTTP answer counts (older gateways
+        have no /health and answer 404); only a connection failure means unreachable."""
         if self.use_dummy_evaluation:
-            return await self._dummy_evaluate_submissions(submissions)
-        
-        # Get test case files
-        evaluator_zip_path = self.get_testcase_files(challenge_id)
-            
-        if not evaluator_zip_path.exists():
-            logger.error(f"Evaluator zip file not found: {evaluator_zip_path}")
-            return await self._dummy_evaluate_submissions(submissions)
-        
-        logger.info(f"Using test case files:")
-        logger.info(f" Validator's testcases Zip: {evaluator_zip_path}")
-        
-        # Create semaphore to limit concurrent requests to EDA server
-        semaphore = asyncio.Semaphore(8)  # Limit to 8 concurrent requests
+            return True
+        try:
+            async with self.session.get(f"{self.eda_server_url}/health",
+                                        timeout=aiohttp.ClientTimeout(total=10)) as response:
+                return response.status < 500 or response.status == 404
+        except Exception as e:
+            logger.error(f"EDA server {self.eda_server_url} unreachable: {e}")
+            return False
 
-        # EDA timeout = batch_processing_timeout - 120s.
-        # batch_processing_timeout = (download + evaluation windows from server) - 45s.
-        # Fall back to hardcoded 2640s if the server has not provided windows yet.
-        _BATCH_SAFETY_BUFFER = 45
-        _EDA_SAFETY_BUFFER = 120
-        _EDA_TIMEOUT_FALLBACK = 2640
+    def _eda_time_budget(self, deadline: Optional[datetime]) -> float:
+        """Seconds an EDA request may take: until the server's evaluation deadline minus a
+        buffer for submitting scores; falls back to the configured batch windows."""
+        if deadline is not None:
+            return (deadline - datetime.now(timezone.utc)).total_seconds() - self.eda_deadline_buffer
         dl_window = getattr(self.state, 'batch_download_window_seconds', 0) if self.state else 0
         eval_window = getattr(self.state, 'batch_evaluation_window_seconds', 0) if self.state else 0
         if dl_window > 0 and eval_window > 0:
-            batch_processing_timeout = (dl_window + eval_window) - _BATCH_SAFETY_BUFFER
-            eda_timeout_seconds = batch_processing_timeout - _EDA_SAFETY_BUFFER
-            logger.info(f"EDA timeout derived from server config: {eda_timeout_seconds}s (batch_timeout={batch_processing_timeout}s - eda_buffer={_EDA_SAFETY_BUFFER}s)")
-        else:
-            eda_timeout_seconds = _EDA_TIMEOUT_FALLBACK
-            logger.info(f"EDA timeout using hardcoded fallback: {eda_timeout_seconds}s")
+            return dl_window + eval_window - 45 - self.eda_deadline_buffer
+        return 2640
 
-        async def evaluate_single_submission(submission_id: str, submission_data: bytes) -> tuple[str, Dict]:
-            """Evaluate a single submission with semaphore control"""
-            async with semaphore:  # This limits concurrent requests
+    async def evaluate_submissions_with_eda_server(self, challenge_id: str, submissions: Dict[str, bytes],
+                                                   deadline: Optional[datetime] = None) -> Dict[str, Dict]:
+        """Evaluate submissions on the EDA server, at most EDA_MAX_CONCURRENCY at a time, each
+        within the time left before the server's evaluation deadline."""
+        logger.info(f"Evaluating {len(submissions)} submissions with EDA server using test cases")
+
+        if self.use_dummy_evaluation:
+            return await self._dummy_evaluate_submissions(submissions)
+
+        evaluator_zip_path = self.get_testcase_files(challenge_id)
+        if not evaluator_zip_path.exists():
+            # Never score miners without test cases: evaluate nothing, the batch is skipped
+            logger.error(f"Evaluator zip file not found: {evaluator_zip_path} - not evaluating")
+            return {}
+        evaluator_bytes = evaluator_zip_path.read_bytes()
+        semaphore = asyncio.Semaphore(self.eda_max_concurrency)
+
+        async def evaluate_single_submission(submission_id: str, submission_data: bytes) -> tuple:
+            async with semaphore:
+                budget = self._eda_time_budget(deadline)
+                if budget < 30:
+                    return submission_id, self._generate_fallback_evaluation(
+                        submission_id,
+                        evaluation_details={'status': 'timeout', 'error': 'No time left before the evaluation window closes'},
+                        timeout_occurred=True,
+                    )
+                form_data = aiohttp.FormData()
+                form_data.add_field('design_zip', submission_data, filename=f'{submission_id}.zip',
+                                    content_type='application/zip')
+                form_data.add_field('evaluator_zip', evaluator_bytes, filename=f'{challenge_id}_validator.zip',
+                                    content_type='application/zip')
+                form_data.add_field('submission_id', submission_id)
+                logger.info(f"Sending {submission_id} to EDA server ({len(submission_data)} bytes, "
+                            f"time budget {budget:.0f}s)")
                 try:
-                    logger.info(f"Evaluating submission {submission_id} with EDA server and test cases")
-
-                    # Create temporary files for submission
-                    with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as design_temp:
-                        design_temp.write(submission_data)
-                        design_temp.flush()
-
-                        # Create timeout for each individual submission
-                        timeout = aiohttp.ClientTimeout(total=eda_timeout_seconds)
-                        
-                        async with aiohttp.ClientSession(timeout=timeout) as session:
-                            # Prepare multipart form data
-                            form_data = aiohttp.FormData()
-                            
-                            # Add design zip
-                            with open(design_temp.name, 'rb') as design_file:
-                                form_data.add_field('design_zip', design_file.read(), 
-                                                filename=f'{submission_id}.zip',
-                                                content_type='application/zip')
-                            
-                            # Add evaluator zip file
-                            with open(evaluator_zip_path, 'rb') as evaluator_zip_file:
-                                form_data.add_field('evaluator_zip', evaluator_zip_file.read(),
-                                                filename=f'{challenge_id}_validator.zip',
-                                                content_type='application/zip')
-
-                            # Add submission_id as form field
-                            form_data.add_field('submission_id', submission_id)
-                            
-                            logger.info(f"Sending evaluation request for {submission_id}:")
-                            logger.info(f"  Design zip size: {len(submission_data)} bytes")
-                            logger.info(f"  Validator's testcases zip size: {evaluator_zip_path.stat().st_size} bytes")
-                            
-                            try:
-                                async with session.post(
-                                    f"{self.eda_server_url}/evaluate",
-                                    data=form_data,
-                                ) as response:
-                                    logger.info(f"EDA server response status for {submission_id}: {response.status}")
-                                    
-                                    if response.status == 200:
-                                        result = await response.json()
-                                        logger.info(f"Successfully evaluated {submission_id} with EDA server")
-                                        logger.info(f"EDA response: {result}")
-                                        
-                                        # Transform EDA server response to expected format
-                                        evaluation_result = self._transform_eda_response(result, submission_id)
-                                        
-                                    else:
-                                        error_text = await response.text()
-                                        logger.error(f"EDA server error for {submission_id}: {response.status} - {error_text}")
-                                        # Use fallback evaluation
-                                        evaluation_result = self._generate_fallback_evaluation(submission_id)
-                                        
-                            except asyncio.TimeoutError:
-                                logger.error(f"Timeout evaluating {submission_id} with EDA server")
-                                evaluation_result = self._generate_fallback_evaluation(
-                                    submission_id,
-                                    evaluation_details={'status': 'timeout', 'error': f'EDA server evaluation timed out after {eda_timeout_seconds} seconds'},
-                                    timeout_occurred=True,
-                                )
-                            except Exception as eval_error:
-                                logger.error(f"Exception during EDA evaluation for {submission_id}: {eval_error}")
-                                evaluation_result = self._generate_fallback_evaluation(submission_id)
-                        
-                        # Clean up temporary design file
-                        os.unlink(design_temp.name)
-                        
-                    return submission_id, evaluation_result
-                        
+                    async with self.session.post(f"{self.eda_server_url}/evaluate", data=form_data,
+                                                 timeout=aiohttp.ClientTimeout(total=budget)) as response:
+                        if response.status == 200:
+                            result = await response.json()
+                            logger.debug(f"EDA response for {submission_id}: {result}")
+                            return submission_id, self._transform_eda_response(result, submission_id)
+                        error_text = await response.text()
+                        logger.error(f"EDA server error for {submission_id}: {response.status} - {error_text[:500]}")
+                        return submission_id, self._generate_fallback_evaluation(
+                            submission_id, evaluation_details={'status': 'eda_http_error', 'http_status': response.status})
+                except asyncio.TimeoutError:
+                    logger.error(f"Timeout evaluating {submission_id} with EDA server after {budget:.0f}s")
+                    return submission_id, self._generate_fallback_evaluation(
+                        submission_id,
+                        evaluation_details={'status': 'timeout', 'error': f'EDA server evaluation timed out after {budget:.0f} seconds'},
+                        timeout_occurred=True,
+                    )
                 except Exception as e:
-                    logger.error(f"Error evaluating submission {submission_id}: {e}")
-                    import traceback
-                    logger.error(f"Traceback: {traceback.format_exc()}")
-                    
-                    # Use fallback evaluation
-                    return submission_id, self._generate_fallback_evaluation(submission_id)
-        
-        # Create tasks for all submissions to run in parallel
-        tasks = [
-            evaluate_single_submission(submission_id, submission_data)
-            for submission_id, submission_data in submissions.items()
-        ]
-        
-        logger.info(f"Starting parallel evaluation of {len(tasks)} submissions")
-        
-        # Wait for all evaluations to complete
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Process results and handle any exceptions
+                    logger.error(f"Exception during EDA evaluation for {submission_id}: {e}")
+                    return submission_id, self._generate_fallback_evaluation(
+                        submission_id, evaluation_details={'status': 'eda_unreachable', 'error': str(e)[:300]})
+
+        results = await asyncio.gather(
+            *[evaluate_single_submission(sid, data) for sid, data in submissions.items()],
+            return_exceptions=True,
+        )
         evaluations = {}
         for result in results:
             if isinstance(result, Exception):
-                logger.error(f"Task failed with exception: {result}")
-                # You might want to generate a fallback evaluation for failed tasks
+                logger.error(f"Evaluation task failed: {result}")
                 continue
-            
             submission_id, evaluation_result = result
             evaluations[submission_id] = evaluation_result
-        
+
         logger.info(f"EDA server evaluation completed for {len(evaluations)} submissions")
         return evaluations
 
     def _transform_eda_response(self, eda_result: Dict, submission_id: str) -> Dict:
-        """Transform EDA server response to expected format"""
-        # Extract the final score from the new response format
-        final_score = eda_result.get('final_score', {})
+        """Transform EDA server response to expected format.
+
+        result ERROR (fault "system": toolchain/bundle/infra, overall is null) is never the
+        miner's score: it becomes a retryable failed evaluation. REJECTED (fault "miner")
+        is a real 0 and carries the reason for the miner."""
+        final_score = eda_result.get('final_score') or {}
+        error = eda_result.get('error') or {}
+        if not isinstance(error, dict):
+            error = {'message': str(error)}
+        if eda_result.get('result') == 'ERROR' or final_score.get('overall') is None:
+            logger.error(f"EDA system error for {submission_id}: {error.get('code')} {error.get('message')}")
+            return self._generate_fallback_evaluation(submission_id, evaluation_details={
+                'status': 'eda_system_error', 'code': error.get('code'), 'stage': error.get('stage'),
+                'message': error.get('message'), 'retryable': error.get('retryable'),
+            })
 
         # Extract functionality score from verilator results
         verilator_results = eda_result.get('verilator_results', {})
@@ -659,6 +653,10 @@ class APIClient:
             except Exception:
                 details['verilator_build_log'] = raw_log
 
+        if error:
+            # Miner-fault rejection: tell the miner what failed and where
+            details['error'] = {k: error.get(k) for k in ('code', 'stage', 'message', 'detail') if error.get(k)}
+
         openlane_success = openlane_results.get('success', False)
         if openlane_success:
             inner = openlane_results.get('results', {})
@@ -682,7 +680,11 @@ class APIClient:
             'functional_gate': functional_gate,
             'overall_gate': overall_gate,
             'timeout_occurred': False,
-            'evaluation_notes': f"EDA evaluation for {submission_id} - Functionality: {functionality_score:.2f}, Overall: {final_score.get('overall', 0.0):.2f}, Gates: func={functional_gate}, overall={overall_gate}",
+            'evaluation_notes': (
+                f"EDA evaluation for {submission_id} - Functionality: {float(functionality_score or 0):.2f}, "
+                f"Overall: {float(final_score.get('overall') or 0):.2f}, Gates: func={functional_gate}, overall={overall_gate}"
+                + (f", Rejected: {error.get('code')} ({error.get('stage')})" if error.get('code') else "")
+            ),
             'evaluation_details': json.dumps(details),
         }
 
@@ -968,7 +970,7 @@ class APIClient:
             evaluator_zip_path = self.base_dir / 'testcases' / f"{challenge_id}_validator.zip"
             
             if not evaluator_zip_path.exists():
-                logger.warning(f"Missing test case file: {file_path}")
+                logger.warning(f"Missing test case file: {evaluator_zip_path}")
                 return False
             
             logger.debug(f"All test case files exist for challenge {challenge_id}")

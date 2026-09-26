@@ -43,3 +43,20 @@ async def test_gate_failed_score_does_not_crown(processor):
     await bp.process_batch("c1", {"batch_id": "b1"})
     assert all(t.winner_hotkey != "hk_winner" for t in targets)
     assert targets[-1] == WeightTarget.burn("no qualified winner")
+
+
+async def test_hotkey_comes_from_batch_entry_not_filename(processor):
+    bp, api, targets = processor
+    bp.extract_hotkeys_from_filenames = lambda batch_id, subs: {"s1": "hk_from_filename"}
+    api.evaluate_submissions_with_eda_server = AsyncMock(return_value={
+        "s1": {"overall_score": 50.0, "functional_gate": True, "overall_gate": True}})
+    await bp.process_batch("c1", {"batch_id": "b2", "submissions": [{"submission_id": "s1", "hotkey": "hk_server"}]})
+    assert targets[-1].winner_hotkey == "hk_server"
+
+
+async def test_deadline_passed_to_eda(processor):
+    bp, api, targets = processor
+    api.evaluate_submissions_with_eda_server = AsyncMock(return_value={})
+    await bp.process_batch("c1", {"batch_id": "b3", "evaluation_ends_at": "2026-09-26T12:00:00+00:00"})
+    deadline = api.evaluate_submissions_with_eda_server.call_args.kwargs["deadline"]
+    assert deadline.isoformat() == "2026-09-26T12:00:00+00:00"
