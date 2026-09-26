@@ -135,6 +135,25 @@ validator's score and notes.
 
 ---
 
+### 3c. `reveals` and `reveal-download` - Winning Designs
+
+When the subnet reveals winning designs (see the reveal policy on the leaderboard's Winners
+tab), any hotkey registered on the subnet can download them. Downloads are signed with your
+hotkey, limited per day and logged.
+
+```bash
+# Reveal policy and the status of each winning design of the active challenge
+python3 python_scripts/miner_cli.py reveals [--challenge_id ID]
+
+# Download a revealed design to ./revealed_designs/<submission_id>.zip
+python3 python_scripts/miner_cli.py reveal-download <submission_id> [--output DIR]
+```
+
+The download is checked against the design's sha256 before it is saved. Submitting a
+byte-identical copy of a winning design is refused by the challenge server.
+
+---
+
 ### 4. `submit` - Submit Solution
 
 Submits a solution ZIP file to the challenge server.

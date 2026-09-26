@@ -228,3 +228,35 @@ def test_cli_logs_request_is_signed_and_names_the_hotkey(monkeypatch):
     p = seen["params"]
     assert p["hotkey"] == kp.ss58_address
     assert kp.verify(f"{kp.ss58_address}{p['timestamp']}".encode(), bytes.fromhex(p["signature"]))
+
+
+def _signed_submitter(monkeypatch):
+    from python_scripts import miner_cli
+    kp = Keypair.create_from_mnemonic(Keypair.generate_mnemonic())
+    sub = miner_cli.SolutionSubmitter.__new__(miner_cli.SolutionSubmitter)
+    sub.api_url, sub.miner_hotkey = API, kp.ss58_address
+    sub.wallet = SimpleNamespace(hotkey=SimpleNamespace(sign=lambda data: kp.sign(data)))
+    return miner_cli, sub, kp
+
+
+def test_reveal_download_is_signed_and_hash_checked(monkeypatch):
+    import hashlib
+    miner_cli, sub, kp = _signed_submitter(monkeypatch)
+    design = b"PK-revealed"
+    seen = {}
+
+    def ok(url, params=None, timeout=None):
+        seen.update(url=url, params=params)
+        return SimpleNamespace(status_code=200, content=design, headers={"X-File-SHA256": hashlib.sha256(design).hexdigest()})
+    monkeypatch.setattr(miner_cli.requests, "get", ok)
+    got = sub.download_revealed_design("s1")
+    assert got["content"] == design and seen["url"] == f"{API}/api/v1/reveals/s1/download"
+    assert kp.verify(f"{kp.ss58_address}{seen['params']['timestamp']}".encode(), bytes.fromhex(seen["params"]["signature"]))
+
+    monkeypatch.setattr(miner_cli.requests, "get",
+                        lambda *a, **k: SimpleNamespace(status_code=200, content=b"tampered", headers={"X-File-SHA256": hashlib.sha256(design).hexdigest()}))
+    assert sub.download_revealed_design("s1") is None                      # mismatching bytes are discarded
+
+    monkeypatch.setattr(miner_cli.requests, "get",
+                        lambda *a, **k: SimpleNamespace(status_code=403, json=lambda: {"detail": {"reason": "scheduled"}}, text=""))
+    assert sub.download_revealed_design("s1") is None

@@ -276,6 +276,36 @@ class SolutionSubmitter:
         return None
 
 
+    def get_reveals(self, challenge_id: Optional[str] = None) -> Optional[Dict]:
+        """Reveal policy and the status of each winning design (public, no signature)."""
+        params = {"challenge_id": challenge_id} if challenge_id else None
+        response = requests.get(f"{self.api_url}/api/v1/public/reveals", params=params, timeout=30)
+        if response.status_code == 200:
+            return response.json()
+        logger.error(f"Could not list reveals: {response.status_code} {response.text[:200]}")
+        return None
+
+    def download_revealed_design(self, submission_id: str) -> Optional[Dict]:
+        """A revealed winning design (registered neurons only, signed). Returns
+        {"content", "sha256", "filename"}; the content is checked against the server's hash."""
+        url = f"{self.api_url}/api/v1/reveals/{submission_id}/download"
+        response = requests.get(url, params={**self.auth_params(), "hotkey": self.miner_hotkey}, timeout=300)
+        if response.status_code != 200:
+            try:
+                detail = response.json().get("detail")
+            except ValueError:
+                detail = response.text[:200]
+            logger.error(f"Download refused ({response.status_code}): {detail}")
+            return None
+        content = response.content
+        expected = response.headers.get("X-File-SHA256", "")
+        actual = hashlib.sha256(content).hexdigest()
+        if expected and expected != actual:
+            logger.error("Downloaded file does not match the server's hash; discarded")
+            return None
+        return {"content": content, "sha256": actual, "filename": f"{submission_id}.zip"}
+
+
 class MinerCLI:
     """Miner Command-Line Interface"""
     
@@ -578,6 +608,38 @@ class MinerCLI:
                         f"{(v['evaluation_notes'] or '').strip()[:200]}")
             logger.info(f"  full log: {path}")
 
+    def show_reveals(self, challenge_id: Optional[str] = None):
+        """Reveal policy and which winning designs can be downloaded."""
+        data = self.submitter.get_reveals(challenge_id)
+        if not data:
+            sys.exit(1)
+        policy = data["policy"]
+        if not policy["enabled"]:
+            logger.info("Design reveals are turned off on this subnet")
+        else:
+            delay = policy["delay_hours"]
+            logger.info(f"Reveal policy: {'after ' + format(delay, 'g') + 'h' if delay is not None else 'no timed reveal'}"
+                        f"{', immediately when overtaken' if policy['on_dethrone'] else ''}"
+                        f"{', all winners at challenge end' if policy['at_challenge_end'] else ''}"
+                        f"{', chain-confirmed winners only' if policy['require_chain_confirmation'] else ''}")
+        if not data["designs"]:
+            logger.info("No winning designs for this challenge yet")
+        for d in data["designs"]:
+            when = "available now" if d["revealed"] else (
+                f"reveals {self.format_timestamp(d['reveal_at'])}" if d["reveal_at"] else d["reason"].replace("_", " "))
+            logger.info(f"#{d['position']} {d['submission_id']}  UID {d['miner_uid']}  score {d['achieved_score']}  -> {when}")
+
+    def download_reveal(self, submission_id: str, output_dir: Optional[str] = None):
+        """Download a revealed winning design (your hotkey must be registered on the subnet)."""
+        result = self.submitter.download_revealed_design(submission_id)
+        if not result:
+            sys.exit(1)
+        out = Path(output_dir or "./revealed_designs")
+        out.mkdir(parents=True, exist_ok=True)
+        path = out / result["filename"]
+        path.write_bytes(result["content"])
+        logger.info(f"Saved {path} ({len(result['content']):,} bytes, sha256 {result['sha256'][:16]}...)")
+
     def submit_solution(self, solution_file: str, challenge_id: Optional[str] = None, 
                        check_status: bool = False, dry_run: bool = False):
         """Submit a solution file"""
@@ -720,6 +782,13 @@ Examples:
     logs_parser.add_argument('submission_id', type=str, help='Submission ID')
     logs_parser.add_argument('--output', '-o', type=str, help='Output directory (default: ./evaluation_logs/<submission_id>)')
 
+    # Reveal commands
+    reveals_parser = subparsers.add_parser('reveals', parents=[sub_common], help='Show the reveal policy and which winning designs are available')
+    reveals_parser.add_argument('--challenge_id', type=str, help='Challenge ID (default: active challenge)')
+    reveal_dl_parser = subparsers.add_parser('reveal-download', parents=[sub_common], help='Download a revealed winning design (registered neurons only)')
+    reveal_dl_parser.add_argument('submission_id', type=str, help='Submission ID of the winning design')
+    reveal_dl_parser.add_argument('--output', '-o', type=str, help='Output directory (default: ./revealed_designs)')
+
     # Submit command
     submit_parser = subparsers.add_parser('submit', parents=[sub_common], help='Submit solution file')
     submit_parser.add_argument('file', type=str, help='Path to solution ZIP file')
@@ -759,6 +828,10 @@ Examples:
             )
         elif args.command == 'logs':
             cli.show_logs(args.submission_id, output_dir=getattr(args, 'output', None))
+        elif args.command == 'reveals':
+            cli.show_reveals(challenge_id=getattr(args, 'challenge_id', None))
+        elif args.command == 'reveal-download':
+            cli.download_reveal(args.submission_id, output_dir=getattr(args, 'output', None))
         elif args.command == 'submit':
             cli.submit_solution(
                 solution_file=args.file,

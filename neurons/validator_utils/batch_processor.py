@@ -6,6 +6,7 @@ Handles batch evaluation and processing logic
 """
 
 import logging
+import os
 import traceback
 from typing import Dict
 from dotenv import load_dotenv
@@ -13,6 +14,16 @@ load_dotenv()
 from .api_client import parse_server_time
 from .storage import data_path
 from .weight_manager import WeightTarget
+
+
+def beats(score: float, target: float) -> bool:
+    """score beats target by at least MIN_IMPROVEMENT_PERCENT (0 = any higher score).
+    Must match the challenge server's MIN_IMPROVEMENT_PERCENT."""
+    try:
+        margin = max(0.0, float(os.getenv("MIN_IMPROVEMENT_PERCENT", "0") or 0))
+    except ValueError:
+        margin = 0.0
+    return score > target + abs(target) * margin / 100.0
 
 logger = logging.getLogger(__name__)
 
@@ -153,8 +164,8 @@ class BatchProcessor:
                     continue
 
                 # Check if score beats both current best AND baseline snapshot (from BEFORE submission)
-                if hotkey and overall_score > new_best_score:
-                    if overall_score > evaluation_baseline_snapshot:
+                if hotkey and beats(overall_score, new_best_score):
+                    if beats(overall_score, evaluation_baseline_snapshot):
                         new_best_score = overall_score
                         new_champion = hotkey
                         logger.info(f"New challenge champion found: {hotkey[:12]}... -> {overall_score} (beats previous: {current_best_score} and baseline snapshot: {evaluation_baseline_snapshot})")

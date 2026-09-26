@@ -313,3 +313,14 @@ Owner decisions this branch follows:
 
 ### F.7 `miner_cli.py logs <submission_id>`
 - The public website shows only a summary of each evaluation; raw EDA logs are no longer public (they can reveal hidden test details). This command fetches the full logs of **your own** submission from the new signed endpoint `GET /api/v1/submissions/{id}/evaluation_logs` (challenge server `a4f9517`) and saves one file per validator.
+
+## Phase H: winner design reveals and the improvement margin (with challenge server `ff45d54`)
+
+### H.1 `MIN_IMPROVEMENT_PERCENT` in the validator
+- **Why:** once winning designs can be revealed, someone could resubmit a revealed winner with a trivial tweak and take over by 0.01. With a margin, a new champion must beat both the current best and the score to beat by that percentage.
+- **Now:** `batch_processor.beats()`; default 0 is exactly the old `>` rule. **It must equal the challenge server's `MIN_IMPROVEMENT_PERCENT`**; each validator picks its own winner, so a mismatch would split validators.
+- **Changes existing flow?** No while it stays 0.
+
+### H.2 `miner_cli.py reveals` / `reveal-download <submission_id>`
+- `reveals` shows the reveal policy and each winning design's status: available, reveals at a given time, or waiting for chain confirmation.
+- `reveal-download` fetches a revealed design with a signed request (registered hotkeys only, rate limited, logged on the server), checks the sha256, and saves it to `./revealed_designs/`.

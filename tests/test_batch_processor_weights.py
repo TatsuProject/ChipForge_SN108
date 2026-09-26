@@ -67,3 +67,16 @@ def test_submissions_dir_follows_data_dir(processor, tmp_path):
     running the container with CHIPFORGE_DATA_DIR=/data and a read-only working dir)."""
     bp, _, _ = processor
     assert bp.submissions_dir == tmp_path / "validator_data" / "submissions"
+
+
+async def test_min_improvement_margin(processor, monkeypatch):
+    """With MIN_IMPROVEMENT_PERCENT the score must clear the baseline by that margin (same rule as the server)."""
+    bp, api, targets = processor
+    api.evaluate_submissions_with_eda_server = AsyncMock(return_value={
+        "s1": {"overall_score": 10.05, "functional_gate": True, "overall_gate": True}})       # baseline is 10.0
+    monkeypatch.setenv("MIN_IMPROVEMENT_PERCENT", "1")
+    await bp.process_batch("c1", {"batch_id": "m1"})
+    assert all(t.winner_hotkey != "hk_winner" for t in targets)
+    monkeypatch.setenv("MIN_IMPROVEMENT_PERCENT", "0")
+    await bp.process_batch("c1", {"batch_id": "m2"})
+    assert targets[-1].winner_hotkey == "hk_winner"
