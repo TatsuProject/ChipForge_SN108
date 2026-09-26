@@ -20,7 +20,10 @@ class _StubMetagraph:
 
 
 @pytest.fixture
-def miner(temp_wallet):
+def miner(temp_wallet, second_wallet):
+    import asyncio as _asyncio
+    import numpy as np
+    from types import SimpleNamespace
     from neurons.miner import ChipForgeMiner
 
     port = free_port()
@@ -33,6 +36,12 @@ def miner(temp_wallet):
     m.axon = axon
     m.current_challenge_id = None
     m.current_github_url = None
+    m.downloaded_challenges = set()
+    m._poll_now = _asyncio.Event()
+    # second_wallet plays the registered validator (the blacklist only lets validators in)
+    m.metagraph = SimpleNamespace(hotkeys=[second_wallet.hotkey.ss58_address], validator_permit=np.array([True]),
+                                  S=np.array([1.0]))
+    m.require_validator_permit = True
     m.setup_axon_handlers()
     axon.start()
     yield m
@@ -111,5 +120,18 @@ async def test_tampered_signature_rejected(miner, second_wallet):
         resp = (await dendrite.forward(axons=[miner.axon.info()], synapse=SimpleMessage(message="PING"), timeout=15))[0]
         assert resp.dendrite.status_code != 200
         assert resp.response == ""
+    finally:
+        await dendrite.aclose_session()
+
+
+async def test_non_validator_is_blacklisted(miner, second_wallet):
+    await _wait_until_listening(miner.axon)
+    miner.metagraph.validator_permit[0] = False
+    dendrite = bt.Dendrite(wallet=second_wallet)
+    try:
+        synapse = SimpleMessage(message="CHALLENGE_ACTIVE:chal-2:https://x:2026-09-26T00:00:00+00:00")
+        resp = (await dendrite.forward(axons=[miner.axon.info()], synapse=synapse, timeout=15))[0]
+        assert resp.dendrite.status_code == 403 and resp.response in (None, "")
+        assert miner.current_challenge_id is None
     finally:
         await dendrite.aclose_session()

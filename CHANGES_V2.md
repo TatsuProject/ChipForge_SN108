@@ -179,3 +179,68 @@ Owner decisions this branch follows:
 - **Problem:** after every batch (and on a new challenge) the validator waited up to 60 s for every miner's axon to answer before continuing.
 - **Fix/Now:** notifications run as background tasks with `MINER_NOTIFY_TIMEOUT` (default 12 s), and missing answers are logged at DEBUG.
 - **Changes existing flow?** Miners get the same messages; the validator doesn't wait for them.
+
+---
+
+## Phase F: miner
+
+### F.1 Challenge auto-download works with server-hosted challenges
+- **Problem:** the miner always rewrote the challenge URL into `<url>/archive/main.zip` (GitHub's archive format). The server now hands out its own link (`…/api/v1/challenges/{id}/download`), so auto-download always got a 404.
+- **Fix/Now:** `resolve_download_url()`:
+  - GitHub repository URLs are still turned into archive URLs.
+  - Any other URL (server download link, pre-signed S3 link) is used as-is.
+  - With no URL, it falls back to `{CHALLENGE_API_URL}/api/v1/challenges/{id}/download`.
+- **Changes existing flow?** Only fixes it: GitHub URLs behave exactly as before.
+
+### F.2 A failed download is retried
+- **Problem:** the challenge directory was created before downloading. After any failure (404, timeout, bad zip) the directory existed, so every later poll said "already exists, skipping". The miner never got the challenge until someone deleted the folder by hand.
+- **Fix/Now:**
+  - The download and extraction happen in a temporary directory inside `downloaded_active_challenge/`, which is renamed into place only on success.
+  - A challenge counts as downloaded only once `challenge_metadata.json` exists. An empty directory left by the old code is replaced.
+  - Failures are retried on the next poll.
+- **Changes existing flow?** No. Same folder layout: `downloaded_active_challenge/<challenge_id>/…` plus `challenge_metadata.json`.
+
+### F.3 Download limits
+- **Problem:** the whole response was read into memory with no size cap, and archives were extracted with no limit on entries or expanded size.
+- **Fix/Now:**
+  - The download is streamed to disk and capped at `MINER_MAX_CHALLENGE_MB` (200).
+  - Extraction is refused above `MINER_MAX_ZIP_MEMBERS` (10000) entries or `MINER_MAX_EXTRACTED_MB` (1024) expanded.
+  - A challenge id containing a path is refused.
+  - For the record: Python's `zipfile.extractall` already strips `..` and absolute paths, so there was no zip-slip hole.
+- **Changes existing flow?** No for real challenge packages (a few MB).
+
+### F.4 Only validators can message the miner
+- **Problem:** `blacklist_simple_message` accepted everyone, so any machine on the internet could spam the axon.
+- **Fix/Now:**
+  - Callers must be registered on the subnet and hold a validator permit (`MINER_REQUIRE_VALIDATOR_PERMIT=false` drops the permit check but still requires registration).
+  - Priority is the caller's stake.
+  - The notice itself is only a hint: the miner never downloads from a URL inside a message. It polls the challenge server immediately when a validator announces a challenge it doesn't have yet.
+  - For the record: the audit's "miner downloads from URLs sent by anyone" was not the case, since the old handler already ignored the URL.
+- **Changes existing flow?** Validators' notices are answered as before; everyone else gets 403.
+
+### F.5 Non-blocking miner loop, configurable polling
+- **Problem:**
+  - `requests` calls ran on the event loop, blocking the axon while waiting.
+  - The metagraph was synced synchronously every 60 s.
+  - The challenge server was polled every 60 s by every miner.
+  - `--challenge_api_url` defaulted to `http://localhost:8000`.
+- **Fix/Now:**
+  - HTTP runs in worker threads.
+  - Metagraph sync every `METAGRAPH_SYNC_SECONDS` (600) in a thread.
+  - Polling every `MINER_POLL_SECONDS` (default 300, minimum 30), plus immediately on a validator notice (F.4), so new challenges are still picked up within seconds.
+  - The URL comes from `CHALLENGE_API_URL`/`.env`, default `https://api.chipforge.io`.
+  - SIGTERM/SIGINT stop the miner cleanly.
+- **Changes existing flow?** No. Miners running against a local server must set `CHALLENGE_API_URL` or pass the flag.
+
+### F.6 Miner CLI fixes (`python_scripts/miner_cli.py`)
+- **`status`/`submissions` always showed "no submissions":** the history endpoint requires a signature (`signature`, `timestamp` over `f"{hotkey}{timestamp}"`) and the CLI sent none, so it got a 422 and showed nothing. It now signs the request, and failures are shown as warnings rather than hidden at DEBUG.
+- **Wrong sort key:** submissions were sorted and dated by `submitted_at`, which the server doesn't return. The CLI now uses `created_at`.
+- **`download` fetched nothing useful:** it called the validator-only test-case endpoint. It now downloads and extracts the challenge package from `/challenges/{id}/download`, and still saves the challenge info JSON.
+- **Flag order:**
+  - `--wallet.name`, `--wallet.hotkey`, `--api_url` only worked before the subcommand. They now work on either side, and values given before the subcommand are not overwritten by defaults.
+  - New flag `--wallet.path` (`WALLET_PATH`/`BT_WALLET_PATH`).
+  - Default API URL `https://api.chipforge.io`.
+- **Size limit:** the client refused anything over 10 MB while the server accepts 50 MB. The limit is now 50 MB (`MAX_SUBMISSION_SIZE_MB`).
+- **Changes existing flow?** No: the documented invocation `miner_cli.py --wallet.name … submit file.zip` still works (tested). Submission signing is unchanged.
+
+**Tests:** `tests/test_miner.py` (URL resolution, atomic download and retry, zip limits, blacklist, immediate poll, CLI parsing, signature and size limit), plus a real axon/dendrite loopback test that a non-validator gets 403.

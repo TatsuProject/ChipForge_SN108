@@ -26,6 +26,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# The challenge server rejects anything above MAX_FILE_SIZE_MB (50 MB); check before uploading.
+MAX_FILE_SIZE_MB = int(os.getenv("MAX_SUBMISSION_SIZE_MB", "50"))
+MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
+
 
 class SolutionSubmitter:
     """Handles solution submission to ChipForge challenge server"""
@@ -60,6 +64,11 @@ class SolutionSubmitter:
             logger.error(f"Error creating signature: {e}")
             raise
     
+    def auth_params(self) -> Dict[str, str]:
+        """Query params for signed miner endpoints: signature over f"{hotkey}{timestamp}"."""
+        timestamp = datetime.now(timezone.utc).isoformat()
+        return {"signature": self.create_signature(f"{self.miner_hotkey}{timestamp}"), "timestamp": timestamp}
+
     def calculate_file_hash(self, file_path: Path) -> str:
         """Calculate SHA256 hash of file"""
         sha256_hash = hashlib.sha256()
@@ -79,13 +88,10 @@ class SolutionSubmitter:
                 logger.error(f"File must be a ZIP file: {zip_path}")
                 return False
             
-            # Check file size (10MB limit)
-            MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB in bytes
             file_size = zip_path.stat().st_size
-            
             if file_size > MAX_FILE_SIZE:
                 size_mb = file_size / (1024 * 1024)
-                logger.error(f"File size ({size_mb:.2f} MB) exceeds maximum allowed size (10 MB)")
+                logger.error(f"File size ({size_mb:.2f} MB) exceeds maximum allowed size ({MAX_FILE_SIZE_MB} MB)")
                 return False
             
             # Test if ZIP is valid
@@ -245,14 +251,14 @@ class SolutionSubmitter:
         """Get all submissions for this miner"""
         try:
             url = f"{self.api_url}/api/v1/challenges/{challenge_id}/submissions/hotkey/{self.miner_hotkey}"
-            response = requests.get(url, timeout=30)
+            response = requests.get(url, params=self.auth_params(), timeout=30)
             
             if response.status_code == 200:
                 submissions = response.json()
                 logger.info(f"Found {len(submissions.get('submissions', []))} previous submissions")
                 return submissions.get('submissions', [])
             else:
-                logger.debug(f"No previous submissions found: {response.status_code}")
+                logger.warning(f"Could not list submissions: {response.status_code} {response.text[:200]}")
                 return []
                 
         except Exception as e:
@@ -317,21 +323,21 @@ class MinerCLI:
             
             logger.info(f"Challenge information saved to: {info_file}")
             
-            # Also try to download test cases if available
+            # Challenge package (spec, testbench). Test cases stay validator-only.
+            url = f"{self.api_url}/api/v1/challenges/{challenge_id}/download"
+            response = requests.get(url, timeout=120)
+            if response.status_code != 200:
+                logger.error(f"Challenge package not available: {response.status_code} {response.text[:200]}")
+                return False
+            package = output_dir / f"{challenge_id}.zip"
+            package.write_bytes(response.content)
+            logger.info(f"Challenge package downloaded to: {package}")
             try:
-                url = f"{self.api_url}/api/v1/challenges/{challenge_id}/test_cases/download"
-                response = requests.get(url, timeout=30)
-                
-                if response.status_code == 200:
-                    test_cases_file = output_dir / f"challenge_{challenge_id}_test_cases.zip"
-                    with open(test_cases_file, 'wb') as f:
-                        f.write(response.content)
-                    logger.info(f"Test cases downloaded to: {test_cases_file}")
-                else:
-                    logger.debug(f"Test cases not available: {response.status_code}")
-            except Exception as e:
-                logger.debug(f"Could not download test cases: {e}")
-            
+                with zipfile.ZipFile(package) as zf:
+                    zf.extractall(output_dir)
+                logger.info(f"Extracted to: {output_dir}")
+            except zipfile.BadZipFile:
+                logger.warning("Downloaded package is not a valid ZIP; kept as-is")
             return True
             
         except Exception as e:
@@ -411,7 +417,7 @@ class MinerCLI:
             # Sort by submission time (most recent first)
             sorted_subs = sorted(
                 submissions,
-                key=lambda x: x.get('submitted_at', ''),
+                key=lambda x: x.get('created_at') or '',
                 reverse=True
             )
             
@@ -419,7 +425,7 @@ class MinerCLI:
                 sub_id = sub.get('submission_id', 'N/A')
                 status = sub.get('status', 'unknown')
                 score = sub.get('score', None)
-                submitted_at = sub.get('submitted_at', '')
+                submitted_at = sub.get('created_at') or ''
                 
                 status_emoji = {
                     'pending': '⏳',
@@ -472,7 +478,7 @@ class MinerCLI:
         # Sort by submission time (most recent first)
         sorted_subs = sorted(
             submissions,
-            key=lambda x: x.get('submitted_at', ''),
+            key=lambda x: x.get('created_at') or '',
             reverse=True
         )
         
@@ -484,7 +490,7 @@ class MinerCLI:
             sub_id = sub.get('submission_id', 'N/A')
             status = sub.get('status', 'unknown')
             score = sub.get('score', None)
-            submitted_at = sub.get('submitted_at', '')
+            submitted_at = sub.get('created_at') or ''
             file_hash = sub.get('file_hash', '')
             
             status_emoji = {
@@ -554,8 +560,6 @@ class MinerCLI:
             logger.error(f"Solution file not found: {solution_file}")
             sys.exit(1)
         
-        # Check file size (10MB limit)
-        MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB in bytes
         file_size = solution_path.stat().st_size
         size_mb = file_size / (1024 * 1024)
         
@@ -563,7 +567,7 @@ class MinerCLI:
         logger.info(f"File Size: {file_size:,} bytes ({size_mb:.2f} MB)")
         
         if file_size > MAX_FILE_SIZE:
-            logger.error(f"File size ({size_mb:.2f} MB) exceeds maximum allowed size (10 MB)")
+            logger.error(f"File size ({size_mb:.2f} MB) exceeds maximum allowed size ({MAX_FILE_SIZE_MB} MB)")
             logger.error("Please reduce the file size and try again.")
             sys.exit(1)
         
@@ -648,35 +652,44 @@ Examples:
         """
     )
     
+    # Common arguments: accepted before the subcommand and after it
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--wallet.name", type=str, default=os.getenv("WALLET_NAME", "default"),
+                        help="Wallet name (default: WALLET_NAME or 'default')")
+    common.add_argument("--wallet.hotkey", type=str, default=os.getenv("MINER_HOTKEY", "default"),
+                        help="Wallet hotkey (default: MINER_HOTKEY or 'default')")
+    common.add_argument("--wallet.path", type=str, default=os.getenv("WALLET_PATH") or os.getenv("BT_WALLET_PATH", "~/.bittensor/wallets"),
+                        help="Wallet directory (default: WALLET_PATH / BT_WALLET_PATH or ~/.bittensor/wallets)")
+    common.add_argument("--api_url", type=str, default=os.getenv("CHALLENGE_API_URL", "https://api.chipforge.io"),
+                        help="Challenge server API URL (default: CHALLENGE_API_URL or https://api.chipforge.io)")
+    # Subcommand copies default to SUPPRESS so they don't overwrite values given before the subcommand
+    sub_common = argparse.ArgumentParser(add_help=False, argument_default=argparse.SUPPRESS)
+    for action in common._actions:
+        sub_common.add_argument(*action.option_strings, type=action.type, help=action.help)
+    for action in common._actions:
+        parser._add_action(action)
+
     # Subcommands
     subparsers = parser.add_subparsers(dest='command', help='Command to execute')
     
     # Status command
-    status_parser = subparsers.add_parser('status', help='Show current challenge and submissions')
+    status_parser = subparsers.add_parser('status', parents=[sub_common], help='Show current challenge and submissions')
     
     # Submissions command
-    submissions_parser = subparsers.add_parser('submissions', help='List all submissions')
+    submissions_parser = subparsers.add_parser('submissions', parents=[sub_common], help='List all submissions')
     submissions_parser.add_argument('--challenge_id', type=str, help='Challenge ID (default: active challenge)')
     
     # Download command
-    download_parser = subparsers.add_parser('download', help='Download current challenge')
+    download_parser = subparsers.add_parser('download', parents=[sub_common], help='Download current challenge')
     download_parser.add_argument('--output', '-o', type=str, help='Output directory (default: ./challenges/<challenge_id>)')
     download_parser.add_argument('--challenge_id', type=str, help='Challenge ID (default: active challenge)')
     
     # Submit command
-    submit_parser = subparsers.add_parser('submit', help='Submit solution file')
+    submit_parser = subparsers.add_parser('submit', parents=[sub_common], help='Submit solution file')
     submit_parser.add_argument('file', type=str, help='Path to solution ZIP file')
     submit_parser.add_argument('--challenge_id', type=str, help='Challenge ID (default: active challenge)')
     submit_parser.add_argument('--check_status', action='store_true', help='Check status of previous submissions')
     submit_parser.add_argument('--dry_run', action='store_true', help='Validate ZIP but don\'t submit')
-    
-    # Common arguments
-    parser.add_argument("--wallet.name", type=str, default=os.getenv("WALLET_NAME", "default"),
-                       help="Wallet name (default: from .env or 'default')")
-    parser.add_argument("--wallet.hotkey", type=str, default=os.getenv("MINER_HOTKEY", "default"),
-                       help="Wallet hotkey (default: from .env or 'default')")
-    parser.add_argument("--api_url", type=str, default=os.getenv("CHALLENGE_API_URL", "http://localhost:8000"),
-                       help="Challenge server API URL (default: from .env or localhost:8000)")
     
     args = parser.parse_args()
     
@@ -689,9 +702,10 @@ Examples:
         config = type('Config', (), {
             'wallet': type('Wallet', (), {
                 'name': getattr(args, 'wallet.name'),
-                'hotkey': getattr(args, 'wallet.hotkey')
+                'hotkey': getattr(args, 'wallet.hotkey'),
+                'path': os.path.expanduser(getattr(args, 'wallet.path')),
             })(),
-            'api_url': args.api_url
+            'api_url': args.api_url.rstrip('/')
         })()
         
         # Initialize CLI
