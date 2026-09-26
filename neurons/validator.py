@@ -7,6 +7,7 @@ Main validator entry point with modular architecture
 import bittensor as bt
 
 import os
+import sys
 import signal
 import asyncio
 import aiohttp
@@ -889,7 +890,9 @@ async def main():
     except Exception as e:
         logger.error(f"Fatal error: {e}")
         logger.error(traceback.format_exc())
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()))

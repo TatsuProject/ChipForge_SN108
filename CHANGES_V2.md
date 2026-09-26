@@ -298,3 +298,12 @@ Owner decisions this branch follows:
 ### G.6 Found while running the containers
 - **Filename fallback looked in the wrong directory:** `BatchProcessor` created and read `./validator_data/submissions` relative to the working directory, while the API client saves downloads under `CHIPFORGE_DATA_DIR`. With a data dir set, the filename fallback for hotkeys looked in the wrong place, and in the container the validator crashed at startup (read-only working dir). It now uses the data dir. Regression test added.
 - **Rejected weights were retried every loop:** a rejected or failed `set_weights` (unregistered hotkey, RPC down) was retried on every 10 s loop, one extrinsic each time. The same weights are now retried after 30 s, 60 s, 120 s … up to 10 minutes. Different weights (a new winner) are still tried immediately, and a success resets the backoff.
+
+### G.7 Clear wallet errors in Docker (found on the first real `make up`)
+- **Problem:**
+  - `WALLET_NAME` set to a host path (which `start_*.sh` accepted) or a `WALLET_DIR` that didn't contain the wallet made the validator crash with a `KeyFileError` traceback every few seconds.
+  - The process exited with code 0 even on a fatal error.
+- **Fix/Now:**
+  - The entrypoint uses the last component of a path in `WALLET_NAME` and checks that `WALLET_DIR/<wallet>/hotkeys/<hotkey>` exists before starting. If it doesn't, it prints what to set and which wallets it can see, then waits 60 s before exiting (code 78), so the restart policy doesn't spin.
+  - Fatal errors in the validator and miner now exit with code 1.
+- **Changes existing flow?** No.
