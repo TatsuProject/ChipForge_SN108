@@ -187,3 +187,4 @@ watchdog.py
 data/
 backups/
 heartbeat-*
+.env.backup-*
