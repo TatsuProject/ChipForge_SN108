@@ -5,6 +5,7 @@
 #   make migrate-state            copy state files from a pre-Docker checkout into ./data
 #   make submit FILE=design.zip   miner: submit a solution with the miner CLI
 #   make test                     run the test-suite in a throwaway container
+#   make env-check                compare .env with .env.example (keys and order)
 
 ROLE      ?= validator
 ENV_DATA_DIR := $(shell sed -n 's/^DATA_DIR=\([^ #]*\).*/\1/p' .env 2>/dev/null | tail -n1)
@@ -13,10 +14,10 @@ COMPOSE   := HOST_UID=$(shell id -u) HOST_GID=$(shell id -g) DATA_DIR=$(DATA_DIR
 SERVICE   := $(ROLE)
 STAMP     := $(shell date -u +%Y%m%dT%H%M%SZ)
 
-.PHONY: help check-env build up down restart logs status backup-state migrate-state submit cli test
+.PHONY: help env-check check-env build up down restart logs status backup-state migrate-state submit cli test
 
 help:
-	@sed -n '1,9p' Makefile | sed 's/^# \{0,1\}//'
+	@sed -n '1,8p' Makefile | sed 's/^# \{0,1\}//'
 
 check-env:
 	@test -f .env || { echo ".env missing: cp .env.example .env and fill it in"; exit 1; }
@@ -72,3 +73,6 @@ test:
 	docker run --rm -u $(shell id -u):$(shell id -g) -e HOME=/tmp -e PYTHONDONTWRITEBYTECODE=1 \
 	  -e BT_WALLET_PATH=/nonexistent -v "$(CURDIR)":/app -w /app chipforge-sn108-test \
 	  python -m pytest -q -p no:cacheprovider tests
+
+env-check:
+	@sh scripts/env_check.sh

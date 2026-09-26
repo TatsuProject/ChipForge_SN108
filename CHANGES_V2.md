@@ -307,3 +307,6 @@ Owner decisions this branch follows:
   - The entrypoint uses the last component of a path in `WALLET_NAME` and checks that `WALLET_DIR/<wallet>/hotkeys/<hotkey>` exists before starting. If it doesn't, it prints what to set and which wallets it can see, then waits 60 s before exiting (code 78), so the restart policy doesn't spin.
   - Fatal errors in the validator and miner now exit with code 1.
 - **Changes existing flow?** No.
+
+### G.8 `make env-check`
+- `scripts/env_check.sh` compares `.env` with `.env.example`: missing keys, extra keys, keys set twice, and a different order. It never prints values. `.env` can now be kept as a line-by-line copy of `.env.example` with your own values.
