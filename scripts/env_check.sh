@@ -2,6 +2,7 @@
 # Compare .env with .env.example: same keys, same order. Values are never printed.
 #   scripts/env_check.sh [ENV_FILE] [EXAMPLE_FILE]      (make env-check)
 set -eu
+export LC_ALL=C   # sort and comm must agree on ordering
 env_file="${1:-.env}"
 example="${2:-.env.example}"
 [ -f "$env_file" ] || { echo "$env_file missing: cp $example $env_file"; exit 1; }
