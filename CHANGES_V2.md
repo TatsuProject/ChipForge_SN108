@@ -310,3 +310,6 @@ Owner decisions this branch follows:
 
 ### G.8 `make env-check`
 - `scripts/env_check.sh` compares `.env` with `.env.example`: missing keys, extra keys, keys set twice, and a different order. It never prints values. `.env` can now be kept as a line-by-line copy of `.env.example` with your own values.
+
+### F.7 `miner_cli.py logs <submission_id>`
+- The public website shows only a summary of each evaluation; raw EDA logs are no longer public (they can reveal hidden test details). This command fetches the full logs of **your own** submission from the new signed endpoint `GET /api/v1/submissions/{id}/evaluation_logs` (challenge server `a4f9517`) and saves one file per validator.

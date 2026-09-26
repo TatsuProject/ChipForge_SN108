@@ -266,6 +266,16 @@ class SolutionSubmitter:
             return []
 
 
+    def get_evaluation_logs(self, submission_id: str) -> Optional[Dict]:
+        """Full EDA logs of your own submission (the public leaderboard shows only a summary)."""
+        url = f"{self.api_url}/api/v1/submissions/{submission_id}/evaluation_logs"
+        response = requests.get(url, params={**self.auth_params(), "hotkey": self.miner_hotkey}, timeout=60)
+        if response.status_code == 200:
+            return response.json()
+        logger.error(f"Could not get logs: {response.status_code} {response.text[:200]}")
+        return None
+
+
 class MinerCLI:
     """Miner Command-Line Interface"""
     
@@ -547,6 +557,27 @@ class MinerCLI:
         
         logger.info("=" * 80)
     
+    def show_logs(self, submission_id: str, output_dir: Optional[str] = None):
+        """Save each validator's full evaluation log of your submission and print the notes."""
+        data = self.submitter.get_evaluation_logs(submission_id)
+        if not data:
+            sys.exit(1)
+        out = Path(output_dir or f"./evaluation_logs/{submission_id}")
+        out.mkdir(parents=True, exist_ok=True)
+        if not data["validations"]:
+            logger.info("No completed evaluations yet")
+            return
+        for v in data["validations"]:
+            path = out / f"{v['validator_hotkey']}.json"
+            try:
+                content = json.dumps(json.loads(v["evaluation_details"] or "null"), indent=2)
+            except (TypeError, ValueError):
+                content = v["evaluation_details"] or ""
+            path.write_text(content)
+            logger.info(f"Validator {v['validator_hotkey'][:12]}...  score={v['overall_score']}  "
+                        f"{(v['evaluation_notes'] or '').strip()[:200]}")
+            logger.info(f"  full log: {path}")
+
     def submit_solution(self, solution_file: str, challenge_id: Optional[str] = None, 
                        check_status: bool = False, dry_run: bool = False):
         """Submit a solution file"""
@@ -684,6 +715,11 @@ Examples:
     download_parser.add_argument('--output', '-o', type=str, help='Output directory (default: ./challenges/<challenge_id>)')
     download_parser.add_argument('--challenge_id', type=str, help='Challenge ID (default: active challenge)')
     
+    # Logs command
+    logs_parser = subparsers.add_parser('logs', parents=[sub_common], help='Save the full evaluation logs of your submission')
+    logs_parser.add_argument('submission_id', type=str, help='Submission ID')
+    logs_parser.add_argument('--output', '-o', type=str, help='Output directory (default: ./evaluation_logs/<submission_id>)')
+
     # Submit command
     submit_parser = subparsers.add_parser('submit', parents=[sub_common], help='Submit solution file')
     submit_parser.add_argument('file', type=str, help='Path to solution ZIP file')
@@ -721,6 +757,8 @@ Examples:
                 output_dir=getattr(args, 'output', None),
                 challenge_id=getattr(args, 'challenge_id', None)
             )
+        elif args.command == 'logs':
+            cli.show_logs(args.submission_id, output_dir=getattr(args, 'output', None))
         elif args.command == 'submit':
             cli.submit_solution(
                 solution_file=args.file,

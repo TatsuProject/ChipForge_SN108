@@ -120,6 +120,21 @@ python3 python_scripts/miner_cli.py download --challenge_id challenge_123 --outp
 
 ---
 
+### 3b. `logs` - Full Evaluation Logs of Your Submission
+
+The website shows a summary of each validator's evaluation (gates, metrics, error code and
+message). The complete EDA logs are only given to the miner who made the submission, and only
+after its batch has closed. The request is signed with your hotkey.
+
+```bash
+python3 python_scripts/miner_cli.py logs <submission_id> [--output DIR]
+```
+
+Saves one JSON file per validator to `./evaluation_logs/<submission_id>/` and prints each
+validator's score and notes.
+
+---
+
 ### 4. `submit` - Submit Solution
 
 Submits a solution ZIP file to the challenge server.

@@ -208,3 +208,23 @@ def test_cli_history_request_is_signed_the_way_the_server_verifies(monkeypatch):
 def test_cli_size_limit_matches_server():
     from python_scripts import miner_cli
     assert miner_cli.MAX_FILE_SIZE == 50 * 1024 * 1024
+
+
+def test_cli_logs_request_is_signed_and_names_the_hotkey(monkeypatch):
+    from python_scripts import miner_cli
+
+    kp = Keypair.create_from_mnemonic(Keypair.generate_mnemonic())
+    sub = miner_cli.SolutionSubmitter.__new__(miner_cli.SolutionSubmitter)
+    sub.api_url, sub.miner_hotkey = API, kp.ss58_address
+    sub.wallet = SimpleNamespace(hotkey=SimpleNamespace(sign=lambda data: kp.sign(data)))
+    seen = {}
+
+    def fake_get(url, params=None, timeout=None):
+        seen.update(url=url, params=params)
+        return SimpleNamespace(status_code=200, json=lambda: {"validations": []})
+    monkeypatch.setattr(miner_cli.requests, "get", fake_get)
+    assert sub.get_evaluation_logs("sub1") == {"validations": []}
+    assert seen["url"] == f"{API}/api/v1/submissions/sub1/evaluation_logs"
+    p = seen["params"]
+    assert p["hotkey"] == kp.ss58_address
+    assert kp.verify(f"{kp.ss58_address}{p['timestamp']}".encode(), bytes.fromhex(p["signature"]))
