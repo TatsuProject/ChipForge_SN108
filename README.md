@@ -109,9 +109,10 @@ CHIPFORGE_LIVE_TESTS=1 pytest -m live    # optional: hits testnet (netuid 440 by
 
 #### Running a Miner
 
-Set parameters in `.env` (see `.env.example`) and run:
+Set parameters in `.env` (see `.env.example`; the miner's wallet is `MINER_WALLET_DIR`,
+`MINER_WALLET_NAME`, `MINER_HOTKEY`) and run:
 ```bash
-./start_miner.sh
+./start_miner.sh          # or, with Docker: make up ROLE=miner
 ```
 
 The miner polls the challenge server every `MINER_POLL_SECONDS` (default 300 s) and
@@ -201,6 +202,32 @@ after the command.
 
 For more details, see [MINER_CLI_COMMANDS.md](MINER_CLI_COMMANDS.md).
 
+#### Results, logs and revealed winning designs
+
+- **Leaderboard:** [chipforge.io/leaderboard](https://chipforge.io/leaderboard) shows the score to beat, the current
+  winner on chain, every submission (one row each, with the validators' consensus score and gates), a page per
+  miner and per submission with a plain explanation of the result (e.g. "functional gate failed", "passed but
+  below the score to beat").
+- **Scores are published when a batch closes.** While your submission is in an open batch it shows "In batch";
+  no validator can see another's results before submitting its own.
+- **Full evaluation logs** are not public (the website shows a summary: gates, metrics, error code and message).
+  The miner who made the submission gets them, once its batch has closed:
+  ```bash
+  python3 python_scripts/miner_cli.py logs <submission_id>        # saves one file per validator
+  ```
+- **Winning designs can be revealed** to every hotkey **registered on the subnet** (miners and validators), when
+  the subnet has reveals turned on. Each winner's design is revealed a set time after it won, earlier if a
+  newer winner overtakes it, and/or when the challenge ends; the Winners tab on the leaderboard shows the policy
+  and when each design becomes available.
+  ```bash
+  python3 python_scripts/miner_cli.py reveals                        # policy + status of each winning design
+  python3 python_scripts/miner_cli.py reveal-download <submission_id>  # saves ./revealed_designs/<id>.zip
+  ```
+  The request is signed with your hotkey (an unregistered hotkey gets 403), downloads are limited per day and
+  logged, and the file is checked against the winner's signed hash before it is saved.
+- **Copies don't win:** a file byte-identical to a winning design is refused at submission, and the subnet can
+  require a new winner to beat the score to beat by a minimum margin (`MIN_IMPROVEMENT_PERCENT`).
+
 #### Solution Format
 
 Solutions must be packaged as ZIP files containing:
@@ -215,8 +242,10 @@ Solutions must be packaged as ZIP files containing:
 - The miner CLI tool automatically validates these requirements before submission
 
 #### Rate Limits
-- Challenge server accepts 5 requests per IP per hour.
-- One hotkey is allowed to submit a maximum 5 solutions for a specific challenge.
+- Miner endpoints of the challenge server (submit, status, history, `logs`, `reveal-download`) accept
+  2 requests per minute and 5 per hour per IP by default.
+- One hotkey is allowed to submit a maximum 5 solutions for a specific challenge (per-challenge setting).
+- The public API used by the website and `miner_cli.py reveals` is limited separately (120 per minute per IP).
 
 ### For Validators
 
@@ -229,11 +258,13 @@ https://github.com/TatsuProject/chipforge_eda_server
 The EDA server has no API key: keep its port (8080) closed to the internet, or bind it to
 `127.0.0.1` on the validator machine.
 
-Set parameters in `.env` (see `.env.example`; `VALIDATOR_SECRET_KEY` goes there, not on the
-command line) and run:
+Set parameters in `.env` (see `.env.example`): the validator's wallet is `VALIDATOR_WALLET_DIR`,
+`VALIDATOR_WALLET_NAME`, `VALIDATOR_HOTKEY`, and `VALIDATOR_SECRET_KEY` goes there too (never on the
+command line). Then run:
 ```bash
-./start_validator.sh
+make up                   # Docker (recommended), or: ./start_validator.sh
 ```
+A miner can run from the same folder with its own wallet (`MINER_WALLET_*`, `make up ROLE=miner`).
 
 What the validator does each cycle:
 - polls the challenge server (`/validator/sync`, one cached request for challenge, batch, bans and test-case version),
@@ -242,7 +273,9 @@ What the validator does each cycle:
 - puts weights on chain immediately when the winner changes (within the chain's rate limit) and refreshes them every `WEIGHTS_REFRESH_SECONDS`: the winner gets `MINER_EMISSION_PERCENTAGE` percent, the rest is burned to UID 0.
 
 Each validator picks its winner from its own evaluations; there is no winner sync between
-validators or with the challenge server.
+validators or with the challenge server. If the subnet sets a minimum improvement margin,
+`MIN_IMPROVEMENT_PERCENT` in the validator's `.env` **must equal the challenge server's value**
+(default 0), otherwise validators disagree about who won.
 
 #### Running with nohup (background process)
 
@@ -312,11 +345,14 @@ Each submission is evaluated across four key metrics:
 
 ### Competitive Ranking
 
-- Submissions are ranked by overall score
-- Only submissions that beat the current challenge-wide best score receive rewards
+- Submissions are ranked by overall score (the average of the validators that evaluated them)
+- A new winner must pass both EDA gates and beat the score to beat (the previous winner's score, plus
+  `MIN_IMPROVEMENT_PERCENT` if the subnet sets one); the score to beat then rises to the new winner's score
 - Weights reward the highest-scoring submission with `MINER_EMISSION_PERCENTAGE` of the validator's weight; the rest is burned
 - Emission burning occurs when no submissions exceed quality thresholds
 - The winner of a challenge will keep getting reward for specific time after challenge expiration
+- The chain decides who is actually paid (highest incentive); the leaderboard shows it and which validators agree
+- Winning designs may be revealed to registered neurons after a delay (see "Results, logs and revealed winning designs")
 
 ## Challenge Types
 
@@ -333,7 +369,23 @@ Each submission is evaluated across four key metrics:
 GET  /api/v1/challenges/active              # Get active challenge
 POST /api/v1/challenges/{id}/generate-submission-id  # Generate submission ID
 POST /api/v1/challenges/{id}/submit         # Submit design solution
-GET  /api/v1/challenges/{id}/submissions/hotkey/{hotkey}  # Check submissions
+GET  /api/v1/challenges/{id}/submissions/hotkey/{hotkey}  # Check submissions (signed)
+GET  /api/v1/challenges/{id}/download       # Challenge package
+GET  /api/v1/submissions/{submission_id}/evaluation_logs   # Full logs of your own submission (signed)
+GET  /api/v1/reveals/{submission_id}/download              # Revealed winning design (signed, registered hotkeys)
+```
+
+### Public Endpoints (no key; cached; rate limited per IP)
+
+```
+GET  /api/v1/public/snapshot                # Active challenge, score to beat, winner (server + chain), batch
+GET  /api/v1/public/challenges              # Active and past challenges
+GET  /api/v1/public/challenges/{id}/leaderboard  # One row per submission
+GET  /api/v1/public/submissions/{id}        # One submission: batches, per-validator results and summary
+GET  /api/v1/public/miners/{hotkey}         # A miner across challenges
+GET  /api/v1/public/validators              # Validators, their on-chain pick, agreement with the chain
+GET  /api/v1/public/reveals?challenge_id=   # Reveal policy and status of each winning design
+GET  /api/v1/public/rules                   # Competition rules as data
 ```
 
 ### Validator Endpoints

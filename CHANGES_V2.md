@@ -333,3 +333,8 @@ Owner decisions this branch follows:
   - `make down` stops only the selected `ROLE`, so both roles run side by side (tested with two containers).
   - The entrypoint's error names the exact setting to fix and lists the wallets it can see.
 - **Changes existing flow?** No. The old `WALLET_NAME`/`WALLET_DIR`/`WALLET_PATH` still work as a fallback when the new ones are unset. `start_validator.sh` no longer needs a hard-coded wallet path.
+
+### G.10 README covers the new miner and validator features
+- Miners: new section "Results, logs and revealed winning designs" (leaderboard pages, scores published at batch close, `miner_cli.py logs`, `reveals` / `reveal-download` for registered hotkeys, copy guard and improvement margin); rate limits updated (the signed `logs` and `reveal-download` calls count toward the miner limit); wallet settings (`MINER_WALLET_*`).
+- Validators: `VALIDATOR_WALLET_*`, `make up`, and that `MIN_IMPROVEMENT_PERCENT` must equal the challenge server's.
+- Competitive ranking and the API reference (miner, public endpoints) brought up to date.
