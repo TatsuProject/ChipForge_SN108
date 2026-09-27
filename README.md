@@ -242,8 +242,10 @@ Solutions must be packaged as ZIP files containing:
 - The miner CLI tool automatically validates these requirements before submission
 
 #### Rate Limits
-- Miner endpoints of the challenge server (submit, status, history, `logs`, `reveal-download`) accept
-  2 requests per minute and 5 per hour per IP by default.
+- Miner endpoints of the challenge server (submit, status, history) accept 2 requests per minute and
+  5 per hour per IP by default.
+- `logs` and `reveal-download` have their own, separate budget (10 per minute, 60 per hour per IP by
+  default), plus a daily cap per hotkey for revealed designs.
 - One hotkey is allowed to submit a maximum 5 solutions for a specific challenge (per-challenge setting).
 - The public API used by the website and `miner_cli.py reveals` is limited separately (120 per minute per IP).
 
