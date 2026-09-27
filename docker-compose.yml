@@ -1,4 +1,5 @@
-# ChipForge SN108. Run one role per machine:
+# ChipForge SN108. Validator and miner can run side by side from one folder; each uses its
+# own wallet (VALIDATOR_WALLET_* / MINER_WALLET_* in .env), mounted read-only at /wallets.
 #   make up                 # validator (default)
 #   make up ROLE=miner      # miner
 #
@@ -18,12 +19,11 @@ x-common: &common
     CHIPFORGE_DATA_DIR: /data
     MINER_CHALLENGE_DIR: /data/downloaded_active_challenge
     WALLET_PATH: /wallets
+    VALIDATOR_WALLET_DIR: /wallets
+    MINER_WALLET_DIR: /wallets
   network_mode: host
   restart: unless-stopped
   stop_grace_period: 60s
-  volumes:
-    - ${DATA_DIR:-./data}:/data
-    - ${WALLET_DIR:-~/.bittensor/wallets}:/wallets:ro
   logging:
     driver: json-file
     options:
@@ -35,6 +35,9 @@ services:
     <<: *common
     profiles: ["validator"]
     container_name: chipforge-validator
+    volumes:
+      - ${DATA_DIR:-./data}:/data
+      - ${VALIDATOR_WALLET_DIR:-${WALLET_DIR:-~/.bittensor/wallets}}:/wallets:ro
     command: ["validator"]
     healthcheck:
       test: ["CMD", "python", "-m", "chipforge.heartbeat", "validator", "--max-age", "180"]
@@ -47,6 +50,9 @@ services:
     <<: *common
     profiles: ["miner"]
     container_name: chipforge-miner
+    volumes:
+      - ${DATA_DIR:-./data}:/data
+      - ${MINER_WALLET_DIR:-${WALLET_DIR:-~/.bittensor/wallets}}:/wallets:ro
     command: ["miner"]
     healthcheck:
       test: ["CMD", "python", "-m", "chipforge.heartbeat", "miner", "--max-age", "180"]

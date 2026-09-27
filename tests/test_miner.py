@@ -260,3 +260,14 @@ def test_reveal_download_is_signed_and_hash_checked(monkeypatch):
     monkeypatch.setattr(miner_cli.requests, "get",
                         lambda *a, **k: SimpleNamespace(status_code=403, json=lambda: {"detail": {"reason": "scheduled"}}, text=""))
     assert sub.download_revealed_design("s1") is None
+
+
+def test_cli_wallet_defaults_come_from_miner_settings(cli_parse, monkeypatch, tmp_path):
+    monkeypatch.setenv("MINER_WALLET_NAME", "m_wallet")
+    monkeypatch.setenv("MINER_HOTKEY", "m_hot")
+    monkeypatch.setenv("MINER_WALLET_DIR", str(tmp_path))
+    monkeypatch.setenv("WALLET_NAME", "old_style")            # the pre-split name only fills in when MINER_ is unset
+    cfg = cli_parse(["status"])
+    assert (cfg.wallet.name, cfg.wallet.hotkey, cfg.wallet.path) == ("m_wallet", "m_hot", str(tmp_path))
+    monkeypatch.delenv("MINER_WALLET_NAME")
+    assert cli_parse(["status"]).wallet.name == "old_style"

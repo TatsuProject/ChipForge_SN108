@@ -8,13 +8,13 @@ role="${1:-validator}"
 [ $# -gt 0 ] && shift
 
 : "${NETUID:?NETUID is not set (see .env.example)}"
-: "${WALLET_NAME:?WALLET_NAME is not set (see .env.example)}"
-
-wallets="${WALLET_PATH:-/wallets}"
+# Each role has its own wallet. Compose mounts VALIDATOR_WALLET_DIR (validator) or
+# MINER_WALLET_DIR (miner) at /wallets. WALLET_NAME is the pre-split name, kept as a fallback.
+wallets=/wallets
 case "$role" in
-  validator) hotkey="${VALIDATOR_HOTKEY:-default}" ;;
-  miner)     hotkey="${MINER_HOTKEY:-default}" ;;
-  *)         hotkey="" ;;
+  validator) wallet_name="${VALIDATOR_WALLET_NAME:-${WALLET_NAME:-}}"; hotkey="${VALIDATOR_HOTKEY:-default}"; prefix=VALIDATOR ;;
+  miner)     wallet_name="${MINER_WALLET_NAME:-${WALLET_NAME:-}}";     hotkey="${MINER_HOTKEY:-default}";     prefix=MINER ;;
+  *)         echo "unknown role '$role' (expected validator or miner)" >&2; exit 2 ;;
 esac
 
 # Config errors: explain, then wait before exiting so `restart: unless-stopped` doesn't spin.
@@ -25,26 +25,29 @@ config_error() {
     exit 78
 }
 
-# A host path in WALLET_NAME (what the start_*.sh scripts accepted) can't be seen in the
-# container: only WALLET_DIR is mounted, at /wallets. Use the last path component.
-case "$WALLET_NAME" in
+[ -n "$wallet_name" ] || config_error "${prefix}_WALLET_NAME is not set (see .env.example)"
+
+# A host path in the wallet name can't be seen in the container (only the wallet
+# directory is mounted, at /wallets). Use the last path component.
+case "$wallet_name" in
   */*)
-    echo "WARNING: WALLET_NAME is a path ($WALLET_NAME); using wallet '$(basename "$WALLET_NAME")' from WALLET_DIR" >&2
-    WALLET_NAME="$(basename "$WALLET_NAME")"
+    echo "WARNING: ${prefix}_WALLET_NAME is a path ($wallet_name); using wallet '$(basename "$wallet_name")' from ${prefix}_WALLET_DIR" >&2
+    wallet_name="$(basename "$wallet_name")"
     ;;
 esac
 
-if [ -n "$hotkey" ] && [ ! -f "$wallets/$WALLET_NAME/hotkeys/$hotkey" ]; then
+if [ ! -f "$wallets/$wallet_name/hotkeys/$hotkey" ]; then
     available="$(ls -1 "$wallets" 2>/dev/null | tr '\n' ' ')"
-    config_error "hotkey '$hotkey' of wallet '$WALLET_NAME' not found in WALLET_DIR (mounted at $wallets).
-  Set WALLET_DIR in .env to the folder that contains the wallet folder, and WALLET_NAME to the wallet folder's name.
-  Wallets visible in WALLET_DIR: ${available:-none}"
+    config_error "hotkey '$hotkey' of wallet '$wallet_name' not found in ${prefix}_WALLET_DIR (mounted at $wallets).
+  Set ${prefix}_WALLET_DIR in .env to the folder that contains the wallet folder, ${prefix}_WALLET_NAME to the
+  wallet folder's name and ${prefix}_HOTKEY to the hotkey's file name.
+  Wallets visible in ${prefix}_WALLET_DIR: ${available:-none}"
 fi
 
 set -- --netuid "$NETUID" \
        --subtensor.network "${SUBTENSOR_NETWORK:-finney}" \
-       --wallet.name "$WALLET_NAME" \
-       --wallet.path "${WALLET_PATH:-/wallets}" \
+       --wallet.name "$wallet_name" \
+       --wallet.path "$wallets" \
        "--logging.${BT_LOG_LEVEL:-info}" \
        "$@"
 if [ -n "${SUBTENSOR_CHAIN_ENDPOINT:-}" ]; then
@@ -58,9 +61,5 @@ case "$role" in
   miner)
     exec python /app/neurons/miner.py --wallet.hotkey "$hotkey" \
         --axon.port "${AXON_PORT:-8091}" "$@"
-    ;;
-  *)
-    echo "unknown role '$role' (expected validator or miner)" >&2
-    exit 2
     ;;
 esac

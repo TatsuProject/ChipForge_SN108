@@ -45,7 +45,7 @@ All settings live in `.env`; [`.env.example`](.env.example) documents every one 
 ```bash
 git clone https://github.com/TatsuProject/ChipForge_SN108
 cd ChipForge_SN108
-cp .env.example .env        # set NETUID, WALLET_NAME, hotkeys (+ VALIDATOR_SECRET_KEY for validators)
+cp .env.example .env        # set NETUID, the VALIDATOR_/MINER_ wallet settings (+ VALIDATOR_SECRET_KEY)
 
 make up                     # validator
 make up ROLE=miner          # miner
@@ -55,7 +55,7 @@ make restart / make down
 make backup-state           # tar.gz of ./data into ./backups
 ```
 
-- **Wallets:** `WALLET_DIR` (default `~/.bittensor/wallets`) is mounted read-only. `WALLET_NAME` is the wallet's folder name inside it, not a path.
+- **Wallets:** the validator and the miner have separate settings (`VALIDATOR_WALLET_DIR` / `VALIDATOR_WALLET_NAME` / `VALIDATOR_HOTKEY`, and the same with `MINER_`), so both can run from one folder with different wallets. Each role's directory is mounted read-only; the wallet name is the folder name inside it, not a path. `make down` stops only the selected `ROLE`.
 - **State:** everything that must survive restarts (validator state, emission state, bans, downloaded submissions, logs, miner challenge packages) is kept in `./data` (`DATA_DIR`). Moving from a bare-metal validator? Run `make migrate-state` once: it copies (never moves) the old state files from the repo root into `./data`.
 - **Networking:** the containers use host networking (Linux). The validator reaches the EDA server at `EDA_SERVER_URL` (default `http://localhost:8080`); the miner's axon listens on `AXON_PORT` (default 8091), which must be reachable from the internet.
 - **Health:** each neuron rewrites a heartbeat file every 30 s from its event loop; the container is marked unhealthy if it goes stale for 3 minutes, and `restart: unless-stopped` brings it back after crashes and reboots. Logs are rotated (5 × 50 MB).

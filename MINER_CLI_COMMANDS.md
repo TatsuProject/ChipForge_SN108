@@ -6,9 +6,9 @@ The `miner_cli.py` tool provides a command-line interface for miners to interact
 ## Common Arguments
 These arguments can be used with any command, before or after the command name:
 
-- `--wallet.name <name>` - Wallet name (default: `WALLET_NAME` from `.env`, else `"default"`)
+- `--wallet.name <name>` - Wallet name (default: `MINER_WALLET_NAME` from `.env`, else `"default"`)
 - `--wallet.hotkey <hotkey>` - Wallet hotkey (default: `MINER_HOTKEY`, else `"default"`)
-- `--wallet.path <dir>` - Wallet directory (default: `WALLET_PATH`, else `~/.bittensor/wallets`)
+- `--wallet.path <dir>` - Wallet directory (default: `MINER_WALLET_DIR` from `.env`, else `~/.bittensor/wallets`)
 - `--api_url <url>` - Challenge server API URL (default: `CHALLENGE_API_URL`, else `https://api.chipforge.io`)
 
 **Note:** values in `.env` (see `.env.example`) are used as defaults.
@@ -214,7 +214,8 @@ python3 python_scripts/miner_cli.py submit solution.zip \
 Create a `.env` file in the project root:
 
 ```bash
-WALLET_NAME=your_wallet_name
+MINER_WALLET_DIR=~/.bittensor/wallets
+MINER_WALLET_NAME=your_wallet_name
 MINER_HOTKEY=your_hotkey_name
 CHALLENGE_API_URL=https://api.chipforge.io
 FILE_TO_SUBMIT=path/to/solution.zip
@@ -244,7 +245,7 @@ This script:
 4. Runs the submit command with `--check_status`
 
 **Required .env variables:**
-- `WALLET_NAME`
+- `MINER_WALLET_NAME` (and `MINER_WALLET_DIR` if not `~/.bittensor/wallets`)
 - `MINER_HOTKEY`
 - `CHALLENGE_API_URL`
 - `FILE_TO_SUBMIT`

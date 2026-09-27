@@ -747,12 +747,15 @@ Examples:
     
     # Common arguments: accepted before the subcommand and after it
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--wallet.name", type=str, default=os.getenv("WALLET_NAME", "default"),
-                        help="Wallet name (default: WALLET_NAME or 'default')")
+    common.add_argument("--wallet.name", type=str,
+                        default=os.getenv("MINER_WALLET_NAME") or os.getenv("WALLET_NAME") or "default",
+                        help="Wallet name (default: MINER_WALLET_NAME from .env, else 'default')")
     common.add_argument("--wallet.hotkey", type=str, default=os.getenv("MINER_HOTKEY", "default"),
-                        help="Wallet hotkey (default: MINER_HOTKEY or 'default')")
-    common.add_argument("--wallet.path", type=str, default=os.getenv("WALLET_PATH") or os.getenv("BT_WALLET_PATH", "~/.bittensor/wallets"),
-                        help="Wallet directory (default: WALLET_PATH / BT_WALLET_PATH or ~/.bittensor/wallets)")
+                        help="Wallet hotkey (default: MINER_HOTKEY from .env, else 'default')")
+    common.add_argument("--wallet.path", type=str,
+                        default=(os.getenv("MINER_WALLET_DIR") or os.getenv("WALLET_PATH")
+                                 or os.getenv("BT_WALLET_PATH") or "~/.bittensor/wallets"),
+                        help="Wallet directory (default: MINER_WALLET_DIR from .env, else ~/.bittensor/wallets)")
     common.add_argument("--api_url", type=str, default=os.getenv("CHALLENGE_API_URL", "https://api.chipforge.io"),
                         help="Challenge server API URL (default: CHALLENGE_API_URL or https://api.chipforge.io)")
     # Subcommand copies default to SUPPRESS so they don't overwrite values given before the subcommand

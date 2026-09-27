@@ -1,4 +1,4 @@
-# ChipForge SN108 operator commands. One role per machine: ROLE=validator (default) or ROLE=miner.
+# ChipForge SN108 operator commands. ROLE=validator (default) or ROLE=miner; both can run from this folder.
 #   make up                       build if needed and start in the background
 #   make logs / status / restart / down
 #   make backup-state             snapshot ./data into ./backups
@@ -30,8 +30,10 @@ up: check-env
 	$(COMPOSE) up -d --build
 	@$(MAKE) --no-print-directory status
 
+# Only this ROLE's container: the validator and the miner can run side by side
 down:
-	$(COMPOSE) down
+	$(COMPOSE) stop $(SERVICE)
+	$(COMPOSE) rm -f $(SERVICE)
 
 restart: check-env
 	$(COMPOSE) restart $(SERVICE)

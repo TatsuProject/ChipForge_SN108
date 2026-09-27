@@ -324,3 +324,12 @@ Owner decisions this branch follows:
 ### H.2 `miner_cli.py reveals` / `reveal-download <submission_id>`
 - `reveals` shows the reveal policy and each winning design's status: available, reveals at a given time, or waiting for chain confirmation.
 - `reveal-download` fetches a revealed design with a signed request (registered hotkeys only, rate limited, logged on the server), checks the sha256, and saves it to `./revealed_designs/`.
+
+### G.9 Separate wallet settings for the validator and the miner
+- **Problem:** one `.env` had a single `WALLET_NAME` (plus `WALLET_DIR` for Docker and `WALLET_PATH` for the miner CLI, which meant the same thing and confused people), so a validator and a miner with different wallets could not run from the same folder, and `WALLET_NAME` was often set to a full path.
+- **Now:**
+  - Two sets of settings: `VALIDATOR_WALLET_DIR` / `VALIDATOR_WALLET_NAME` / `VALIDATOR_HOTKEY` and `MINER_WALLET_DIR` / `MINER_WALLET_NAME` / `MINER_HOTKEY`.
+  - Docker mounts each role's own directory at `/wallets`. `start_validator.sh`, `start_miner.sh`, `submit_solution.sh` and `miner_cli.py` read the matching set.
+  - `make down` stops only the selected `ROLE`, so both roles run side by side (tested with two containers).
+  - The entrypoint's error names the exact setting to fix and lists the wallets it can see.
+- **Changes existing flow?** No. The old `WALLET_NAME`/`WALLET_DIR`/`WALLET_PATH` still work as a fallback when the new ones are unset. `start_validator.sh` no longer needs a hard-coded wallet path.
