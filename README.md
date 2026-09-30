@@ -33,10 +33,34 @@ ChipForge operates as a competitive platform where:
 
 ### Prerequisites
 
-- Python 3.12
+- Docker with the compose plugin (recommended), or Python 3.12
 - Bittensor wallet with registered hotkey
 - Access to Chipforge Challenge Server API
 - Chipforge EDA Server (for validators)
+
+### Running with Docker (recommended)
+
+All settings live in `.env`; [`.env.example`](.env.example) documents every one of them.
+
+```bash
+git clone https://github.com/TatsuProject/ChipForge_SN108
+cd ChipForge_SN108
+cp .env.example .env        # set NETUID, the VALIDATOR_/MINER_ wallet settings (+ VALIDATOR_SECRET_KEY)
+
+make up                     # validator
+make up ROLE=miner          # miner
+make logs                   # follow logs        (add ROLE=miner for the miner)
+make status                 # container + heartbeat
+make restart / make down
+make backup-state           # tar.gz of ./data into ./backups
+```
+
+- **Wallets:** the validator and the miner have separate settings (`VALIDATOR_WALLET_DIR` / `VALIDATOR_WALLET_NAME` / `VALIDATOR_HOTKEY`, and the same with `MINER_`), so both can run from one folder with different wallets. Each role's directory is mounted read-only; the wallet name is the folder name inside it, not a path. `make down` stops only the selected `ROLE`.
+- **State:** everything that must survive restarts (validator state, emission state, bans, downloaded submissions, logs, miner challenge packages) is kept in `./data` (`DATA_DIR`). Moving from a bare-metal validator? Run `make migrate-state` once: it copies (never moves) the old state files from the repo root into `./data`.
+- **Networking:** the containers use host networking (Linux). The validator reaches the EDA server at `EDA_SERVER_URL` (default `http://localhost:8080`); the miner's axon listens on `AXON_PORT` (default 8091), which must be reachable from the internet.
+- **Health:** each neuron rewrites a heartbeat file every 30 s from its event loop; the container is marked unhealthy if it goes stale for 3 minutes, and `restart: unless-stopped` brings it back after crashes and reboots. Logs are rotated (5 × 50 MB).
+- **Miner CLI in Docker:** `make submit FILE=solution.zip`, or any command with `make cli ARGS="status"`.
+- `make test` runs the test-suite in a throwaway container.
 
 ### For Miners
 
@@ -85,10 +109,16 @@ CHIPFORGE_LIVE_TESTS=1 pytest -m live    # optional: hits testnet (netuid 440 by
 
 #### Running a Miner
 
-Set parameters in .env file and run:
+Set parameters in `.env` (see `.env.example`; the miner's wallet is `MINER_WALLET_DIR`,
+`MINER_WALLET_NAME`, `MINER_HOTKEY`) and run:
 ```bash
-./start_miner
+./start_miner.sh          # or, with Docker: make up ROLE=miner
 ```
+
+The miner polls the challenge server every `MINER_POLL_SECONDS` (default 300 s) and
+immediately when a validator announces a new challenge, then downloads and extracts the
+challenge package to `downloaded_active_challenge/<challenge_id>/`. A failed download is
+retried on the next poll. The axon only answers hotkeys with a validator permit.
 
 #### Running with nohup (background process)
 
@@ -138,7 +168,7 @@ python3 python_scripts/miner_cli.py status
 # List all your submissions
 python3 python_scripts/miner_cli.py submissions
 
-# Download challenge information and test cases
+# Download and extract the challenge package (spec, testbench) + challenge info
 python3 python_scripts/miner_cli.py download
 
 # Submit a solution (with validation)
@@ -163,11 +193,40 @@ You can also use the miner CLI directly with explicit arguments:
 python3 python_scripts/miner_cli.py submit solution.zip \
     --wallet.name YOUR_WALLET \
     --wallet.hotkey YOUR_HOTKEY \
-    --api_url http://your-api-url:8000 \
+    --api_url https://api.chipforge.io \
     --check_status
 ```
 
+`--wallet.name`, `--wallet.hotkey`, `--wallet.path` and `--api_url` can be given before or
+after the command.
+
 For more details, see [MINER_CLI_COMMANDS.md](MINER_CLI_COMMANDS.md).
+
+#### Results, logs and revealed winning designs
+
+- **Leaderboard:** [chipforge.io/leaderboard](https://chipforge.io/leaderboard) shows the score to beat, the current
+  winner on chain, every submission (one row each, with the validators' consensus score and gates), a page per
+  miner and per submission with a plain explanation of the result (e.g. "functional gate failed", "passed but
+  below the score to beat").
+- **Scores are published when a batch closes.** While your submission is in an open batch it shows "In batch";
+  no validator can see another's results before submitting its own.
+- **Full evaluation logs** are not public (the website shows a summary: gates, metrics, error code and message).
+  The miner who made the submission gets them, once its batch has closed:
+  ```bash
+  python3 python_scripts/miner_cli.py logs <submission_id>        # saves one file per validator
+  ```
+- **Winning designs can be revealed** to every hotkey **registered on the subnet** (miners and validators), when
+  the subnet has reveals turned on. Each winner's design is revealed a set time after it won, earlier if a
+  newer winner overtakes it, and/or when the challenge ends; the Winners tab on the leaderboard shows the policy
+  and when each design becomes available.
+  ```bash
+  python3 python_scripts/miner_cli.py reveals                        # policy + status of each winning design
+  python3 python_scripts/miner_cli.py reveal-download <submission_id>  # saves ./revealed_designs/<id>.zip
+  ```
+  The request is signed with your hotkey (an unregistered hotkey gets 403), downloads are limited per day and
+  logged, and the file is checked against the winner's signed hash before it is saved.
+- **Copies don't win:** a file byte-identical to a winning design is refused at submission, and the subnet can
+  require a new winner to beat the score to beat by a minimum margin (`MIN_IMPROVEMENT_PERCENT`).
 
 #### Solution Format
 
@@ -178,13 +237,17 @@ Solutions must be packaged as ZIP files containing:
 - README with design description (optional)
 
 **Important Constraints:**
-- Maximum file size: **10MB**
+- Maximum file size: **50 MB**
 - File must be a valid ZIP archive
 - The miner CLI tool automatically validates these requirements before submission
 
 #### Rate Limits
-- Challenge server accepts 5 requests per IP per hour.
-- One hotkey is allowed to submit a maximum 5 solutions for a specific challenge.
+- Miner endpoints of the challenge server (submit, status, history) accept 2 requests per minute and
+  5 per hour per IP by default.
+- `logs` and `reveal-download` have their own, separate budget (10 per minute, 60 per hour per IP by
+  default), plus a daily cap per hotkey for revealed designs.
+- One hotkey is allowed to submit a maximum 5 solutions for a specific challenge (per-challenge setting).
+- The public API used by the website and `miner_cli.py reveals` is limited separately (120 per minute per IP).
 
 ### For Validators
 
@@ -194,11 +257,29 @@ Pull and run Chipforge EDA Server:
 ```
 https://github.com/TatsuProject/chipforge_eda_server
 ```
+The EDA server has no API key: keep its port (8080) closed to the internet, or bind it to
+`127.0.0.1` on the validator machine.
 
-Set parameters in .env file and run:
+Set parameters in `.env` (see `.env.example`): the validator's wallet is `VALIDATOR_WALLET_DIR`,
+`VALIDATOR_WALLET_NAME`, `VALIDATOR_HOTKEY`, and `VALIDATOR_SECRET_KEY` goes there too (never on the
+command line). Then run:
 ```bash
-./start_validator
+make up                   # Docker (recommended), or: ./start_validator.sh
 ```
+A miner can run from the same folder with its own wallet (`MINER_WALLET_*`, `make up ROLE=miner`).
+
+What the validator does each cycle:
+- polls the challenge server (`/validator/sync`, one cached request for challenge, batch, bans and test-case version),
+- downloads the exposed batch (each file's sha256 is checked against the hash the miner signed) and evaluates it on the EDA server within the batch's deadline,
+- submits scores, and if a submission beats the challenge's best qualified score, it becomes this validator's winner,
+- puts weights on chain immediately when the winner changes (within the chain's rate limit) and refreshes them every `WEIGHTS_REFRESH_SECONDS`: the winner gets `MINER_EMISSION_PERCENTAGE` percent, the rest is burned to UID 0.
+
+Each validator picks its winner from its own evaluations; there is no winner sync between
+validators or with the challenge server. The winner's share of the weight
+(`MINER_EMISSION_PERCENTAGE`) is the validator's own setting unless the challenge server sets one,
+in which case the server's value is used (the validator logs when it overrides the local value). If the subnet sets a minimum improvement margin,
+`MIN_IMPROVEMENT_PERCENT` in the validator's `.env` **must equal the challenge server's value**
+(default 0), otherwise validators disagree about who won.
 
 #### Running with nohup (background process)
 
@@ -268,11 +349,16 @@ Each submission is evaluated across four key metrics:
 
 ### Competitive Ranking
 
-- Submissions are ranked by overall score
-- Only submissions that beat the current challenge-wide best score receive rewards
-- Weights are set to reward the highest-scoring submission
+- Submissions are ranked by overall score (the average of the validators that evaluated them)
+- The challenge server decides the winner when a batch closes, from every validator's results: a
+  submission's score is the highest gate-passing score it received, and the best one in the batch wins
+  if it beats the score to beat (plus `MIN_IMPROVEMENT_PERCENT` if the subnet sets one). Ties go to the
+  earlier submission, and the score to beat then rises to the new winner's score
+- Weights reward the highest-scoring submission with `MINER_EMISSION_PERCENTAGE` of the validator's weight; the rest is burned
 - Emission burning occurs when no submissions exceed quality thresholds
 - The winner of a challenge will keep getting reward for specific time after challenge expiration
+- The chain decides who is actually paid (highest incentive); the leaderboard shows it and which validators agree
+- Winning designs may be revealed to registered neurons after a delay (see "Results, logs and revealed winning designs")
 
 ## Challenge Types
 
@@ -289,12 +375,29 @@ Each submission is evaluated across four key metrics:
 GET  /api/v1/challenges/active              # Get active challenge
 POST /api/v1/challenges/{id}/generate-submission-id  # Generate submission ID
 POST /api/v1/challenges/{id}/submit         # Submit design solution
-GET  /api/v1/challenges/{id}/submissions/hotkey/{hotkey}  # Check submissions
+GET  /api/v1/challenges/{id}/submissions/hotkey/{hotkey}  # Check submissions (signed)
+GET  /api/v1/challenges/{id}/download       # Challenge package
+GET  /api/v1/submissions/{submission_id}/evaluation_logs   # Full logs of your own submission (signed)
+GET  /api/v1/reveals/{submission_id}/download              # Revealed winning design (signed, registered hotkeys)
+```
+
+### Public Endpoints (no key; cached; rate limited per IP)
+
+```
+GET  /api/v1/public/snapshot                # Active challenge, score to beat, winner (server + chain), batch
+GET  /api/v1/public/challenges              # Active and past challenges
+GET  /api/v1/public/challenges/{id}/leaderboard  # One row per submission
+GET  /api/v1/public/submissions/{id}        # One submission: batches, per-validator results and summary
+GET  /api/v1/public/miners/{hotkey}         # A miner across challenges
+GET  /api/v1/public/validators              # Validators, their on-chain pick, agreement with the chain
+GET  /api/v1/public/reveals?challenge_id=   # Reveal policy and status of each winning design
+GET  /api/v1/public/rules                   # Competition rules as data
 ```
 
 ### Validator Endpoints
 
 ```
+GET  /api/v1/validator/sync                 # Challenge, batch, bans, test-case version in one call (ETag)
 GET  /api/v1/challenges/{id}/batch/current  # Get current evaluation batch
 GET  /api/v1/challenges/{id}/submissions/{submission_id}/download  # Download submission
 POST /api/v1/challenges/{id}/submissions/{submission_id}/submit_score  # Submit evaluation
@@ -306,7 +409,7 @@ POST /api/v1/challenges/{id}/submissions/{submission_id}/submit_score  # Submit 
 
 The subnet uses a dynamic batch system:
 - Submissions are grouped into evaluation batches
-- Each batch has a download window (10 minutes) and evaluation window (20 minutes)
+- Each batch has a download window and an evaluation window; the lengths come from the challenge server
 - Only one batch is exposed to validators at a time
 - Batches transition: EXPOSED → EVALUATING → COMPLETED
 
@@ -329,8 +432,12 @@ The subnet uses a dynamic batch system:
 ### Health Checks
 
 ```bash
-# Check challenge server health
-curl http://challenge-server:8000/health
+# Challenge server
+curl https://api.chipforge.io/health
+# EDA server (validators)
+curl http://localhost:8080/health
+# Validator / miner under Docker
+make status
 ```
 
 ## Troubleshooting
@@ -345,7 +452,7 @@ curl http://challenge-server:8000/health
 2. **Submission Upload Failed**
    - Use `miner_cli.py submit solution.zip --dry_run` to validate before submitting
    - Check ZIP file format and contents
-   - Verify file size limits (10MB maximum - enforced by miner CLI)
+   - Verify file size limits (50 MB maximum - checked by the miner CLI before uploading)
    - Ensure proper authentication headers
    - Check wallet configuration in `.env` file or command-line arguments
 

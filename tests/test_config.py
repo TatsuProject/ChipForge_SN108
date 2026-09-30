@@ -19,6 +19,8 @@ def _clean_parse_flag(monkeypatch):
 def test_validator_get_config_parses_cli(monkeypatch, tmp_path):
     from neurons.validator import get_config
 
+    # the validator modules load the developer's .env; the default must not depend on it
+    monkeypatch.delenv("MINER_EMISSION_PERCENTAGE", raising=False)
     monkeypatch.setattr(sys, "argv", [
         "validator.py",
         "--netuid", "84",
@@ -118,3 +120,15 @@ def test_miner_cli_parser_accepts_documented_invocation(monkeypatch):
     cfg = captured["config"]
     assert cfg.wallet.name == "w" and cfg.wallet.hotkey == "h" and cfg.api_url == "http://x:1"
     assert captured["submit"] == {"solution_file": "sol.zip", "challenge_id": None, "check_status": True, "dry_run": False}
+
+
+def test_miner_emission_percentage_from_env(monkeypatch, tmp_path):
+    from neurons.validator import get_config
+
+    monkeypatch.setenv("MINER_EMISSION_PERCENTAGE", "25")
+    monkeypatch.setattr(sys, "argv", ["validator.py", "--netuid", "108", "--wallet.path", str(tmp_path),
+                                      "--validator_secret_key", "x"])
+    assert get_config().miner_emission_percentage == 25.0
+    monkeypatch.setattr(sys, "argv", ["validator.py", "--netuid", "108", "--wallet.path", str(tmp_path),
+                                      "--validator_secret_key", "x", "--miner_emission_percentage", "5"])
+    assert get_config().miner_emission_percentage == 5.0     # CLI flag wins

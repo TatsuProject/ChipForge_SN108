@@ -71,10 +71,19 @@ def test_scalecodec_comes_from_cyscale_not_legacy_pin():
 
 def test_app_imports():
     """Every module the neurons and CLI import must resolve in this env."""
-    for mod in ("torch", "aiohttp", "aiofiles", "requests", "dotenv", "cryptography.hazmat.primitives.asymmetric.ed25519"):
+    for mod in ("aiohttp", "aiofiles", "requests", "dotenv", "cryptography.hazmat.primitives.asymmetric.ed25519"):
         importlib.import_module(mod)
 
 
 def test_repo_modules_import():
     import chipforge.protocol  # noqa: F401
     import validator_utils  # noqa: F401  (neurons/ is on sys.path via conftest)
+
+
+def test_torch_is_not_required():
+    """Weights are passed to bittensor as plain lists; the validator must not import torch."""
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[1]
+    offenders = [str(p) for p in (root / "neurons").rglob("*.py") if "import torch" in p.read_text()]
+    assert offenders == []
+    assert "torch" not in (root / "requirements.txt").read_text()

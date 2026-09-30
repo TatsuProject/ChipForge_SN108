@@ -14,8 +14,10 @@ source .env
 # Check required environment variables
 missing_vars=()
 
-if [ -z "$WALLET_NAME" ]; then
-    missing_vars+=("WALLET_NAME")
+MINER_WALLET_NAME="${MINER_WALLET_NAME:-$WALLET_NAME}"
+MINER_WALLET_DIR="${MINER_WALLET_DIR:-${WALLET_DIR:-$HOME/.bittensor/wallets}}"
+if [ -z "$MINER_WALLET_NAME" ]; then
+    missing_vars+=("MINER_WALLET_NAME")
 fi
 
 if [ -z "$MINER_HOTKEY" ]; then
@@ -47,7 +49,8 @@ fi
 
 # All checks passed, proceed with submission
 python python_scripts/miner_cli.py \
-    --wallet.name "$WALLET_NAME" \
+    --wallet.name "$MINER_WALLET_NAME" \
+    --wallet.path "$MINER_WALLET_DIR" \
     --wallet.hotkey "$MINER_HOTKEY" \
     --api_url "$CHALLENGE_API_URL" \
     submit "$FILE_TO_SUBMIT" \

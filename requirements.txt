@@ -20,7 +20,6 @@ bt-decode==0.8.0
 
 # Application dependencies (transitives are resolved by pip; see
 # requirements-lock.txt for the exact set that was tested).
-torch>=2.4
 aiohttp>=3.10
 aiofiles>=24.1
 requests>=2.32

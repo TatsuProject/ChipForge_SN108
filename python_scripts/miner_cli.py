@@ -26,6 +26,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# The challenge server rejects anything above MAX_FILE_SIZE_MB (50 MB); check before uploading.
+MAX_FILE_SIZE_MB = int(os.getenv("MAX_SUBMISSION_SIZE_MB", "50"))
+MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
+
 
 class SolutionSubmitter:
     """Handles solution submission to ChipForge challenge server"""
@@ -60,6 +64,11 @@ class SolutionSubmitter:
             logger.error(f"Error creating signature: {e}")
             raise
     
+    def auth_params(self) -> Dict[str, str]:
+        """Query params for signed miner endpoints: signature over f"{hotkey}{timestamp}"."""
+        timestamp = datetime.now(timezone.utc).isoformat()
+        return {"signature": self.create_signature(f"{self.miner_hotkey}{timestamp}"), "timestamp": timestamp}
+
     def calculate_file_hash(self, file_path: Path) -> str:
         """Calculate SHA256 hash of file"""
         sha256_hash = hashlib.sha256()
@@ -79,13 +88,10 @@ class SolutionSubmitter:
                 logger.error(f"File must be a ZIP file: {zip_path}")
                 return False
             
-            # Check file size (10MB limit)
-            MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB in bytes
             file_size = zip_path.stat().st_size
-            
             if file_size > MAX_FILE_SIZE:
                 size_mb = file_size / (1024 * 1024)
-                logger.error(f"File size ({size_mb:.2f} MB) exceeds maximum allowed size (10 MB)")
+                logger.error(f"File size ({size_mb:.2f} MB) exceeds maximum allowed size ({MAX_FILE_SIZE_MB} MB)")
                 return False
             
             # Test if ZIP is valid
@@ -245,19 +251,59 @@ class SolutionSubmitter:
         """Get all submissions for this miner"""
         try:
             url = f"{self.api_url}/api/v1/challenges/{challenge_id}/submissions/hotkey/{self.miner_hotkey}"
-            response = requests.get(url, timeout=30)
+            response = requests.get(url, params=self.auth_params(), timeout=30)
             
             if response.status_code == 200:
                 submissions = response.json()
                 logger.info(f"Found {len(submissions.get('submissions', []))} previous submissions")
                 return submissions.get('submissions', [])
             else:
-                logger.debug(f"No previous submissions found: {response.status_code}")
+                logger.warning(f"Could not list submissions: {response.status_code} {response.text[:200]}")
                 return []
                 
         except Exception as e:
             logger.error(f"Error getting miner submissions: {e}")
             return []
+
+
+    def get_evaluation_logs(self, submission_id: str) -> Optional[Dict]:
+        """Full EDA logs of your own submission (the public leaderboard shows only a summary)."""
+        url = f"{self.api_url}/api/v1/submissions/{submission_id}/evaluation_logs"
+        response = requests.get(url, params={**self.auth_params(), "hotkey": self.miner_hotkey}, timeout=60)
+        if response.status_code == 200:
+            return response.json()
+        logger.error(f"Could not get logs: {response.status_code} {response.text[:200]}")
+        return None
+
+
+    def get_reveals(self, challenge_id: Optional[str] = None) -> Optional[Dict]:
+        """Reveal policy and the status of each winning design (public, no signature)."""
+        params = {"challenge_id": challenge_id} if challenge_id else None
+        response = requests.get(f"{self.api_url}/api/v1/public/reveals", params=params, timeout=30)
+        if response.status_code == 200:
+            return response.json()
+        logger.error(f"Could not list reveals: {response.status_code} {response.text[:200]}")
+        return None
+
+    def download_revealed_design(self, submission_id: str) -> Optional[Dict]:
+        """A revealed winning design (registered neurons only, signed). Returns
+        {"content", "sha256", "filename"}; the content is checked against the server's hash."""
+        url = f"{self.api_url}/api/v1/reveals/{submission_id}/download"
+        response = requests.get(url, params={**self.auth_params(), "hotkey": self.miner_hotkey}, timeout=300)
+        if response.status_code != 200:
+            try:
+                detail = response.json().get("detail")
+            except ValueError:
+                detail = response.text[:200]
+            logger.error(f"Download refused ({response.status_code}): {detail}")
+            return None
+        content = response.content
+        expected = response.headers.get("X-File-SHA256", "")
+        actual = hashlib.sha256(content).hexdigest()
+        if expected and expected != actual:
+            logger.error("Downloaded file does not match the server's hash; discarded")
+            return None
+        return {"content": content, "sha256": actual, "filename": f"{submission_id}.zip"}
 
 
 class MinerCLI:
@@ -317,21 +363,21 @@ class MinerCLI:
             
             logger.info(f"Challenge information saved to: {info_file}")
             
-            # Also try to download test cases if available
+            # Challenge package (spec, testbench). Test cases stay validator-only.
+            url = f"{self.api_url}/api/v1/challenges/{challenge_id}/download"
+            response = requests.get(url, timeout=120)
+            if response.status_code != 200:
+                logger.error(f"Challenge package not available: {response.status_code} {response.text[:200]}")
+                return False
+            package = output_dir / f"{challenge_id}.zip"
+            package.write_bytes(response.content)
+            logger.info(f"Challenge package downloaded to: {package}")
             try:
-                url = f"{self.api_url}/api/v1/challenges/{challenge_id}/test_cases/download"
-                response = requests.get(url, timeout=30)
-                
-                if response.status_code == 200:
-                    test_cases_file = output_dir / f"challenge_{challenge_id}_test_cases.zip"
-                    with open(test_cases_file, 'wb') as f:
-                        f.write(response.content)
-                    logger.info(f"Test cases downloaded to: {test_cases_file}")
-                else:
-                    logger.debug(f"Test cases not available: {response.status_code}")
-            except Exception as e:
-                logger.debug(f"Could not download test cases: {e}")
-            
+                with zipfile.ZipFile(package) as zf:
+                    zf.extractall(output_dir)
+                logger.info(f"Extracted to: {output_dir}")
+            except zipfile.BadZipFile:
+                logger.warning("Downloaded package is not a valid ZIP; kept as-is")
             return True
             
         except Exception as e:
@@ -411,7 +457,7 @@ class MinerCLI:
             # Sort by submission time (most recent first)
             sorted_subs = sorted(
                 submissions,
-                key=lambda x: x.get('submitted_at', ''),
+                key=lambda x: x.get('created_at') or '',
                 reverse=True
             )
             
@@ -419,7 +465,7 @@ class MinerCLI:
                 sub_id = sub.get('submission_id', 'N/A')
                 status = sub.get('status', 'unknown')
                 score = sub.get('score', None)
-                submitted_at = sub.get('submitted_at', '')
+                submitted_at = sub.get('created_at') or ''
                 
                 status_emoji = {
                     'pending': '⏳',
@@ -472,7 +518,7 @@ class MinerCLI:
         # Sort by submission time (most recent first)
         sorted_subs = sorted(
             submissions,
-            key=lambda x: x.get('submitted_at', ''),
+            key=lambda x: x.get('created_at') or '',
             reverse=True
         )
         
@@ -484,7 +530,7 @@ class MinerCLI:
             sub_id = sub.get('submission_id', 'N/A')
             status = sub.get('status', 'unknown')
             score = sub.get('score', None)
-            submitted_at = sub.get('submitted_at', '')
+            submitted_at = sub.get('created_at') or ''
             file_hash = sub.get('file_hash', '')
             
             status_emoji = {
@@ -541,6 +587,59 @@ class MinerCLI:
         
         logger.info("=" * 80)
     
+    def show_logs(self, submission_id: str, output_dir: Optional[str] = None):
+        """Save each validator's full evaluation log of your submission and print the notes."""
+        data = self.submitter.get_evaluation_logs(submission_id)
+        if not data:
+            sys.exit(1)
+        out = Path(output_dir or f"./evaluation_logs/{submission_id}")
+        out.mkdir(parents=True, exist_ok=True)
+        if not data["validations"]:
+            logger.info("No completed evaluations yet")
+            return
+        for v in data["validations"]:
+            path = out / f"{v['validator_hotkey']}.json"
+            try:
+                content = json.dumps(json.loads(v["evaluation_details"] or "null"), indent=2)
+            except (TypeError, ValueError):
+                content = v["evaluation_details"] or ""
+            path.write_text(content)
+            logger.info(f"Validator {v['validator_hotkey'][:12]}...  score={v['overall_score']}  "
+                        f"{(v['evaluation_notes'] or '').strip()[:200]}")
+            logger.info(f"  full log: {path}")
+
+    def show_reveals(self, challenge_id: Optional[str] = None):
+        """Reveal policy and which winning designs can be downloaded."""
+        data = self.submitter.get_reveals(challenge_id)
+        if not data:
+            sys.exit(1)
+        policy = data["policy"]
+        if not policy["enabled"]:
+            logger.info("Design reveals are turned off on this subnet")
+        else:
+            delay = policy["delay_hours"]
+            logger.info(f"Reveal policy: {'after ' + format(delay, 'g') + 'h' if delay is not None else 'no timed reveal'}"
+                        f"{', immediately when overtaken' if policy['on_dethrone'] else ''}"
+                        f"{', all winners at challenge end' if policy['at_challenge_end'] else ''}"
+                        f"{', chain-confirmed winners only' if policy['require_chain_confirmation'] else ''}")
+        if not data["designs"]:
+            logger.info("No winning designs for this challenge yet")
+        for d in data["designs"]:
+            when = "available now" if d["revealed"] else (
+                f"reveals {self.format_timestamp(d['reveal_at'])}" if d["reveal_at"] else d["reason"].replace("_", " "))
+            logger.info(f"#{d['position']} {d['submission_id']}  UID {d['miner_uid']}  score {d['achieved_score']}  -> {when}")
+
+    def download_reveal(self, submission_id: str, output_dir: Optional[str] = None):
+        """Download a revealed winning design (your hotkey must be registered on the subnet)."""
+        result = self.submitter.download_revealed_design(submission_id)
+        if not result:
+            sys.exit(1)
+        out = Path(output_dir or "./revealed_designs")
+        out.mkdir(parents=True, exist_ok=True)
+        path = out / result["filename"]
+        path.write_bytes(result["content"])
+        logger.info(f"Saved {path} ({len(result['content']):,} bytes, sha256 {result['sha256'][:16]}...)")
+
     def submit_solution(self, solution_file: str, challenge_id: Optional[str] = None, 
                        check_status: bool = False, dry_run: bool = False):
         """Submit a solution file"""
@@ -554,8 +653,6 @@ class MinerCLI:
             logger.error(f"Solution file not found: {solution_file}")
             sys.exit(1)
         
-        # Check file size (10MB limit)
-        MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB in bytes
         file_size = solution_path.stat().st_size
         size_mb = file_size / (1024 * 1024)
         
@@ -563,7 +660,7 @@ class MinerCLI:
         logger.info(f"File Size: {file_size:,} bytes ({size_mb:.2f} MB)")
         
         if file_size > MAX_FILE_SIZE:
-            logger.error(f"File size ({size_mb:.2f} MB) exceeds maximum allowed size (10 MB)")
+            logger.error(f"File size ({size_mb:.2f} MB) exceeds maximum allowed size ({MAX_FILE_SIZE_MB} MB)")
             logger.error("Please reduce the file size and try again.")
             sys.exit(1)
         
@@ -648,35 +745,59 @@ Examples:
         """
     )
     
+    # Common arguments: accepted before the subcommand and after it
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--wallet.name", type=str,
+                        default=os.getenv("MINER_WALLET_NAME") or os.getenv("WALLET_NAME") or "default",
+                        help="Wallet name (default: MINER_WALLET_NAME from .env, else 'default')")
+    common.add_argument("--wallet.hotkey", type=str, default=os.getenv("MINER_HOTKEY", "default"),
+                        help="Wallet hotkey (default: MINER_HOTKEY from .env, else 'default')")
+    common.add_argument("--wallet.path", type=str,
+                        default=(os.getenv("MINER_WALLET_DIR") or os.getenv("WALLET_PATH")
+                                 or os.getenv("BT_WALLET_PATH") or "~/.bittensor/wallets"),
+                        help="Wallet directory (default: MINER_WALLET_DIR from .env, else ~/.bittensor/wallets)")
+    common.add_argument("--api_url", type=str, default=os.getenv("CHALLENGE_API_URL", "https://api.chipforge.io"),
+                        help="Challenge server API URL (default: CHALLENGE_API_URL or https://api.chipforge.io)")
+    # Subcommand copies default to SUPPRESS so they don't overwrite values given before the subcommand
+    sub_common = argparse.ArgumentParser(add_help=False, argument_default=argparse.SUPPRESS)
+    for action in common._actions:
+        sub_common.add_argument(*action.option_strings, type=action.type, help=action.help)
+    for action in common._actions:
+        parser._add_action(action)
+
     # Subcommands
     subparsers = parser.add_subparsers(dest='command', help='Command to execute')
     
     # Status command
-    status_parser = subparsers.add_parser('status', help='Show current challenge and submissions')
+    status_parser = subparsers.add_parser('status', parents=[sub_common], help='Show current challenge and submissions')
     
     # Submissions command
-    submissions_parser = subparsers.add_parser('submissions', help='List all submissions')
+    submissions_parser = subparsers.add_parser('submissions', parents=[sub_common], help='List all submissions')
     submissions_parser.add_argument('--challenge_id', type=str, help='Challenge ID (default: active challenge)')
     
     # Download command
-    download_parser = subparsers.add_parser('download', help='Download current challenge')
+    download_parser = subparsers.add_parser('download', parents=[sub_common], help='Download current challenge')
     download_parser.add_argument('--output', '-o', type=str, help='Output directory (default: ./challenges/<challenge_id>)')
     download_parser.add_argument('--challenge_id', type=str, help='Challenge ID (default: active challenge)')
     
+    # Logs command
+    logs_parser = subparsers.add_parser('logs', parents=[sub_common], help='Save the full evaluation logs of your submission')
+    logs_parser.add_argument('submission_id', type=str, help='Submission ID')
+    logs_parser.add_argument('--output', '-o', type=str, help='Output directory (default: ./evaluation_logs/<submission_id>)')
+
+    # Reveal commands
+    reveals_parser = subparsers.add_parser('reveals', parents=[sub_common], help='Show the reveal policy and which winning designs are available')
+    reveals_parser.add_argument('--challenge_id', type=str, help='Challenge ID (default: active challenge)')
+    reveal_dl_parser = subparsers.add_parser('reveal-download', parents=[sub_common], help='Download a revealed winning design (registered neurons only)')
+    reveal_dl_parser.add_argument('submission_id', type=str, help='Submission ID of the winning design')
+    reveal_dl_parser.add_argument('--output', '-o', type=str, help='Output directory (default: ./revealed_designs)')
+
     # Submit command
-    submit_parser = subparsers.add_parser('submit', help='Submit solution file')
+    submit_parser = subparsers.add_parser('submit', parents=[sub_common], help='Submit solution file')
     submit_parser.add_argument('file', type=str, help='Path to solution ZIP file')
     submit_parser.add_argument('--challenge_id', type=str, help='Challenge ID (default: active challenge)')
     submit_parser.add_argument('--check_status', action='store_true', help='Check status of previous submissions')
     submit_parser.add_argument('--dry_run', action='store_true', help='Validate ZIP but don\'t submit')
-    
-    # Common arguments
-    parser.add_argument("--wallet.name", type=str, default=os.getenv("WALLET_NAME", "default"),
-                       help="Wallet name (default: from .env or 'default')")
-    parser.add_argument("--wallet.hotkey", type=str, default=os.getenv("MINER_HOTKEY", "default"),
-                       help="Wallet hotkey (default: from .env or 'default')")
-    parser.add_argument("--api_url", type=str, default=os.getenv("CHALLENGE_API_URL", "http://localhost:8000"),
-                       help="Challenge server API URL (default: from .env or localhost:8000)")
     
     args = parser.parse_args()
     
@@ -689,9 +810,10 @@ Examples:
         config = type('Config', (), {
             'wallet': type('Wallet', (), {
                 'name': getattr(args, 'wallet.name'),
-                'hotkey': getattr(args, 'wallet.hotkey')
+                'hotkey': getattr(args, 'wallet.hotkey'),
+                'path': os.path.expanduser(getattr(args, 'wallet.path')),
             })(),
-            'api_url': args.api_url
+            'api_url': args.api_url.rstrip('/')
         })()
         
         # Initialize CLI
@@ -707,6 +829,12 @@ Examples:
                 output_dir=getattr(args, 'output', None),
                 challenge_id=getattr(args, 'challenge_id', None)
             )
+        elif args.command == 'logs':
+            cli.show_logs(args.submission_id, output_dir=getattr(args, 'output', None))
+        elif args.command == 'reveals':
+            cli.show_reveals(challenge_id=getattr(args, 'challenge_id', None))
+        elif args.command == 'reveal-download':
+            cli.download_reveal(args.submission_id, output_dir=getattr(args, 'output', None))
         elif args.command == 'submit':
             cli.submit_solution(
                 solution_file=args.file,

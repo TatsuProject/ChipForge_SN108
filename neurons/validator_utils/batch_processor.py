@@ -5,28 +5,41 @@ Batch Processor for ChipForge Validator
 Handles batch evaluation and processing logic
 """
 
-import asyncio
 import logging
+import os
 import traceback
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict
 from dotenv import load_dotenv
 load_dotenv()
+from .api_client import parse_server_time
+from .storage import data_path
+from .weight_manager import WeightTarget
+
+
+def beats(score: float, target: float) -> bool:
+    """score beats target by at least MIN_IMPROVEMENT_PERCENT (0 = any higher score).
+    Must match the challenge server's MIN_IMPROVEMENT_PERCENT."""
+    try:
+        margin = max(0.0, float(os.getenv("MIN_IMPROVEMENT_PERCENT", "0") or 0))
+    except ValueError:
+        margin = 0.0
+    return score > target + abs(target) * margin / 100.0
+
 logger = logging.getLogger(__name__)
 
 
 class BatchProcessor:
     """Handles batch processing logic for the validator"""
     
-    def __init__(self, api_client, state, emission_manager, weight_manager):
+    def __init__(self, api_client, state, emission_manager, set_weight_target):
         self.api_client = api_client
         self.state = state
         self.emission_manager = emission_manager
-        self.weight_manager = weight_manager
+        # Callable(WeightTarget): the validator applies it to the chain right after the batch
+        self.set_weight_target = set_weight_target
         
         # Directories
-        self.base_dir = Path('./validator_data')
+        self.base_dir = data_path('validator_data')
         self.submissions_dir = self.base_dir / 'submissions'
         self.submissions_dir.mkdir(parents=True, exist_ok=True)
     
@@ -55,50 +68,6 @@ class BatchProcessor:
         
         return submission_hotkeys
     
-    def calculate_weights_from_hotkeys(self, evaluations: Dict[str, Dict], submission_hotkeys: Dict[str, str]) -> Dict[str, float]:
-        """Calculate weights based on evaluation scores and map to miner hotkeys"""
-        if not evaluations or not submission_hotkeys:
-            return {}
-
-        # Create hotkey to best score mapping
-        hotkey_scores = {}
-
-        for submission_id, eval_data in evaluations.items():
-            miner_hotkey = submission_hotkeys.get(submission_id)
-            if miner_hotkey:
-                # GATE CHECK: Both functional_gate and overall_gate must be True
-                functional_gate = eval_data.get('functional_gate', False)
-                overall_gate = eval_data.get('overall_gate', False)
-
-                if not functional_gate or not overall_gate:
-                    logger.info(f"Submission {submission_id} FAILED gates - skipping from weight calculation")
-                    continue
-
-                score = eval_data['overall_score']
-                # Keep the best score for each miner
-                if miner_hotkey not in hotkey_scores or score > hotkey_scores[miner_hotkey]:
-                    hotkey_scores[miner_hotkey] = score
-
-        if not hotkey_scores:
-            return {}
-
-        # Sort miners by best score
-        sorted_miners = sorted(hotkey_scores.items(), key=lambda x: x[1], reverse=True)
-
-        # Winner-takes-all approach
-        weights = {}
-        for i, (hotkey, score) in enumerate(sorted_miners):
-            if i == 0:  # Highest score gets weight 1
-                weights[hotkey] = 1.0
-            else:  # All others get weight 0
-                weights[hotkey] = 0.0
-
-        winner_hotkey, winner_score = sorted_miners[0]
-        logger.info(f"Calculated weights: winner={winner_hotkey[:12]}... (score: {winner_score})")
-        logger.info(f"Total miners evaluated: {len(weights)}")
-
-        return weights
-    
     async def process_batch(self, challenge_id: str, batch: Dict) -> bool:
         """Process a complete batch evaluation with challenge-wide best score tracking"""
         batch_id = batch['batch_id']
@@ -112,7 +81,7 @@ class BatchProcessor:
             # CRITICAL: Fetch FRESH baseline BEFORE evaluation (it may have changed since last check)
             logger.info(f"Fetching fresh baseline score for challenge {challenge_id} before evaluation")
             try:
-                challenge_info = await self.api_client.get_challenge_info(challenge_id)
+                challenge_info = await self.api_client.get_challenge_info(challenge_id, fresh=True)
                 if challenge_info and 'winner_baseline_score' in challenge_info:
                     fresh_baseline = challenge_info['winner_baseline_score']
                     if self.state.winner_baseline_score != fresh_baseline:
@@ -124,20 +93,8 @@ class BatchProcessor:
                 else:
                     logger.warning(f"Could not fetch fresh baseline, using cached: {self.state.winner_baseline_score}")
 
-                # Refresh batch window config so the EDA timeout used for this batch matches the server
-                if challenge_info:
-                    new_dl = challenge_info.get('batch_download_window_seconds')
-                    new_eval = challenge_info.get('batch_evaluation_window_seconds')
-                    ws_changed = False
-                    if new_dl is not None and new_dl != self.state.batch_download_window_seconds:
-                        self.state.batch_download_window_seconds = new_dl
-                        ws_changed = True
-                    if new_eval is not None and new_eval != self.state.batch_evaluation_window_seconds:
-                        self.state.batch_evaluation_window_seconds = new_eval
-                        ws_changed = True
-                    if ws_changed:
-                        logger.info(f"Batch windows refreshed: download={self.state.batch_download_window_seconds}s, evaluation={self.state.batch_evaluation_window_seconds}s")
-                        self.state.save_state()
+                # Keep batch windows in sync with the server
+                self.state.update_batch_windows(challenge_info)
             except Exception as e:
                 logger.error(f"Error fetching fresh baseline: {e}, using cached: {self.state.winner_baseline_score}")
 
@@ -151,12 +108,21 @@ class BatchProcessor:
             logger.info(f"Downloaded {len(downloaded_submissions)} submissions")
 
             if not downloaded_submissions:
+                ids = {s.get('submission_id') for s in batch.get('submissions', [])}
+                if ids and ids <= self.api_client.already_evaluated:
+                    # Everything in this batch was already scored by this validator (re-batched
+                    # for another validator): done, not a failure
+                    logger.info(f"Batch {batch_id}: nothing left to evaluate for this validator")
+                    self.state.mark_batch_evaluated(batch_id)
+                    return True
                 logger.warning(f"No submissions downloaded for batch {batch_id}")
                 return False
 
-            # Evaluate with EDA server
+            # Evaluate with EDA server, within the server's evaluation deadline for this batch
             logger.info(f"Evaluating {len(downloaded_submissions)} submissions with EDA server")
-            evaluations = await self.api_client.evaluate_submissions_with_eda_server(challenge_id, downloaded_submissions)
+            evaluations = await self.api_client.evaluate_submissions_with_eda_server(
+                challenge_id, downloaded_submissions, deadline=parse_server_time(batch.get('evaluation_ends_at'))
+            )
             if not evaluations:
                 logger.error(f"No evaluations received from EDA server")
                 return False
@@ -174,11 +140,17 @@ class BatchProcessor:
 
             logger.info(f"Successfully submitted {len(successful_submissions)} evaluations")
 
-            # Extract hotkeys from filenames
-            submission_hotkeys = self.extract_hotkeys_from_filenames(batch_id, successful_submissions)
+            # Miner hotkeys: from the batch entries (challenge server provides them), falling
+            # back to parsing the downloaded filenames for older servers
+            submission_hotkeys = {
+                s['submission_id']: s['hotkey'] for s in batch.get('submissions', [])
+                if s.get('hotkey') and s['submission_id'] in successful_submissions
+            }
+            missing = {k: v for k, v in successful_submissions.items() if k not in submission_hotkeys}
+            if missing:
+                submission_hotkeys.update(self.extract_hotkeys_from_filenames(batch_id, missing))
 
-            current_best_score = self.state.current_challenge_best[1] if hasattr(self.state, 'current_challenge_best') else 0.0
-            current_best_hotkey = self.state.current_challenge_best[0] if hasattr(self.state, 'current_challenge_best') else None
+            current_best_hotkey, current_best_score = self.state.current_challenge_best
 
             logger.info(f"Current challenge best: {current_best_hotkey[:12] if current_best_hotkey else 'None'}... -> {current_best_score}")
 
@@ -199,8 +171,8 @@ class BatchProcessor:
                     continue
 
                 # Check if score beats both current best AND baseline snapshot (from BEFORE submission)
-                if hotkey and overall_score > new_best_score:
-                    if overall_score > evaluation_baseline_snapshot:
+                if hotkey and beats(overall_score, new_best_score):
+                    if beats(overall_score, evaluation_baseline_snapshot):
                         new_best_score = overall_score
                         new_champion = hotkey
                         logger.info(f"New challenge champion found: {hotkey[:12]}... -> {overall_score} (beats previous: {current_best_score} and baseline snapshot: {evaluation_baseline_snapshot})")
@@ -217,30 +189,10 @@ class BatchProcessor:
                 # Update emission manager with new winner + baseline snapshot they qualified against
                 self.emission_manager.update_winner(new_champion, new_best_score, evaluation_baseline_snapshot, winner_timestamp=None)
                 
-                # Check if new champion is on subnet and get UID
-                # Check emissions ban before setting weights
-                if self.state.ban_emissions:
-                    logger.warning(f"EMISSIONS BANNED by challenge server - burning instead of rewarding new champion {new_champion[:12]}...")
-                    self.weight_manager.set_burn_weights()
-                else:
-                    try:
-                        uid = self.weight_manager.get_hotkey_uid(new_champion)
-                        if uid is not None:
-                            # Set weights: 1.0 for new champion, 0.0 for others
-                            weights = {new_champion: 1.0}
-                            logger.info(f"Setting NEW CHAMPION weights: {new_champion[:12]}... (UID {uid}) = 1.0, score: {new_best_score}")
-                            
-                            weight_success = self.weight_manager.set_weights(weights)
-                            if not weight_success:
-                                logger.error("Failed to set weights, burning emissions")
-                                self.weight_manager.set_burn_weights()
-                        else:
-                            logger.warning(f"New champion {new_champion[:12]}... not found on subnet, burning emissions")
-                            self.weight_manager.set_burn_weights()
-                    except Exception as e:
-                        logger.error(f"Error getting UID for new champion: {e}, burning emissions")
-                        self.weight_manager.set_burn_weights()
-                    
+                # Reward the new champion. Bans, ban_emissions, the emission split and
+                # "not registered" are all handled when the weights are built and submitted.
+                self.set_weight_target(WeightTarget.winner(new_champion, f"new champion, score {new_best_score}"))
+
             else:
                 # No new champion found - check emission management policy
                 logger.info(f"No submissions beat challenge best of {current_best_score}")
@@ -248,40 +200,19 @@ class BatchProcessor:
                 # Get reward hotkey from emission manager (NO baseline check - winner already qualified)
                 reward_hotkey = self.emission_manager.get_reward_hotkey(current_best_hotkey, current_best_score)
                 should_burn = self.emission_manager.should_burn_emissions(current_best_score)
-                
+
                 if reward_hotkey and not should_burn:
-                    # Check emissions ban before continuing to reward
-                    if self.state.ban_emissions:
-                        logger.warning(f"EMISSIONS BANNED by challenge server - burning instead of rewarding {reward_hotkey[:12]}...")
-                        self.weight_manager.set_burn_weights()
-                    else:
-                        # Continue rewarding current winner/champion
-                        try:
-                            uid = self.weight_manager.get_hotkey_uid(reward_hotkey)
-                            if uid is not None:
-                                weights = {reward_hotkey: 1.0}
-                                logger.info(f"Challenge active, winner {reward_hotkey[:12]}... taking reward until next good submission")
-                                
-                                weight_success = self.weight_manager.set_weights(weights)
-                                if not weight_success:
-                                    logger.error("Failed to set weights, burning emissions")
-                                    self.weight_manager.set_burn_weights()
-                            else:
-                                logger.warning(f"Reward target {reward_hotkey[:12]}... not found on subnet, burning emissions")
-                                self.weight_manager.set_burn_weights()
-                        except Exception as e:
-                            logger.error(f"Error getting UID for reward target: {e}, burning emissions")
-                            self.weight_manager.set_burn_weights()
+                    logger.info(f"Challenge active, winner {reward_hotkey[:12]}... taking reward until next good submission")
+                    self.set_weight_target(WeightTarget.winner(reward_hotkey, "current winner"))
                 else:
-                    # Should burn emissions
                     if self.emission_manager.current_winner:
                         logger.info("Challenge active, submissions found but winner reward period expired - burning emissions")
                     else:
                         logger.info("Challenge active, submissions checking but no qualified winner - burning emissions")
-                    self.weight_manager.set_burn_weights()
-            
+                    self.set_weight_target(WeightTarget.burn("no qualified winner"))
+
             # Mark batch as processed
-            self.state.evaluated_batches.add(batch_id)
+            self.state.mark_batch_evaluated(batch_id)
             self.state.current_batch_id = None
             self.state.evaluation_in_progress = False
             self.state.save_state()

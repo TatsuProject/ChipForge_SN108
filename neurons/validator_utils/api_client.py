@@ -8,19 +8,38 @@ Handles all API communications with challenge server and EDA server
 import asyncio
 import aiohttp
 import aiofiles
+import hashlib
 import logging
-import tempfile
 import os
+import re
 import json
-from datetime import datetime, timezone, timedelta
+import secrets
+import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Any
-from cryptography.hazmat.primitives.asymmetric import ed25519
-import zipfile
+from urllib.parse import urlparse
+from typing import Dict, Optional, Any
 from dotenv import load_dotenv
 load_dotenv()
 
+from .storage import data_path
+
 logger = logging.getLogger(__name__)
+
+_SAFE_FILENAME = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
+
+
+def safe_filename(name: Optional[str], fallback: str) -> str:
+    """A server-provided filename reduced to a plain basename; anything else -> fallback."""
+    base = os.path.basename((name or "").strip().strip('"'))
+    return base if base and base not in (".", "..") and _SAFE_FILENAME.match(base) else fallback
+
+
+def parse_server_time(value) -> Optional[datetime]:
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")) if value else None
+    except ValueError:
+        return None
 
 
 class APIClient:
@@ -42,170 +61,347 @@ class APIClient:
         
         # Validator authentication
         self.validator_hotkey = self.wallet.hotkey.ss58_address
+        self.signature_mode = os.getenv("SIGNATURE_MODE", "both").lower()   # both | v2 | v1
+
+        # /validator/sync cache (see _sync)
+        self._sync_supported: Optional[bool] = None
+        self._sync_state: Optional[Dict] = None
+        # Submissions the server says this validator already evaluated (HTTP 409 on download)
+        self.already_evaluated: set = set()
+        self._sync_etag: Optional[str] = None
+        self._sync_fetched_at = 0.0
+        self._sync_checked_at = 0.0
+        self._sync_ttl = 10
+        self._pending_testcases_version: Dict[str, Optional[str]] = {}
         
+        self.eda_max_concurrency = max(1, int(os.getenv("EDA_MAX_CONCURRENCY", "4")))
+        # Seconds kept free before the server's evaluation deadline for submitting scores
+        self.eda_deadline_buffer = int(os.getenv("EDA_DEADLINE_BUFFER_SECONDS", "90"))
+
         # Directories
-        self.base_dir = Path('./validator_data')
+        self.base_dir = data_path('validator_data')
         self.submissions_dir = self.base_dir / 'submissions'
         self.submissions_dir.mkdir(parents=True, exist_ok=True)
 
-    async def check_server_connectivity(self) -> bool:
-        """Check if challenge server is reachable"""
-        try:
-            url = f"{self.api_url}/api/v1/health"
-            async with self.session.get(url, timeout=5) as response:
-                return response.status in [200, 404]  # 404 is ok, means server is up
-        except Exception:
-            return False
-    
+    # ------------------------------------------------------------------
+    # Signed requests to the challenge server
+    # ------------------------------------------------------------------
+
     def create_signature(self, message: str) -> str:
-        """Create signature using Bittensor's native signing method"""
-        try:
-            # Use Bittensor wallet's native signing (same as submission signatures)
-            signature_bytes = self.wallet.hotkey.sign(data=message)
-            signature_hex = signature_bytes.hex()
-            
-            logger.debug(f"Validator signature created:")
-            logger.debug(f"  Message: {message}")
-            logger.debug(f"  Signature: {signature_hex}")
-            
-            return signature_hex
-            
-        except Exception as e:
-            logger.error(f"Error creating validator signature: {e}")
-            raise
-    
+        """Sign with the validator hotkey (Bittensor native, sr25519), hex encoded."""
+        return self.wallet.hotkey.sign(data=message).hex()
+
+    def _auth(self, method: str, url: str, form: Optional[Dict] = None) -> tuple:
+        """Query params + headers authenticating one request.
+
+        SIGNATURE_MODE=both (default) sends the legacy v1 signature (query params, over
+        f"{hotkey}{iso_ts}") AND the v2 headers. Servers that know v2 use it (it binds the
+        signature to method, path, body and a single-use nonce); older servers ignore the
+        headers and verify v1. Set SIGNATURE_MODE=v2 once every server you talk to has v2.
+        """
+        params = {'validator_hotkey': self.validator_hotkey}
+        headers = {'X-Validator-Secret': self.validator_secret}
+        if self.signature_mode in ('both', 'v1'):
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            params['signature'] = self.create_signature(f"{self.validator_hotkey}{ts}")
+            params['timestamp'] = ts
+        if self.signature_mode in ('both', 'v2'):
+            ts = str(int(time.time()))
+            nonce = secrets.token_hex(16)
+            canonical = "&".join(f"{k}={v}" for k, v in sorted((form or {}).items()))
+            digest = hashlib.sha256(canonical.encode()).hexdigest()
+            path = urlparse(url).path
+            message = f"chipforge-sn108:v2:{method.upper()}:{path}:{self.validator_hotkey}:{ts}:{nonce}:{digest}"
+            headers.update({
+                'X-Signature-Version': '2',
+                'X-Timestamp': ts,
+                'X-Nonce': nonce,
+                'X-Signature': self.create_signature(message),
+            })
+        return params, headers
+
+    async def _signed(self, method: str, url: str, *, form: Optional[Dict] = None, timeout: float = 30,
+                      attempts: int = 1, read: str = "text", extra_headers: Optional[Dict] = None):
+        """Signed request with retries on network errors and 5xx (fresh signature and nonce
+        per attempt). Returns (status, body, headers); status None = unreachable."""
+        for attempt in range(attempts):
+            params, headers = self._auth(method, url, form)
+            if extra_headers:
+                headers.update(extra_headers)
+            try:
+                async with self.session.request(method, url, params=params, headers=headers, data=form,
+                                                timeout=aiohttp.ClientTimeout(total=timeout)) as response:
+                    body = await (response.read() if read == "bytes" else response.text())
+                    if response.status >= 500 and attempt < attempts - 1:
+                        logger.warning(f"{method} {urlparse(url).path}: HTTP {response.status}, retrying")
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+                    return response.status, body, response.headers
+            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                logger.warning(f"{method} {urlparse(url).path} failed (attempt {attempt + 1}/{attempts}): {e!r}")
+                if attempt < attempts - 1:
+                    await asyncio.sleep(2 ** attempt)
+        return None, None, None
+
+    # ------------------------------------------------------------------
+    # /validator/sync (one cached call instead of separate polls)
+    # ------------------------------------------------------------------
+
+    async def _sync(self, fresh: bool = False) -> Optional[Dict]:
+        """Cached /validator/sync state, or None when the server doesn't offer it (older
+        servers answer 404; re-checked hourly) or it failed - callers then use the
+        individual endpoints."""
+        now = time.monotonic()
+        if self._sync_supported is False:
+            if now - self._sync_checked_at < 3600:
+                return None
+            self._sync_supported = None
+        if not fresh and self._sync_state is not None and now - self._sync_fetched_at < self._sync_ttl:
+            return self._sync_state
+
+        extra = {'If-None-Match': self._sync_etag} if (self._sync_etag and self._sync_state) else None
+        status, body, headers = await self._signed("GET", f"{self.api_url}/api/v1/validator/sync",
+                                                   timeout=15, extra_headers=extra)
+        self._sync_checked_at = now
+        if status == 404:
+            if self._sync_supported is not False:
+                logger.info("Challenge server has no /validator/sync - using individual endpoints")
+            self._sync_supported = False
+            return None
+        if status == 304 and self._sync_state is not None:
+            self._sync_fetched_at = now
+            return self._sync_state
+        if status == 200:
+            try:
+                state = json.loads(body)
+            except ValueError:
+                return None
+            self._sync_supported = True
+            self._sync_state, self._sync_fetched_at = state, now
+            self._sync_etag = headers.get('ETag')
+            self._sync_ttl = max(5, min(60, int(state.get('next_poll_seconds') or 10)))
+            return state
+        if status is not None:
+            logger.error(f"/validator/sync: HTTP {status} {str(body)[:200]}")
+        return None
+
+    def _testcases_version_file(self, challenge_id: str) -> Path:
+        return self.base_dir / 'testcases' / f"{challenge_id}.version"
+
+    def _needs_testcases(self, challenge_id: str, version: Optional[str], flag: bool) -> bool:
+        """Download test cases only when their version changed (sync) or, on older servers,
+        at most every 10 minutes while the server's download flag is set."""
+        zip_path = self.get_testcase_files(challenge_id)
+        if not zip_path.exists():
+            return True
+        if version:
+            vf = self._testcases_version_file(challenge_id)
+            return not vf.exists() or vf.read_text().strip() != version
+        return bool(flag) and (time.time() - zip_path.stat().st_mtime) > 600
+
+    # ------------------------------------------------------------------
+    # Challenge state
+    # ------------------------------------------------------------------
+
+    def server_miner_emission_percentage(self, challenge: Optional[Dict] = None):
+        """(controlled, value): the challenge server's miner emission percentage from the last
+        /validator/sync (or, on servers without sync, the active challenge). controlled=False
+        when the server doesn't send one; value None means "not set on the server"."""
+        if self._sync_state is not None and 'miner_emission_percentage' in self._sync_state:
+            return True, self._sync_state['miner_emission_percentage']
+        if isinstance(challenge, dict) and 'miner_emission_percentage' in challenge:
+            return True, challenge['miner_emission_percentage']
+        return False, None
+
     async def get_active_challenge(self) -> Optional[Dict]:
         """
         Get active challenge from server with connection error handling
-        
+
         Returns:
             Dict: Challenge data if active challenge exists (includes winner_reward_hours)
             {"status": "no_active_challenge"}: Server accessible but no challenge (intentional)
-            None: Only on connection errors (will raise ConnectionError instead)
+        Raises ConnectionError when the server is unreachable.
         """
+        state = await self._sync()
+        if state is not None:
+            return state['challenge'] or {"status": "no_active_challenge"}
+
         try:
             url = f"{self.api_url}/api/v1/challenges/active"
-            async with self.session.get(url, timeout=10) as response:
-                if response.status == 200:
-                    challenge = await response.json()
-                    
-                    # Handle new response format - server intentionally says no challenge
-                    if isinstance(challenge, dict) and challenge.get('status') == 'no_active_challenge':
-                        logger.info("Server accessible: No active challenge (server response)")
-                        return {"status": "no_active_challenge"}
-                    
-                    # Old format - null response
-                    if challenge is None:
-                        logger.info("Server accessible: No active challenge (null response)")
-                        return {"status": "None"}
-                    
-                    # Validate challenge structure
-                    if not isinstance(challenge, dict) or 'challenge_id' not in challenge:
-                        logger.warning(f"Invalid challenge response format: {challenge}")
-                        return {"status": "None"}
-                    
-                    # Extract winner_reward_hours if present
-                    if 'winner_reward_hours' in challenge:
-                        logger.info(f"Active challenge: {challenge['challenge_id']} (winner_reward_hours: {challenge['winner_reward_hours']}h)")
-                    else:
-                        logger.warning(f"Active challenge {challenge['challenge_id']} missing winner_reward_hours - will use local fallback")
-                    
-                    return challenge
-                else:
+            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status != 200:
                     logger.debug(f"No active challenge found: HTTP {response.status}")
                     return {"status": "None"}
-                    
+                challenge = await response.json()
+                if isinstance(challenge, dict) and challenge.get('status') == 'no_active_challenge':
+                    return {"status": "no_active_challenge"}
+                if not isinstance(challenge, dict) or 'challenge_id' not in challenge:
+                    logger.warning(f"Invalid challenge response format: {challenge}")
+                    return {"status": "None"}
+                if 'winner_reward_hours' not in challenge:
+                    logger.warning(f"Active challenge {challenge['challenge_id']} missing winner_reward_hours - will use local fallback")
+                return challenge
         except asyncio.TimeoutError:
-            logger.error("Timeout connecting to challenge server")
             raise ConnectionError("Challenge server timeout")
         except aiohttp.ClientError as e:
-            logger.error(f"Connection error: {e}")
             raise ConnectionError(f"Challenge server unreachable: {e}")
-        except Exception as e:
-            logger.error(f"Unexpected error getting challenge: {e}")
-            raise
 
-    async def get_challenge_info(self, challenge_id: str) -> Optional[Dict]:
-        """Get challenge information including remaining time and winner baseline score"""
+    async def get_challenge_info(self, challenge_id: str, fresh: bool = False) -> Optional[Dict]:
+        """Remaining time, baseline, ban_emissions, batch windows and whether new test cases
+        must be downloaded. fresh=True bypasses the sync cache (e.g. right before evaluating)."""
+        state = await self._sync(fresh=fresh)
+        challenge = state.get('challenge') if state else None
+        if challenge and challenge.get('challenge_id') == challenge_id:
+            result = {
+                'winner_baseline_score': challenge.get('winner_baseline_score'),
+                'ban_emissions': challenge.get('ban_emissions', False),
+                'batch_download_window_seconds': state['batch_windows']['download_seconds'],
+                'batch_evaluation_window_seconds': state['batch_windows']['evaluation_seconds'],
+            }
+            expires = parse_server_time(challenge.get('expires_at'))
+            if expires:
+                result['remaining_time'] = max(0, (expires - datetime.now(timezone.utc)).total_seconds())
+            tc = state.get('testcases') or {}
+            if self._needs_testcases(challenge_id, tc.get('version'), tc.get('download_new_testcases')):
+                result['download_new_testcases'] = True
+            self._pending_testcases_version[challenge_id] = tc.get('version')
+            return result
+
         try:
             url = f"{self.api_url}/api/v1/challenges/{challenge_id}/info"
-            async with self.session.get(url) as response:
-                if response.status == 200:
-                    challenge = await response.json()
-                    if challenge:
-                        result = {}
-
-                        # Extract remaining time
-                        if 'expires_at' in challenge:
-                            expires_at = datetime.fromisoformat(challenge['expires_at'].replace('Z', '+00:00'))
-                            remaining = (expires_at - datetime.now(timezone.utc)).total_seconds()
-                            result['remaining_time'] = max(0, remaining)
-
-                        # Extract winner baseline score
-                        if 'winner_baseline_score' in challenge:
-                            result['winner_baseline_score'] = challenge['winner_baseline_score']
-                            logger.info(f"Challenge {challenge_id} winner baseline score: {challenge['winner_baseline_score']}")
-
-                        # Extract ban_emissions flag
-                        if 'ban_emissions' in challenge:
-                            result['ban_emissions'] = challenge['ban_emissions']
-                            if challenge['ban_emissions']:
-                                logger.warning(f"Challenge {challenge_id} has EMISSIONS BANNED")
-
-                        # Extract download_new_testcases flag
-                        if challenge.get('download_new_testcases'):
-                            result['download_new_testcases'] = True
-
-                        # Extract batch window configuration
-                        if 'batch_download_window_seconds' in challenge:
-                            result['batch_download_window_seconds'] = challenge['batch_download_window_seconds']
-                        if 'batch_evaluation_window_seconds' in challenge:
-                            result['batch_evaluation_window_seconds'] = challenge['batch_evaluation_window_seconds']
-
-                        return result
-                return None
+            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                if response.status != 200:
+                    return None
+                challenge = await response.json()
         except Exception as e:
             logger.error(f"Error getting challenge info: {e}")
             return None
-
-    async def get_challenge_remaining_time(self, challenge_id: str) -> Optional[float]:
-        """Get remaining time for challenge in seconds (legacy method)"""
-        info = await self.get_challenge_info(challenge_id)
-        return info.get('remaining_time') if info else None
-    
-    async def get_current_batch(self, challenge_id: str) -> Optional[Dict]:
-        """Get current evaluation batch with dynamic scheduling"""
-        try:
-            url = f"{self.api_url}/api/v1/challenges/{challenge_id}/batch/current"
-            headers = {'X-Validator-Secret': self.validator_secret}
-            
-            # Create signature
-            timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            message = f"{self.validator_hotkey}{timestamp}"
-            signature = self.create_signature(message)
-            
-            params = {
-                'validator_hotkey': self.validator_hotkey,
-                'signature': signature,
-                'timestamp': timestamp
-            }
-            
-            async with self.session.get(url, headers=headers, params=params) as response:
-                if response.status == 200:
-                    batch = await response.json()
-                    if batch.get('batch_id'):
-                        logger.info(f"Found current batch: {batch['batch_id']} with {batch.get('available_submissions', 0)} submissions")
-                        return batch
-                    else:
-                        logger.info(f"{batch}")
-                else:
-                    logger.debug(f"No current batch: {response.status}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"Error getting current batch: {e}")
+        if not challenge:
             return None
-    
+        result = {}
+        expires = parse_server_time(challenge.get('expires_at'))
+        if expires:
+            result['remaining_time'] = max(0, (expires - datetime.now(timezone.utc)).total_seconds())
+        for key in ('winner_baseline_score', 'ban_emissions', 'batch_download_window_seconds',
+                    'batch_evaluation_window_seconds'):
+            if key in challenge:
+                result[key] = challenge[key]
+        if self._needs_testcases(challenge_id, None, challenge.get('download_new_testcases')):
+            result['download_new_testcases'] = True
+        return result
+
+    async def get_current_batch(self, challenge_id: str) -> Optional[Dict]:
+        """The batch currently exposed for evaluation (as this validator sees it), or None."""
+        state = await self._sync()
+        if state is not None and (state.get('challenge') or {}).get('challenge_id') == challenge_id:
+            batch = state.get('batch')
+            return batch if batch and batch.get('batch_id') else None
+
+        status, body, _ = await self._signed(
+            "GET", f"{self.api_url}/api/v1/challenges/{challenge_id}/batch/current", timeout=15)
+        if status != 200:
+            if status is not None:
+                logger.debug(f"No current batch: HTTP {status}")
+            return None
+        batch = json.loads(body)
+        if batch.get('batch_id'):
+            logger.info(f"Found current batch: {batch['batch_id']} with {batch.get('available_submissions', 0)} submissions")
+            return batch
+        return None
+
+    async def get_banned_coldkeys(self, challenge_id: str) -> Optional[Dict]:
+        """Permanent + this challenge's bans ({"count", "bans": [...]}), or None on failure
+        (the caller keeps its cached list)."""
+        state = await self._sync()
+        if state is not None and state.get('bans') is not None and \
+                (state.get('challenge') or {}).get('challenge_id') == challenge_id:
+            return {"challenge_id": challenge_id, **state['bans']}
+
+        status, body, _ = await self._signed(
+            "GET", f"{self.api_url}/api/v1/challenges/{challenge_id}/banned_coldkeys", timeout=15)
+        if status != 200:
+            logger.error(f"Failed to fetch banned coldkeys: HTTP {status} {str(body)[:200]}")
+            return None
+        data = json.loads(body)
+        logger.info(f"Fetched {data.get('count', len(data.get('bans', [])))} banned coldkeys for {challenge_id}")
+        return data
+
+    # ------------------------------------------------------------------
+    # Submissions, scores, test cases
+    # ------------------------------------------------------------------
+
+    async def download_submission(self, challenge_id: str, submission_id: str) -> Optional[Dict]:
+        """Download one submission: {'content', 'filename', 'submission_id'} or None."""
+        url = f"{self.api_url}/api/v1/challenges/{challenge_id}/submissions/{submission_id}/download"
+        status, content, headers = await self._signed("GET", url, timeout=60, attempts=3, read="bytes")
+        if status == 409:
+            # A re-batched submission this validator already scored: nothing to do, not an error
+            self.already_evaluated.add(submission_id)
+            logger.info(f"Skipping {submission_id}: already evaluated by this validator")
+            return None
+        if status != 200:
+            hint = {401: "authentication failed", 403: "not in the exposed batch / not permitted",
+                    404: "submission not found or already fully evaluated"}.get(status, "")
+            logger.error(f"Download of {submission_id} failed: HTTP {status} {hint}")
+            return None
+        filename = None
+        disposition = headers.get('Content-Disposition', '')
+        if 'filename=' in disposition:
+            filename = disposition.split('filename=', 1)[1].split(';')[0].strip().strip('"')
+        if not content.startswith(b'PK'):
+            logger.warning(f"Downloaded {submission_id} does not look like a ZIP file")
+        logger.info(f"Downloaded {submission_id}: {len(content)} bytes")
+        return {'content': content, 'filename': filename or f"{submission_id}.zip", 'submission_id': submission_id}
+
+    async def submit_evaluation(self, challenge_id: str, submission_id: str, evaluation: Dict) -> bool:
+        """Submit one evaluation (form data). Retries network errors and 5xx."""
+        _EVAL_DETAILS_LIMIT = 16384
+        details = evaluation.get('evaluation_details') or ''
+        if len(details) > _EVAL_DETAILS_LIMIT:
+            details = details[:_EVAL_DETAILS_LIMIT] + '...[truncated]'
+        form_data = {
+            'overall_score': str(evaluation['overall_score']),
+            'functionality_score': str(evaluation['functionality_score']),
+            'area_score': str(evaluation['area_score']),
+            'delay_score': str(evaluation['delay_score']),
+            'power_score': str(evaluation['power_score']),
+            'passed_testbench': str(evaluation['passed_testbench']).lower(),
+            'functional_gate': str(evaluation.get('functional_gate', False)).lower(),
+            'overall_gate': str(evaluation.get('overall_gate', False)).lower(),
+            'timeout_occurred': str(evaluation.get('timeout_occurred', False)).lower(),
+            'evaluation_notes': evaluation.get('evaluation_notes', ''),
+            'evaluation_details': details,
+        }
+        logger.debug(f"Submitting evaluation for {submission_id}: score={form_data['overall_score']}, "
+                     f"gates={form_data['functional_gate']}/{form_data['overall_gate']}")
+        url = f"{self.api_url}/api/v1/challenges/{challenge_id}/submissions/{submission_id}/submit_score"
+        status, body, _ = await self._signed("POST", url, form=form_data, timeout=60, attempts=3)
+        if status == 200:
+            logger.info(f"Submitted evaluation for {submission_id}: score {evaluation['overall_score']}")
+            return True
+        logger.error(f"Failed to submit evaluation for {submission_id}: HTTP {status} {str(body)[:300]}")
+        return False
+
+    async def download_test_cases(self, challenge_id: str) -> bool:
+        """Download the challenge's test cases (atomically replacing the local copy)."""
+        logger.info(f"Downloading test cases for challenge {challenge_id}")
+        url = f"{self.api_url}/api/v1/challenges/{challenge_id}/test_cases/download"
+        status, content, _ = await self._signed("GET", url, timeout=240, attempts=2, read="bytes")
+        if status != 200:
+            logger.error(f"Failed to download test cases: HTTP {status}")
+            return False
+        zip_path = self.get_testcase_files(challenge_id)
+        zip_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = zip_path.with_suffix('.zip.part')
+        async with aiofiles.open(tmp, 'wb') as f:
+            await f.write(content)
+        os.replace(tmp, zip_path)
+        version = self._pending_testcases_version.get(challenge_id)
+        if version:
+            self._testcases_version_file(challenge_id).write_text(version)
+        logger.info(f"Downloaded test cases for {challenge_id}: {len(content)} bytes")
+        return True
+
     async def download_batch_submissions(self, challenge_id: str, batch: Dict) -> Dict[str, bytes]:
         """Download all submissions in batch in parallel with proper filename handling"""
         submissions = batch.get('submissions', [])
@@ -214,6 +410,9 @@ class APIClient:
         
         logger.info(f"Downloading {len(submissions)} submissions in parallel")
         
+        # Hash the miner signed, when the server provides it (challenge server >= 2026-09)
+        expected_hash = {s['submission_id']: s.get('file_hash') for s in submissions}
+
         # Create download tasks
         tasks = []
         for submission in submissions:
@@ -231,7 +430,12 @@ class APIClient:
             elif result is not None and isinstance(result, dict):
                 # Handle new return format with content, filename, and submission_id
                 content = result['content']
-                filename = result['filename']
+                filename = safe_filename(result.get('filename'), f"{submission_id}.zip")
+
+                expected = expected_hash.get(submission_id)
+                if expected and hashlib.sha256(content).hexdigest() != expected:
+                    logger.error(f"Download of {submission_id} does not match the hash the miner signed - discarded")
+                    continue
                 downloaded[submission_id] = content
                 
                 logger.info(f"Successfully downloaded {submission_id}: {len(content)} bytes")
@@ -250,374 +454,118 @@ class APIClient:
         logger.info(f"Successfully downloaded {len(downloaded)} submissions")
         return downloaded
     
-    async def download_submission(self, challenge_id: str, submission_id: str) -> Optional[Dict]:
-        """Download a single submission with enhanced debugging and filename extraction"""
-        max_retries = 3
-        
-        logger.info(f"Starting download for submission {submission_id} in challenge {challenge_id}")
-        
-        for attempt in range(max_retries):
-            try:
-                url = f"{self.api_url}/api/v1/challenges/{challenge_id}/submissions/{submission_id}/download"
-                
-                # Create fresh signature for each attempt
-                timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                message = f"{self.validator_hotkey}{timestamp}"
-                
-                # Use the updated create_signature method (Bittensor native signing)
-                signature = self.create_signature(message)
-                
-                headers = {
-                    'X-Validator-Secret': self.validator_secret
-                }
-                
-                params = {
-                    'validator_hotkey': self.validator_hotkey,
-                    'signature': signature,
-                    'timestamp': timestamp
-                }
-                
-                # Debug logging
-                logger.info(f"Download attempt {attempt + 1} for {submission_id}")
-                logger.info(f"  URL: {url}")
-                logger.info(f"  Validator hotkey: {self.validator_hotkey}")
-                logger.info(f"  Timestamp: {timestamp}")
-                logger.info(f"  Message for signing: {message}")
-                logger.info(f"  Generated signature: {signature}")
-                logger.info(f"  Validator secret present: {'Yes' if self.validator_secret else 'No'}")
-                
-                async with self.session.get(url, headers=headers, params=params, timeout=30) as response:
-                    logger.info(f"Response status for {submission_id}: {response.status}")
-                    
-                    if response.status == 200:
-                        content = await response.read()
-                        content_length = len(content)
-                        logger.info(f"Successfully downloaded submission {submission_id}: {content_length} bytes")
-                        
-                        # Verify it's actually a ZIP file
-                        if content.startswith(b'PK'):
-                            logger.info(f"Downloaded content appears to be a valid ZIP file")
-                        else:
-                            logger.warning(f"Downloaded content may not be a valid ZIP file")
-                        
-                        # Extract filename from Content-Disposition header
-                        content_disposition = response.headers.get('Content-Disposition', '')
-                        if 'filename=' in content_disposition:
-                            # Extract filename from header (handles both quoted and unquoted)
-                            filename_part = content_disposition.split('filename=')[1]
-                            if filename_part.startswith('"') and filename_part.endswith('"'):
-                                filename = filename_part[1:-1]  # Remove quotes
-                            else:
-                                filename = filename_part.split(';')[0].strip()  # Handle multiple params
-                            logger.info(f"Using server-provided filename: {filename}")
-                        else:
-                            filename = f"{submission_id}.zip"
-                            logger.info(f"No Content-Disposition header, using fallback: {filename}")
-                        
-                        return {
-                            'content': content,
-                            'filename': filename,
-                            'submission_id': submission_id
-                        }
-                        
-                    else:
-                        # Read the error response body for detailed error info
-                        try:
-                            error_text = await response.text()
-                            logger.error(f"Failed to download submission {submission_id}")
-                            logger.error(f"  Status: {response.status}")
-                            logger.error(f"  Error response: {error_text}")
-                            
-                            # Log response headers for additional debugging
-                            response_headers = dict(response.headers)
-                            if response_headers:
-                                logger.error(f"  Response headers: {response_headers}")
-                                
-                        except Exception as read_error:
-                            logger.error(f"Failed to read error response body: {read_error}")
-                        
-                        # Handle specific error codes
-                        if response.status == 401:
-                            logger.error("Authentication failed - check signature generation and server verification")
-                        elif response.status == 403:
-                            logger.error("Forbidden - check validator secret or batch permissions")
-                        elif response.status == 404:
-                            logger.error("Not found - submission may not exist or not in current batch")
-                        elif response.status == 409:
-                            logger.error("Conflict - you may have already evaluated this submission")
-                        
-                        if attempt < max_retries - 1:
-                            wait_time = 2 ** attempt
-                            logger.info(f"Retrying in {wait_time} seconds...")
-                            await asyncio.sleep(wait_time)
-                            continue
-                        else:
-                            logger.error(f"Max retries exceeded for {submission_id}")
-                            return None
-                            
-            except asyncio.TimeoutError:
-                logger.error(f"Timeout downloading submission {submission_id} (attempt {attempt + 1})")
-                if attempt < max_retries - 1:
-                    wait_time = 2 ** attempt
-                    logger.info(f"Retrying after timeout in {wait_time} seconds...")
-                    await asyncio.sleep(wait_time)
-                else:
-                    logger.error(f"Max retries exceeded due to timeouts for {submission_id}")
-                    return None
-                    
-            except Exception as e:
-                logger.error(f"Exception downloading submission {submission_id} (attempt {attempt + 1}): {e}")
-                logger.error(f"Exception type: {type(e).__name__}")
-                
-                # Log full traceback for debugging
-                import traceback
-                logger.error(f"Traceback:\n{traceback.format_exc()}")
-                
-                if attempt < max_retries - 1:
-                    wait_time = 2 ** attempt
-                    logger.info(f"Retrying after exception in {wait_time} seconds...")
-                    await asyncio.sleep(wait_time)
-                else:
-                    logger.error(f"Max retries exceeded after exceptions for {submission_id}")
-                    return None
-        
-        logger.error(f"Complete failure: could not download {submission_id} after all attempts")
-        return None
-    
-    async def get_submission_details(self, challenge_id: str, submission_ids: List[str]) -> Dict[str, str]:
-        """Get miner hotkeys for submission IDs with enhanced debugging"""
-        submission_hotkeys = {}
-        
-        logger.info(f"Getting submission details for {len(submission_ids)} submissions")
-        logger.info(f"Submission IDs: {submission_ids}")
-        
-        try:
-            url = f"{self.api_url}/api/v1/challenges/{challenge_id}/submissions"
-            headers = {'X-Validator-Secret': self.validator_secret}
-            
-            timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            message = f"{self.validator_hotkey}{timestamp}"
-            signature = self.create_signature(message)
-            
-            params = {
-                'validator_hotkey': self.validator_hotkey,
-                'signature': signature,
-                'timestamp': timestamp
-            }
-            
-            logger.info(f"Making API request to: {url}")
-            logger.debug(f"Request params: {params}")
-            
-            async with self.session.get(url, headers=headers, params=params) as response:
-                logger.info(f"API response status: {response.status}")
-                
-                if response.status == 200:
-                    data = await response.json()
-                    logger.info(f"API response data keys: {list(data.keys())}")
-                    
-                    submissions = data.get('submissions', [])
-                    logger.info(f"Found {len(submissions)} total submissions in API response")
-                    
-                    # Debug: Show structure of first submission
-                    if submissions:
-                        first_sub = submissions[0]
-                        logger.info(f"First submission structure: {list(first_sub.keys())}")
-                        logger.info(f"First submission sample: {first_sub}")
-                    
-                    for submission in submissions:
-                        sub_id = submission.get('submission_id')
-                        # Try both possible field names
-                        miner_hotkey = submission.get('miner_hotkey') or submission.get('hotkey')
-                        
-                        logger.debug(f"Processing submission: id={sub_id}, hotkey={miner_hotkey}")
-                        
-                        if sub_id in submission_ids:
-                            if miner_hotkey:
-                                submission_hotkeys[sub_id] = miner_hotkey
-                                logger.info(f"✅ Mapped {sub_id} -> {miner_hotkey[:12]}...")
-                            else:
-                                logger.warning(f"❌ No hotkey found for submission {sub_id}")
-                                logger.warning(f"Available fields: {list(submission.keys())}")
-                        else:
-                            logger.debug(f"Skipping submission {sub_id} (not in requested list)")
-                    
-                    logger.info(f"Successfully mapped {len(submission_hotkeys)} of {len(submission_ids)} submissions to hotkeys")
-                    
-                    # Show what we couldn't map
-                    unmapped = set(submission_ids) - set(submission_hotkeys.keys())
-                    if unmapped:
-                        logger.warning(f"Could not map these submissions: {unmapped}")
-                    
-                else:
-                    error_text = await response.text()
-                    logger.error(f"API request failed with status {response.status}")
-                    logger.error(f"Error response: {error_text}")
-                    
-                    if response.status == 401:
-                        logger.error("Authentication failed - check signature generation")
-                    elif response.status == 403:
-                        logger.error("Forbidden - check validator secret")
-                    elif response.status == 404:
-                        logger.error("Challenge or submissions not found")
-                        
-        except Exception as e:
-            logger.error(f"Exception getting submission details: {e}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
-        
-        if not submission_hotkeys:
-            logger.error("FAILED: No submissions mapped to hotkeys")
-        
-        return submission_hotkeys
-    
-    async def evaluate_submissions_with_eda_server(self, challenge_id: str, submissions: Dict[str, bytes]) -> Dict[str, Dict]:
-        """Send submissions to EDA server for evaluation with test cases - PARALLEL VERSION"""
-        logger.info(f"Evaluating {len(submissions)} submissions with EDA server using test cases")
-        
-        # Fallback to dummy evaluation if configured
+    async def eda_server_ready(self) -> bool:
+        """Pre-flight: is the EDA server reachable? Any HTTP answer counts (older gateways
+        have no /health and answer 404); only a connection failure means unreachable."""
         if self.use_dummy_evaluation:
-            return await self._dummy_evaluate_submissions(submissions)
-        
-        # Get test case files
-        evaluator_zip_path = self.get_testcase_files(challenge_id)
-            
-        if not evaluator_zip_path.exists():
-            logger.error(f"Evaluator zip file not found: {evaluator_zip_path}")
-            return await self._dummy_evaluate_submissions(submissions)
-        
-        logger.info(f"Using test case files:")
-        logger.info(f" Validator's testcases Zip: {evaluator_zip_path}")
-        
-        # Create semaphore to limit concurrent requests to EDA server
-        semaphore = asyncio.Semaphore(8)  # Limit to 8 concurrent requests
+            return True
+        try:
+            async with self.session.get(f"{self.eda_server_url}/health",
+                                        timeout=aiohttp.ClientTimeout(total=10)) as response:
+                return response.status < 500 or response.status == 404
+        except Exception as e:
+            logger.error(f"EDA server {self.eda_server_url} unreachable: {e}")
+            return False
 
-        # EDA timeout = batch_processing_timeout - 120s.
-        # batch_processing_timeout = (download + evaluation windows from server) - 45s.
-        # Fall back to hardcoded 2640s if the server has not provided windows yet.
-        _BATCH_SAFETY_BUFFER = 45
-        _EDA_SAFETY_BUFFER = 120
-        _EDA_TIMEOUT_FALLBACK = 2640
+    def _eda_time_budget(self, deadline: Optional[datetime]) -> float:
+        """Seconds an EDA request may take: until the server's evaluation deadline minus a
+        buffer for submitting scores; falls back to the configured batch windows."""
+        if deadline is not None:
+            return (deadline - datetime.now(timezone.utc)).total_seconds() - self.eda_deadline_buffer
         dl_window = getattr(self.state, 'batch_download_window_seconds', 0) if self.state else 0
         eval_window = getattr(self.state, 'batch_evaluation_window_seconds', 0) if self.state else 0
         if dl_window > 0 and eval_window > 0:
-            batch_processing_timeout = (dl_window + eval_window) - _BATCH_SAFETY_BUFFER
-            eda_timeout_seconds = batch_processing_timeout - _EDA_SAFETY_BUFFER
-            logger.info(f"EDA timeout derived from server config: {eda_timeout_seconds}s (batch_timeout={batch_processing_timeout}s - eda_buffer={_EDA_SAFETY_BUFFER}s)")
-        else:
-            eda_timeout_seconds = _EDA_TIMEOUT_FALLBACK
-            logger.info(f"EDA timeout using hardcoded fallback: {eda_timeout_seconds}s")
+            return dl_window + eval_window - 45 - self.eda_deadline_buffer
+        return 2640
 
-        async def evaluate_single_submission(submission_id: str, submission_data: bytes) -> tuple[str, Dict]:
-            """Evaluate a single submission with semaphore control"""
-            async with semaphore:  # This limits concurrent requests
+    async def evaluate_submissions_with_eda_server(self, challenge_id: str, submissions: Dict[str, bytes],
+                                                   deadline: Optional[datetime] = None) -> Dict[str, Dict]:
+        """Evaluate submissions on the EDA server, at most EDA_MAX_CONCURRENCY at a time, each
+        within the time left before the server's evaluation deadline."""
+        logger.info(f"Evaluating {len(submissions)} submissions with EDA server using test cases")
+
+        if self.use_dummy_evaluation:
+            return await self._dummy_evaluate_submissions(submissions)
+
+        evaluator_zip_path = self.get_testcase_files(challenge_id)
+        if not evaluator_zip_path.exists():
+            # Never score miners without test cases: evaluate nothing, the batch is skipped
+            logger.error(f"Evaluator zip file not found: {evaluator_zip_path} - not evaluating")
+            return {}
+        evaluator_bytes = evaluator_zip_path.read_bytes()
+        semaphore = asyncio.Semaphore(self.eda_max_concurrency)
+
+        async def evaluate_single_submission(submission_id: str, submission_data: bytes) -> tuple:
+            async with semaphore:
+                budget = self._eda_time_budget(deadline)
+                if budget < 30:
+                    return submission_id, self._generate_fallback_evaluation(
+                        submission_id,
+                        evaluation_details={'status': 'timeout', 'error': 'No time left before the evaluation window closes'},
+                        timeout_occurred=True,
+                    )
+                form_data = aiohttp.FormData()
+                form_data.add_field('design_zip', submission_data, filename=f'{submission_id}.zip',
+                                    content_type='application/zip')
+                form_data.add_field('evaluator_zip', evaluator_bytes, filename=f'{challenge_id}_validator.zip',
+                                    content_type='application/zip')
+                form_data.add_field('submission_id', submission_id)
+                logger.info(f"Sending {submission_id} to EDA server ({len(submission_data)} bytes, "
+                            f"time budget {budget:.0f}s)")
                 try:
-                    logger.info(f"Evaluating submission {submission_id} with EDA server and test cases")
-
-                    # Create temporary files for submission
-                    with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as design_temp:
-                        design_temp.write(submission_data)
-                        design_temp.flush()
-
-                        # Create timeout for each individual submission
-                        timeout = aiohttp.ClientTimeout(total=eda_timeout_seconds)
-                        
-                        async with aiohttp.ClientSession(timeout=timeout) as session:
-                            # Prepare multipart form data
-                            form_data = aiohttp.FormData()
-                            
-                            # Add design zip
-                            with open(design_temp.name, 'rb') as design_file:
-                                form_data.add_field('design_zip', design_file.read(), 
-                                                filename=f'{submission_id}.zip',
-                                                content_type='application/zip')
-                            
-                            # Add evaluator zip file
-                            with open(evaluator_zip_path, 'rb') as evaluator_zip_file:
-                                form_data.add_field('evaluator_zip', evaluator_zip_file.read(),
-                                                filename=f'{challenge_id}_validator.zip',
-                                                content_type='application/zip')
-
-                            # Add submission_id as form field
-                            form_data.add_field('submission_id', submission_id)
-                            
-                            logger.info(f"Sending evaluation request for {submission_id}:")
-                            logger.info(f"  Design zip size: {len(submission_data)} bytes")
-                            logger.info(f"  Validator's testcases zip size: {evaluator_zip_path.stat().st_size} bytes")
-                            
-                            try:
-                                async with session.post(
-                                    f"{self.eda_server_url}/evaluate",
-                                    data=form_data,
-                                ) as response:
-                                    logger.info(f"EDA server response status for {submission_id}: {response.status}")
-                                    
-                                    if response.status == 200:
-                                        result = await response.json()
-                                        logger.info(f"Successfully evaluated {submission_id} with EDA server")
-                                        logger.info(f"EDA response: {result}")
-                                        
-                                        # Transform EDA server response to expected format
-                                        evaluation_result = self._transform_eda_response(result, submission_id)
-                                        
-                                    else:
-                                        error_text = await response.text()
-                                        logger.error(f"EDA server error for {submission_id}: {response.status} - {error_text}")
-                                        # Use fallback evaluation
-                                        evaluation_result = self._generate_fallback_evaluation(submission_id)
-                                        
-                            except asyncio.TimeoutError:
-                                logger.error(f"Timeout evaluating {submission_id} with EDA server")
-                                evaluation_result = self._generate_fallback_evaluation(
-                                    submission_id,
-                                    evaluation_details={'status': 'timeout', 'error': f'EDA server evaluation timed out after {eda_timeout_seconds} seconds'},
-                                    timeout_occurred=True,
-                                )
-                            except Exception as eval_error:
-                                logger.error(f"Exception during EDA evaluation for {submission_id}: {eval_error}")
-                                evaluation_result = self._generate_fallback_evaluation(submission_id)
-                        
-                        # Clean up temporary design file
-                        os.unlink(design_temp.name)
-                        
-                    return submission_id, evaluation_result
-                        
+                    async with self.session.post(f"{self.eda_server_url}/evaluate", data=form_data,
+                                                 timeout=aiohttp.ClientTimeout(total=budget)) as response:
+                        if response.status == 200:
+                            result = await response.json()
+                            logger.debug(f"EDA response for {submission_id}: {result}")
+                            return submission_id, self._transform_eda_response(result, submission_id)
+                        error_text = await response.text()
+                        logger.error(f"EDA server error for {submission_id}: {response.status} - {error_text[:500]}")
+                        return submission_id, self._generate_fallback_evaluation(
+                            submission_id, evaluation_details={'status': 'eda_http_error', 'http_status': response.status})
+                except asyncio.TimeoutError:
+                    logger.error(f"Timeout evaluating {submission_id} with EDA server after {budget:.0f}s")
+                    return submission_id, self._generate_fallback_evaluation(
+                        submission_id,
+                        evaluation_details={'status': 'timeout', 'error': f'EDA server evaluation timed out after {budget:.0f} seconds'},
+                        timeout_occurred=True,
+                    )
                 except Exception as e:
-                    logger.error(f"Error evaluating submission {submission_id}: {e}")
-                    import traceback
-                    logger.error(f"Traceback: {traceback.format_exc()}")
-                    
-                    # Use fallback evaluation
-                    return submission_id, self._generate_fallback_evaluation(submission_id)
-        
-        # Create tasks for all submissions to run in parallel
-        tasks = [
-            evaluate_single_submission(submission_id, submission_data)
-            for submission_id, submission_data in submissions.items()
-        ]
-        
-        logger.info(f"Starting parallel evaluation of {len(tasks)} submissions")
-        
-        # Wait for all evaluations to complete
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Process results and handle any exceptions
+                    logger.error(f"Exception during EDA evaluation for {submission_id}: {e}")
+                    return submission_id, self._generate_fallback_evaluation(
+                        submission_id, evaluation_details={'status': 'eda_unreachable', 'error': str(e)[:300]})
+
+        results = await asyncio.gather(
+            *[evaluate_single_submission(sid, data) for sid, data in submissions.items()],
+            return_exceptions=True,
+        )
         evaluations = {}
         for result in results:
             if isinstance(result, Exception):
-                logger.error(f"Task failed with exception: {result}")
-                # You might want to generate a fallback evaluation for failed tasks
+                logger.error(f"Evaluation task failed: {result}")
                 continue
-            
             submission_id, evaluation_result = result
             evaluations[submission_id] = evaluation_result
-        
+
         logger.info(f"EDA server evaluation completed for {len(evaluations)} submissions")
         return evaluations
 
     def _transform_eda_response(self, eda_result: Dict, submission_id: str) -> Dict:
-        """Transform EDA server response to expected format"""
-        # Extract the final score from the new response format
-        final_score = eda_result.get('final_score', {})
+        """Transform EDA server response to expected format.
+
+        result ERROR (fault "system": toolchain/bundle/infra, overall is null) is never the
+        miner's score: it becomes a retryable failed evaluation. REJECTED (fault "miner")
+        is a real 0 and carries the reason for the miner."""
+        final_score = eda_result.get('final_score') or {}
+        error = eda_result.get('error') or {}
+        if not isinstance(error, dict):
+            error = {'message': str(error)}
+        if eda_result.get('result') == 'ERROR' or final_score.get('overall') is None:
+            logger.error(f"EDA system error for {submission_id}: {error.get('code')} {error.get('message')}")
+            return self._generate_fallback_evaluation(submission_id, evaluation_details={
+                'status': 'eda_system_error', 'code': error.get('code'), 'stage': error.get('stage'),
+                'message': error.get('message'), 'retryable': error.get('retryable'),
+            })
 
         # Extract functionality score from verilator results
         verilator_results = eda_result.get('verilator_results', {})
@@ -659,6 +607,10 @@ class APIClient:
             except Exception:
                 details['verilator_build_log'] = raw_log
 
+        if error:
+            # Miner-fault rejection: tell the miner what failed and where
+            details['error'] = {k: error.get(k) for k in ('code', 'stage', 'message', 'detail') if error.get(k)}
+
         openlane_success = openlane_results.get('success', False)
         if openlane_success:
             inner = openlane_results.get('results', {})
@@ -682,7 +634,11 @@ class APIClient:
             'functional_gate': functional_gate,
             'overall_gate': overall_gate,
             'timeout_occurred': False,
-            'evaluation_notes': f"EDA evaluation for {submission_id} - Functionality: {functionality_score:.2f}, Overall: {final_score.get('overall', 0.0):.2f}, Gates: func={functional_gate}, overall={overall_gate}",
+            'evaluation_notes': (
+                f"EDA evaluation for {submission_id} - Functionality: {float(functionality_score or 0):.2f}, "
+                f"Overall: {float(final_score.get('overall') or 0):.2f}, Gates: func={functional_gate}, overall={overall_gate}"
+                + (f", Rejected: {error.get('code')} ({error.get('stage')})" if error.get('code') else "")
+            ),
             'evaluation_details': json.dumps(details),
         }
 
@@ -727,7 +683,6 @@ class APIClient:
         """Original dummy evaluation for testing"""
         evaluations = {}
         for submission_id in submissions.keys():
-            import random
             evaluations[submission_id] = {
                 'overall_score': 0.0,
                 'functionality_score': 0.0,
@@ -767,196 +722,6 @@ class APIClient:
         
         return results
     
-    async def submit_evaluation(self, challenge_id: str, submission_id: str, evaluation: Dict) -> bool:
-        """Submit evaluation for a single submission using form data - skip if evaluation failed"""
-        # Check if evaluation failed - if so, skip submission
-        if evaluation['overall_score'] == 'failed':
-            logger.warning(f"Skipping submission of failed evaluation for {submission_id}")
-            logger.info(f"Evaluation failed for {submission_id}, validator can retry this submission in next batch")
-            return False  # Return False but don't treat as error
-
-        max_retries = 3
-
-        for attempt in range(max_retries):
-            try:
-                url = f"{self.api_url}/api/v1/challenges/{challenge_id}/submissions/{submission_id}/submit_score"
-
-                # Create signature for authentication
-                timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                message = f"{self.validator_hotkey}{timestamp}"
-                signature = self.create_signature(message)
-
-                # Authentication parameters go in query params
-                params = {
-                    'validator_hotkey': self.validator_hotkey,
-                    'signature': signature,
-                    'timestamp': timestamp
-                }
-
-                # Headers (no Content-Type needed for form data)
-                headers = {
-                    'X-Validator-Secret': self.validator_secret
-                }
-
-                # Truncate evaluation_details to 16KB to keep form data size bounded
-                _EVAL_DETAILS_LIMIT = 16384
-                evaluation_details = evaluation.get('evaluation_details', '')
-                if len(evaluation_details) > _EVAL_DETAILS_LIMIT:
-                    evaluation_details = evaluation_details[:_EVAL_DETAILS_LIMIT] + '...[truncated]'
-
-                # Evaluation data as FORM DATA (not JSON)
-                form_data = {
-                    'overall_score': str(evaluation['overall_score']),
-                    'functionality_score': str(evaluation['functionality_score']),
-                    'area_score': str(evaluation['area_score']),
-                    'delay_score': str(evaluation['delay_score']),
-                    'power_score': str(evaluation['power_score']),
-                    'passed_testbench': str(evaluation['passed_testbench']).lower(),
-                    'functional_gate': str(evaluation.get('functional_gate', False)).lower(),
-                    'overall_gate': str(evaluation.get('overall_gate', False)).lower(),
-                    'timeout_occurred': str(evaluation.get('timeout_occurred', False)).lower(),
-                    'evaluation_notes': evaluation.get('evaluation_notes', ''),
-                    'evaluation_details': evaluation_details,
-                }
-
-                if attempt == 0:
-                    logger.info(f"Submitting evaluation for {submission_id} as form data:")
-                    logger.info(f"  Form data: {form_data}")
-                else:
-                    logger.info(f"Retry attempt {attempt + 1}/{max_retries} for {submission_id}")
-
-                # Send as form data (not JSON)
-                async with self.session.post(url, params=params, headers=headers, data=form_data) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        logger.info(f"Successfully submitted evaluation for {submission_id}: score {evaluation['overall_score']}")
-                        logger.info(f"Server response: {result}")
-                        return True
-                    else:
-                        error_text = await response.text()
-                        logger.error(f"Failed to submit evaluation for {submission_id}: {response.status} - {error_text}")
-
-                        # Retry on server errors (500-599) or specific client errors
-                        if response.status >= 500 and attempt < max_retries - 1:
-                            wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
-                            logger.warning(f"Server error {response.status}, retrying in {wait_time}s...")
-                            await asyncio.sleep(wait_time)
-                            continue
-                        else:
-                            return False
-
-            except asyncio.TimeoutError:
-                logger.error(f"Timeout submitting evaluation for {submission_id} (attempt {attempt + 1}/{max_retries})")
-                if attempt < max_retries - 1:
-                    wait_time = 2 ** attempt
-                    logger.info(f"Retrying after timeout in {wait_time}s...")
-                    await asyncio.sleep(wait_time)
-                else:
-                    return False
-
-            except Exception as e:
-                logger.error(f"Error submitting evaluation for {submission_id} (attempt {attempt + 1}/{max_retries}): {e}")
-                if attempt == 0:  # Only log traceback on first attempt to reduce noise
-                    import traceback
-                    logger.error(f"Traceback: {traceback.format_exc()}")
-
-                if attempt < max_retries - 1:
-                    wait_time = 2 ** attempt
-                    logger.info(f"Retrying after exception in {wait_time}s...")
-                    await asyncio.sleep(wait_time)
-                else:
-                    return False
-
-        logger.error(f"Failed to submit evaluation for {submission_id} after {max_retries} attempts")
-        return False
-
-    async def get_banned_coldkeys(self, challenge_id: str) -> Optional[Dict]:
-        """Fetch banned coldkeys (permanent + this challenge's scoped bans) from the server.
-
-        Returns the parsed JSON response on success, or None on failure. Caller
-        should fall back to cached state when this returns None.
-        """
-        try:
-            url = f"{self.api_url}/api/v1/challenges/{challenge_id}/banned_coldkeys"
-
-            timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            message = f"{self.validator_hotkey}{timestamp}"
-            signature = self.create_signature(message)
-
-            params = {
-                'validator_hotkey': self.validator_hotkey,
-                'signature': signature,
-                'timestamp': timestamp,
-            }
-            headers = {
-                'X-Validator-Secret': self.validator_secret,
-            }
-
-            async with self.session.get(url, headers=headers, params=params, timeout=15) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    count = data.get('count', len(data.get('bans', [])))
-                    logger.info(f"Fetched {count} banned coldkeys for {challenge_id}")
-                    return data
-                else:
-                    error_text = await response.text()
-                    logger.error(f"Failed to fetch banned coldkeys: {response.status} - {error_text}")
-                    return None
-        except Exception as e:
-            logger.error(f"Error fetching banned coldkeys for {challenge_id}: {e}")
-            return None
-
-    async def download_test_cases(self, challenge_id: str) -> bool:
-        """Download and extract test cases for a challenge"""
-        try:
-            logger.info(f"Downloading test cases for challenge {challenge_id}")
-            
-            url = f"{self.api_url}/api/v1/challenges/{challenge_id}/test_cases/download"
-            
-            # Create signature for authentication
-            timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            message = f"{self.validator_hotkey}{timestamp}"
-            signature = self.create_signature(message)
-            
-            headers = {
-                'X-Validator-Secret': self.validator_secret
-            }
-            
-            params = {
-                'validator_hotkey': self.validator_hotkey,
-                'signature': signature,
-                'timestamp': timestamp
-            }
-            
-            logger.info(f"Requesting test cases from: {url}")
-            
-            async with self.session.get(url, headers=headers, params=params, timeout=240) as response:
-                if response.status == 200:
-                    content = await response.read()
-                    logger.info(f"Downloaded test cases: {len(content)} bytes")
-                    
-                    # Create test cases directory
-                    testcases_dir = self.base_dir / 'testcases'
-                    testcases_dir.mkdir(exist_ok=True)
-                    
-                    # Save the zip file
-                    zip_path = testcases_dir / f"{challenge_id}_validator.zip"
-                    async with aiofiles.open(zip_path, 'wb') as f:
-                        await f.write(content)
-                    
-                    return True
-                    
-                else:
-                    error_text = await response.text()
-                    logger.error(f"Failed to download test cases: {response.status} - {error_text}")
-                    return False
-                    
-        except Exception as e:
-            logger.error(f"Error downloading test cases for {challenge_id}: {e}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            return False
-    
     def get_testcase_files(self, challenge_id: str) -> tuple:
         """Get test case files for a challenge"""
         evaluator_zip_path = self.base_dir / 'testcases' / f"{challenge_id}_validator.zip"
@@ -968,7 +733,7 @@ class APIClient:
             evaluator_zip_path = self.base_dir / 'testcases' / f"{challenge_id}_validator.zip"
             
             if not evaluator_zip_path.exists():
-                logger.warning(f"Missing test case file: {file_path}")
+                logger.warning(f"Missing test case file: {evaluator_zip_path}")
                 return False
             
             logger.debug(f"All test case files exist for challenge {challenge_id}")

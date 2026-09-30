@@ -1,124 +1,60 @@
 #!/usr/bin/env python3
 """
-Miner Communications for ChipForge Validator (Simplified)
-Handles communication with miners via Bittensor protocol using default Synapse
+Miner Communications for ChipForge Validator
+Broadcasts short SimpleMessage notices to serving miners (challenge active, batch complete).
 """
 
-import bittensor as bt
+import logging
+import os
+from datetime import datetime, timezone
+from typing import Dict
+
 from chipforge.protocol import SimpleMessage
 
-import logging
-from datetime import datetime, timezone
-from typing import Dict, List
-from dotenv import load_dotenv
-load_dotenv()
 logger = logging.getLogger(__name__)
 
+
 class MinerCommunications:
-    """Handles communication with miners using default Synapse"""
-    
+    """Sends notices to miners' axons"""
+
     def __init__(self, dendrite, metagraph):
         self.dendrite = dendrite
         self.metagraph = metagraph
-    
-    # In your validator_utils/miner_comms.py, update the functions:
+        self.timeout = float(os.getenv("MINER_NOTIFY_TIMEOUT", "12"))
+
+    async def _broadcast(self, message: str, label: str) -> Dict[int, str]:
+        """Send `message` to every serving axon; returns {uid: response} for miners that answered."""
+        try:
+            serving = [(uid, axon) for uid, axon in enumerate(self.metagraph.axons) if axon.is_serving]
+            if not serving:
+                logger.warning("No serving miners found")
+                return {}
+
+            synapse = SimpleMessage()
+            synapse.message = message
+            logger.info(f"Notifying {len(serving)} miners: {label}")
+            responses = await self.dendrite.forward(
+                axons=[axon for _, axon in serving], synapse=synapse, timeout=self.timeout
+            )
+
+            answered = {}
+            for (uid, _), response in zip(serving, responses):
+                if getattr(response, 'response', None):
+                    answered[uid] = response.response
+                else:
+                    logger.debug(f"Miner {uid} did not respond to {label}")
+            logger.info(f"{len(answered)}/{len(serving)} miners acknowledged {label}")
+            return answered
+        except Exception as e:
+            logger.error(f"Error notifying miners ({label}): {e}")
+            return {}
 
     async def notify_miners_challenge_active(self, challenge_id: str, github_url: str) -> Dict[int, str]:
-        try:
-            # Get serving miners
-            serving_axons = []
-            serving_uids = []
-            
-            for uid, axon in enumerate(self.metagraph.axons):
-                if axon.is_serving:
-                    serving_axons.append(axon)
-                    serving_uids.append(uid)
-            
-            if not serving_axons:
-                logger.warning("No serving miners found")
-                return {}
-            
-            # Create simple custom synapse
-            timestamp = datetime.now(timezone.utc).isoformat()
-            message = f"CHALLENGE_ACTIVE:{challenge_id}:{github_url}:{timestamp}"
-            
-            synapse = SimpleMessage()
-            synapse.message = message
-            
-            logger.info(f"Notifying {len(serving_axons)} miners about challenge {challenge_id}")
-            logger.info(f"Message: {message}")
-            
-            # Send to miners
-            responses = await self.dendrite.forward(
-                axons=serving_axons,
-                synapse=synapse,
-                timeout=60
-            )
-            
-            # Process responses
-            miner_responses = {}
-            for uid, response in zip(serving_uids, responses):
-                if hasattr(response, 'response') and response.response:
-                    miner_responses[uid] = response.response
-                    if response.response.upper() == "OK":
-                        logger.debug(f"Miner {uid} acknowledged challenge")
-                else:
-                    logger.warning(f"Miner {uid} did not respond")
-            
-            logger.info(f"Received {len(miner_responses)} responses from miners")
-            return miner_responses
-            
-        except Exception as e:
-            logger.error(f"Error notifying miners about challenge: {e}")
-            return {}
-
+        timestamp = datetime.now(timezone.utc).isoformat()
+        return await self._broadcast(f"CHALLENGE_ACTIVE:{challenge_id}:{github_url}:{timestamp}",
+                                     f"challenge {challenge_id} active")
 
     async def notify_miners_batch_complete(self, batch_id: str = None) -> Dict[int, str]:
-        """Notify miners about batch completion using SimpleMessage synapse"""
-        try:
-            # Get serving miners
-            serving_axons = []
-            serving_uids = []
-            
-            for uid, axon in enumerate(self.metagraph.axons):
-                if axon.is_serving:
-                    serving_axons.append(axon)
-                    serving_uids.append(uid)
-            
-            if not serving_axons:
-                logger.warning("No serving miners found")
-                return {}
-            
-            # Create simple custom synapse
-            timestamp = datetime.now(timezone.utc).isoformat()
-            message = f"BATCH_COMPLETE:{batch_id if batch_id else 'unknown'}:{timestamp}"
-            
-            synapse = SimpleMessage()
-            synapse.message = message
-            
-            logger.info(f"Notifying {len(serving_axons)} miners about batch completion")
-            logger.info(f"Message: {message}")
-            
-            # Send to miners
-            responses = await self.dendrite.forward(
-                axons=serving_axons,
-                synapse=synapse,
-                timeout=60
-            )
-            
-            # Process responses
-            miner_responses = {}
-            for uid, response in zip(serving_uids, responses):
-                if hasattr(response, 'response') and response.response:
-                    miner_responses[uid] = response.response
-                    if response.response.upper() == "OK":
-                        logger.debug(f"Miner {uid} acknowledged batch completion")
-                else:
-                    logger.warning(f"Miner {uid} did not respond to batch completion")
-            
-            logger.info(f"Received {len(miner_responses)} batch completion responses")
-            return miner_responses
-            
-        except Exception as e:
-            logger.error(f"Error notifying miners about batch completion: {e}")
-            return {}
+        timestamp = datetime.now(timezone.utc).isoformat()
+        return await self._broadcast(f"BATCH_COMPLETE:{batch_id or 'unknown'}:{timestamp}",
+                                     f"batch {batch_id} complete")

@@ -5,13 +5,17 @@ Emission Manager for ChipForge Validator
 Handles emission phases based on challenge lifecycle
 """
 
-import json
 import os
 import logging
+
+from .logutil import info_on_change
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple
 from dotenv import load_dotenv
 load_dotenv()
+
+from .storage import atomic_write_json, data_path, load_json
+
 logger = logging.getLogger(__name__)
 
 
@@ -61,7 +65,8 @@ class EmissionManager:
         Args:
             winner_reward_hours: Hours from challenge server, or None if not available
         """
-        if winner_reward_hours is not None and winner_reward_hours > 0:
+        max_hours = float(os.getenv('MAX_WINNER_REWARD_HOURS', '720'))
+        if winner_reward_hours is not None and 0 < winner_reward_hours <= max_hours:
             if self.total_hours_for_winner_reward != winner_reward_hours:
                 logger.info(f"Updating winner reward hours: {self.total_hours_for_winner_reward}h → {winner_reward_hours}h (from challenge server)")
                 self.total_hours_for_winner_reward = winner_reward_hours
@@ -83,34 +88,33 @@ class EmissionManager:
     def load_state(self):
         """Load emission state from file"""
         try:
-            if os.path.exists('emission_state.json'):
-                with open('emission_state.json', 'r') as f:
-                    data = json.load(f)
-                    self.subnet_start_time = data.get('subnet_start_time')
-                    self.first_challenge_end_time = data.get('first_challenge_end_time')
-                    self.winner_reward_start_time = data.get('winner_reward_start_time')
-                    self.current_phase = data.get('current_phase', 'initial_burn')
-                    self.current_winner = data.get('current_winner')
-                    self.current_winner_score = data.get('current_winner_score', 0.0)
-                    self.winner_qualified_baseline = data.get('winner_qualified_baseline', 0.0)
-                    self.last_challenge_end_time = data.get('last_challenge_end_time')
+            data = load_json(data_path('emission_state.json'))
+            if data is not None:
+                self.subnet_start_time = data.get('subnet_start_time')
+                self.first_challenge_end_time = data.get('first_challenge_end_time')
+                self.winner_reward_start_time = data.get('winner_reward_start_time')
+                self.current_phase = data.get('current_phase', 'initial_burn')
+                self.current_winner = data.get('current_winner')
+                self.current_winner_score = data.get('current_winner_score', 0.0)
+                self.winner_qualified_baseline = data.get('winner_qualified_baseline', 0.0)
+                self.last_challenge_end_time = data.get('last_challenge_end_time')
                     
-                    # Restore winner reward hours if saved
-                    saved_hours = data.get('total_hours_for_winner_reward')
-                    if saved_hours is not None:
-                        self.total_hours_for_winner_reward = saved_hours
-                        self.initial_burn_days = self.total_hours_for_winner_reward / 24
-                        self.winner_reward_days = self.total_hours_for_winner_reward / 24
+                # Restore winner reward hours if saved
+                saved_hours = data.get('total_hours_for_winner_reward')
+                if saved_hours is not None:
+                    self.total_hours_for_winner_reward = saved_hours
+                    self.initial_burn_days = self.total_hours_for_winner_reward / 24
+                    self.winner_reward_days = self.total_hours_for_winner_reward / 24
                     
-                    # Convert ISO strings back to datetime objects
-                    if self.subnet_start_time:
-                        self.subnet_start_time = datetime.fromisoformat(self.subnet_start_time)
-                    if self.first_challenge_end_time:
-                        self.first_challenge_end_time = datetime.fromisoformat(self.first_challenge_end_time)
-                    if self.winner_reward_start_time:
-                        self.winner_reward_start_time = datetime.fromisoformat(self.winner_reward_start_time)
-                    if self.last_challenge_end_time:
-                        self.last_challenge_end_time = datetime.fromisoformat(self.last_challenge_end_time)
+                # Convert ISO strings back to datetime objects
+                if self.subnet_start_time:
+                    self.subnet_start_time = datetime.fromisoformat(self.subnet_start_time)
+                if self.first_challenge_end_time:
+                    self.first_challenge_end_time = datetime.fromisoformat(self.first_challenge_end_time)
+                if self.winner_reward_start_time:
+                    self.winner_reward_start_time = datetime.fromisoformat(self.winner_reward_start_time)
+                if self.last_challenge_end_time:
+                    self.last_challenge_end_time = datetime.fromisoformat(self.last_challenge_end_time)
                         
                 logger.info(f"Loaded emission state: phase={self.current_phase}, winner={self.current_winner[:12] + '...' if self.current_winner else 'None'}, score={self.current_winner_score}, qualified_baseline={self.winner_qualified_baseline}, reward_hours={self.total_hours_for_winner_reward}h")
         except Exception as e:
@@ -131,8 +135,7 @@ class EmissionManager:
                 'total_hours_for_winner_reward': self.total_hours_for_winner_reward,
                 'updated_at': datetime.now(timezone.utc).isoformat()
             }
-            with open('emission_state.json', 'w') as f:
-                json.dump(data, f, indent=2)
+            atomic_write_json(data_path('emission_state.json'), data)
         except Exception as e:
             logger.error(f"Error saving emission state: {e}")
     
@@ -143,16 +146,6 @@ class EmissionManager:
             self.current_phase = "initial_burn"
             self.save_state()
             logger.info("Initialized subnet start time")
-    
-    def mark_first_challenge_complete(self, winner_hotkey: str):
-        """Mark first challenge as complete with winner"""
-        self.first_challenge_end_time = datetime.now(timezone.utc)
-        self.winner_reward_start_time = datetime.now(timezone.utc)
-        self.current_phase = "winner_reward"
-        self.current_winner = winner_hotkey
-        self.last_challenge_end_time = datetime.now(timezone.utc)
-        self.save_state()
-        logger.info(f"First challenge completed, winner: {winner_hotkey[:12]}...")
     
     def update_winner(self, winner_hotkey: str, winner_score: float, qualified_baseline: float, winner_timestamp: Optional[datetime] = None):
         """
@@ -295,7 +288,7 @@ class EmissionManager:
         now = datetime.now(timezone.utc)
         
         if not self.subnet_start_time:
-            logger.info("No subnet start time - burning emissions")
+            info_on_change(logger, "emission_phase", "No subnet start time - burning emissions")
             return True
         
         # Phase 1: Initial burn period (X days from subnet start)
@@ -304,21 +297,21 @@ class EmissionManager:
             
             if now < initial_period_end:
                 if best_miner_score > 0:
-                    logger.info("Good submission found during initial burn period - transitioning to normal")
+                    info_on_change(logger, "emission_phase", "Good submission found during initial burn period - transitioning to normal")
                     self.current_phase = "normal"
                     self.save_state()
                     return False
-                logger.info("Initial burn period active - burning emissions")
+                info_on_change(logger, "emission_phase", "Initial burn period active - burning emissions")
                 return True
             else:
                 # Initial period ended
                 if best_miner_score > 0:
-                    logger.info("Initial burn period ended, good submission found - transitioning to normal")
+                    info_on_change(logger, "emission_phase", "Initial burn period ended, good submission found - transitioning to normal")
                     self.current_phase = "normal"
                     self.save_state()
                     return False
                 else:
-                    logger.info("Initial burn period ended, no good submissions - burning until submission")
+                    info_on_change(logger, "emission_phase", "Initial burn period ended, no good submissions - burning until submission")
                     self.current_phase = "burn_until_submission"
                     self.save_state()
                     return True
@@ -329,22 +322,21 @@ class EmissionManager:
                 reward_period_end = self.winner_reward_start_time + timedelta(hours=self.total_hours_for_winner_reward)
                 if now < reward_period_end:
                     remaining_hours = (reward_period_end - now).total_seconds() / 3600
-                    logger.info(f"Winner {self.current_winner[:12] if self.current_winner else 'Unknown'}... (score: {self.current_winner_score}) reward period active - {remaining_hours:.1f}h remaining")
+                    info_on_change(logger, "emission_phase", f"Winner {self.current_winner[:12] if self.current_winner else 'Unknown'}... (score: {self.current_winner_score}) reward period active - {remaining_hours:.1f}h remaining")
                     return False
                 else:
                     # Winner period ended - ONLY clear winner, KEEP score for comparison
-                    logger.info(f"Winner reward period EXPIRED for {self.current_winner[:12] if self.current_winner else 'Unknown'}... (score: {self.current_winner_score})")
-                    old_winner = self.current_winner
+                    info_on_change(logger, "emission_phase", f"Winner reward period EXPIRED for {self.current_winner[:12] if self.current_winner else 'Unknown'}... (score: {self.current_winner_score})")
                     self.current_winner = None
                     # DO NOT reset current_winner_score - keep it for future comparisons
                     
                     if best_miner_score > 0:
-                        logger.info("Winner period ended, challenge still active - transitioning to normal")
+                        info_on_change(logger, "emission_phase", "Winner period ended, challenge still active - transitioning to normal")
                         self.current_phase = "normal"
                         self.save_state()
                         return False
                     else:
-                        logger.info("Winner period ended, no new submissions - burning until submission")
+                        info_on_change(logger, "emission_phase", "Winner period ended, no new submissions - burning until submission")
                         self.current_phase = "burn_until_submission"
                         self.save_state()
                         return True
@@ -352,11 +344,11 @@ class EmissionManager:
         # Phase 3: Burn until good submission
         elif self.current_phase == "burn_until_submission":
             if best_miner_score > 0:
-                logger.info("Good submission found during burn phase - transitioning to normal")
+                info_on_change(logger, "emission_phase", "Good submission found during burn phase - transitioning to normal")
                 self.current_phase = "normal"
                 self.save_state()
                 return False
-            logger.info("No good submissions found - burning emissions")
+            info_on_change(logger, "emission_phase", "No good submissions found - burning emissions")
             return True
         
         # Phase 4: Normal operation
@@ -364,14 +356,14 @@ class EmissionManager:
             if best_miner_score > 0:
                 # Log winner info if we have one
                 if self.current_winner:
-                    logger.info(f"Normal operation: Current winner {self.current_winner[:12]}... (no time limit during active challenge)")
-                logger.info("Normal operation with submissions - not burning emissions")
+                    info_on_change(logger, "emission_phase", f"Normal operation: Current winner {self.current_winner[:12]}... (no time limit during active challenge)")
+                info_on_change(logger, "emission_phase", "Normal operation with submissions - not burning emissions")
                 return False
             else:
-                logger.info("Normal operation but no submissions - burning emissions")
+                info_on_change(logger, "emission_phase", "Normal operation but no submissions - burning emissions")
                 return True
         
-        logger.info("Unknown phase - burning emissions as fallback")
+        info_on_change(logger, "emission_phase", "Unknown phase - burning emissions as fallback")
         return True
     
     def get_reward_hotkey(self, current_best_hotkey: Optional[str] = None, current_best_score: float = 0.0) -> Optional[str]:

@@ -1,0 +1,62 @@
+# ChipForge SN108. Validator and miner can run side by side from one folder; each uses its
+# own wallet (VALIDATOR_WALLET_* / MINER_WALLET_* in .env), mounted read-only at /wallets.
+#   make up                 # validator (default)
+#   make up ROLE=miner      # miner
+#
+# Host networking: the validator reaches the EDA server on 127.0.0.1:8080 and the chain
+# directly; the miner's axon listens on AXON_PORT on the host. Linux hosts only.
+
+x-common: &common
+  build:
+    context: .
+    args:
+      UID: ${HOST_UID:-1000}
+      GID: ${HOST_GID:-1000}
+  image: chipforge-sn108:${IMAGE_TAG:-local}
+  env_file: .env
+  environment:
+    # In-container locations; set here so values meant for the host in .env can't override them
+    CHIPFORGE_DATA_DIR: /data
+    MINER_CHALLENGE_DIR: /data/downloaded_active_challenge
+    WALLET_PATH: /wallets
+    VALIDATOR_WALLET_DIR: /wallets
+    MINER_WALLET_DIR: /wallets
+  network_mode: host
+  restart: unless-stopped
+  stop_grace_period: 60s
+  logging:
+    driver: json-file
+    options:
+      max-size: "50m"
+      max-file: "5"
+
+services:
+  validator:
+    <<: *common
+    profiles: ["validator"]
+    container_name: chipforge-validator
+    volumes:
+      - ${DATA_DIR:-./data}:/data
+      - ${VALIDATOR_WALLET_DIR:-${WALLET_DIR:-~/.bittensor/wallets}}:/wallets:ro
+    command: ["validator"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "chipforge.heartbeat", "validator", "--max-age", "180"]
+      interval: 60s
+      timeout: 10s
+      start_period: 180s
+      retries: 3
+
+  miner:
+    <<: *common
+    profiles: ["miner"]
+    container_name: chipforge-miner
+    volumes:
+      - ${DATA_DIR:-./data}:/data
+      - ${MINER_WALLET_DIR:-${WALLET_DIR:-~/.bittensor/wallets}}:/wallets:ro
+    command: ["miner"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "chipforge.heartbeat", "miner", "--max-age", "180"]
+      interval: 60s
+      timeout: 10s
+      start_period: 180s
+      retries: 3

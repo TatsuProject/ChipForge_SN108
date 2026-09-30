@@ -1,0 +1,17 @@
+# Keep secrets, wallets and local state out of the image
+.env
+.env.*
+!.env.example
+data/
+backups/
+logs/
+validator_data/
+downloaded_active_challenge/
+*.json
+.git/
+.pytest_cache/
+**/__pycache__/
+*.egg-info/
+tests/
+docs/
+assets/

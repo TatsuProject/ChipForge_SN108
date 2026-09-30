@@ -4,13 +4,19 @@
 The `miner_cli.py` tool provides a command-line interface for miners to interact with the ChipForge challenge system.
 
 ## Common Arguments
-These arguments can be used with any command:
+These arguments can be used with any command, before or after the command name:
 
-- `--wallet.name <name>` - Wallet name (default: from `.env` or `"default"`)
-- `--wallet.hotkey <hotkey>` - Wallet hotkey (default: from `.env` or `"default"`)
-- `--api_url <url>` - Challenge server API URL (default: from `.env` or `"http://localhost:8000"`)
+- `--wallet.name <name>` - Wallet name (default: `MINER_WALLET_NAME` from `.env`, else `"default"`)
+- `--wallet.hotkey <hotkey>` - Wallet hotkey (default: `MINER_HOTKEY`, else `"default"`)
+- `--wallet.path <dir>` - Wallet directory (default: `MINER_WALLET_DIR` from `.env`, else `~/.bittensor/wallets`)
+- `--api_url <url>` - Challenge server API URL (default: `CHALLENGE_API_URL`, else `https://api.chipforge.io`)
 
-**Note:** If `.env` file exists and contains `WALLET_NAME`, `MINER_HOTKEY`, and `CHALLENGE_API_URL`, these values will be used as defaults.
+**Note:** values in `.env` (see `.env.example`) are used as defaults.
+
+`status`, `submissions` and `submit --check_status` read your submission history, which the
+server only returns to the hotkey's owner: the CLI signs that request with your hotkey.
+
+**Docker:** `make cli ARGS="status"`, `make submit FILE=solution.zip`.
 
 ---
 
@@ -34,7 +40,7 @@ python3 python_scripts/miner_cli.py status
 python3 python_scripts/miner_cli.py status \
     --wallet.name my_wallet \
     --wallet.hotkey my_hotkey \
-    --api_url http://localhost:8000
+    --api_url https://api.chipforge.io
 ```
 
 **Output:**
@@ -82,9 +88,10 @@ python3 python_scripts/miner_cli.py submissions --challenge_id challenge_123
 
 ---
 
-### 3. `download` - Download Challenge Information
+### 3. `download` - Download the Challenge
 
-Downloads challenge information and test cases (if available).
+Downloads the challenge package (specification, testbench, templates) and extracts it,
+plus the challenge information as JSON. Hidden test cases stay with the validators.
 
 **Usage:**
 ```bash
@@ -109,7 +116,41 @@ python3 python_scripts/miner_cli.py download --challenge_id challenge_123 --outp
 
 **Output:**
 - Challenge information JSON file: `challenge_<id>_info.json`
-- Test cases ZIP file (if available): `challenge_<id>_test_cases.zip`
+- Challenge package `<id>.zip`, extracted into the output directory
+
+---
+
+### 3b. `logs` - Full Evaluation Logs of Your Submission
+
+The website shows a summary of each validator's evaluation (gates, metrics, error code and
+message). The complete EDA logs are only given to the miner who made the submission, and only
+after its batch has closed. The request is signed with your hotkey.
+
+```bash
+python3 python_scripts/miner_cli.py logs <submission_id> [--output DIR]
+```
+
+Saves one JSON file per validator to `./evaluation_logs/<submission_id>/` and prints each
+validator's score and notes.
+
+---
+
+### 3c. `reveals` and `reveal-download` - Winning Designs
+
+When the subnet reveals winning designs (see the reveal policy on the leaderboard's Winners
+tab), any hotkey registered on the subnet can download them. Downloads are signed with your
+hotkey, limited per day and logged.
+
+```bash
+# Reveal policy and the status of each winning design of the active challenge
+python3 python_scripts/miner_cli.py reveals [--challenge_id ID]
+
+# Download a revealed design to ./revealed_designs/<submission_id>.zip
+python3 python_scripts/miner_cli.py reveal-download <submission_id> [--output DIR]
+```
+
+The download is checked against the design's sha256 before it is saved. Submitting a
+byte-identical copy of a winning design is refused by the challenge server.
 
 ---
 
@@ -150,13 +191,13 @@ python3 python_scripts/miner_cli.py submit solution.zip \
     --check_status \
     --wallet.name my_wallet \
     --wallet.hotkey my_hotkey \
-    --api_url http://localhost:8000
+    --api_url https://api.chipforge.io
 ```
 
 **Validation:**
 - File must exist
 - File must be a ZIP file
-- File size must be ≤ 10MB
+- File size must be ≤ 50 MB (the server's limit)
 - ZIP file must be valid
 
 **Output:**
@@ -173,9 +214,10 @@ python3 python_scripts/miner_cli.py submit solution.zip \
 Create a `.env` file in the project root:
 
 ```bash
-WALLET_NAME=your_wallet_name
+MINER_WALLET_DIR=~/.bittensor/wallets
+MINER_WALLET_NAME=your_wallet_name
 MINER_HOTKEY=your_hotkey_name
-CHALLENGE_API_URL=http://your-api-url:8000
+CHALLENGE_API_URL=https://api.chipforge.io
 FILE_TO_SUBMIT=path/to/solution.zip
 ```
 
@@ -203,7 +245,7 @@ This script:
 4. Runs the submit command with `--check_status`
 
 **Required .env variables:**
-- `WALLET_NAME`
+- `MINER_WALLET_NAME` (and `MINER_WALLET_DIR` if not `~/.bittensor/wallets`)
 - `MINER_HOTKEY`
 - `CHALLENGE_API_URL`
 - `FILE_TO_SUBMIT`
@@ -214,7 +256,7 @@ This script:
 
 The CLI provides clear error messages:
 - ❌ File not found
-- ❌ File size exceeds 10MB limit
+- ❌ File size exceeds the 50 MB limit
 - ❌ No active challenge found
 - ❌ ZIP validation failed
 - ❌ Missing environment variables (in shell script)
