@@ -343,3 +343,7 @@ Owner decisions this branch follows:
 - When the challenge server sets `MINER_EMISSION_PERCENTAGE` (server `b107d12`), the validator uses it instead of its own value, from `/validator/sync` (also between challenges) or `/challenges/active` on servers without sync. When the server doesn't set it, or doesn't send the field, the local `MINER_EMISSION_PERCENTAGE` applies as before.
 - A change is logged (with a warning when it overrides the local value) and reaches the chain with the next weight set.
 - Tests: `tests/test_emission_control.py`.
+
+### F.8 Challenge download always from the miner's own challenge server
+- **Problem:** the challenge's download link is stored when the challenge is activated, from the server's `CHALLENGE_SERVER_PROD_URL`. A testnet server with that set to `api.chipforge.io` stored production links, so miners on testnet tried to download from production (unreachable, and it doesn't have testnet challenges) and failed on every poll.
+- **Now:** a challenge-server download link (`…/api/v1/challenges/<id>/download`) is fetched from the miner's own `CHALLENGE_API_URL`, whatever host the stored link names. GitHub links and other URLs behave as before.

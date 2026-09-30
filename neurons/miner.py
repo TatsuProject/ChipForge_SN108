@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 import os
 import sys
 import asyncio
+import re
 import shutil
 import signal
 import tempfile
@@ -62,13 +63,19 @@ class ChallengeDownloadError(Exception):
 def resolve_download_url(challenge_id: str, url: str, api_url: str) -> str:
     """Where to fetch the challenge package from.
 
-    GitHub repository URLs become archive ZIP URLs; any other URL (the challenge server's
-    /challenges/{id}/download link, a pre-signed S3 link) is used as-is; with no URL we fall
-    back to the challenge server's download endpoint."""
+    - A challenge-server download link (…/api/v1/challenges/<id>/download) is fetched from the
+      server this miner uses (CHALLENGE_API_URL). The stored link is fixed when the challenge is
+      activated and can name another deployment (e.g. production on a testnet server).
+    - GitHub repository URLs become archive ZIP URLs.
+    - Any other URL (e.g. a pre-signed S3 link) is used as-is.
+    - No URL: the challenge server's download endpoint."""
+    own = f"{api_url.rstrip('/')}/api/v1/challenges/{challenge_id}/download"
     url = (url or "").strip()
     if not url:
-        return f"{api_url.rstrip('/')}/api/v1/challenges/{challenge_id}/download"
+        return own
     parsed = urlparse(url)
+    if re.fullmatch(r"(/api/v\d+)?/challenges/[^/]+/download", parsed.path.rstrip("/")):
+        return own
     if parsed.netloc.lower() not in ("github.com", "www.github.com") or "/archive/" in parsed.path:
         return url
     if url.endswith('.git'):

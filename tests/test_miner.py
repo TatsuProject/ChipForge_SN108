@@ -64,6 +64,8 @@ def serve(monkeypatch, miner, payloads):
 
 @pytest.mark.parametrize("url, expected", [
     (f"{API}/api/v1/challenges/c1/download", f"{API}/api/v1/challenges/c1/download"),   # server-hosted
+    # stored link names another deployment (testnet challenge activated with the production URL)
+    ("https://api.chipforge.io/api/v1/challenges/c1/download", f"{API}/api/v1/challenges/c1/download"),
     ("https://bucket.s3.amazonaws.com/pending/c1.zip?X-Amz=1", "https://bucket.s3.amazonaws.com/pending/c1.zip?X-Amz=1"),
     ("https://github.com/org/repo", "https://github.com/org/repo/archive/main.zip"),
     ("https://github.com/org/repo.git", "https://github.com/org/repo/archive/main.zip"),
