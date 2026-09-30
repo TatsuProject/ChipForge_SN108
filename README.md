@@ -348,8 +348,10 @@ Each submission is evaluated across four key metrics:
 ### Competitive Ranking
 
 - Submissions are ranked by overall score (the average of the validators that evaluated them)
-- A new winner must pass both EDA gates and beat the score to beat (the previous winner's score, plus
-  `MIN_IMPROVEMENT_PERCENT` if the subnet sets one); the score to beat then rises to the new winner's score
+- The challenge server decides the winner when a batch closes, from every validator's results: a
+  submission's score is the highest gate-passing score it received, and the best one in the batch wins
+  if it beats the score to beat (plus `MIN_IMPROVEMENT_PERCENT` if the subnet sets one). Ties go to the
+  earlier submission, and the score to beat then rises to the new winner's score
 - Weights reward the highest-scoring submission with `MINER_EMISSION_PERCENTAGE` of the validator's weight; the rest is burned
 - Emission burning occurs when no submissions exceed quality thresholds
 - The winner of a challenge will keep getting reward for specific time after challenge expiration
