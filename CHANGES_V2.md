@@ -338,3 +338,8 @@ Owner decisions this branch follows:
 - Miners: new section "Results, logs and revealed winning designs" (leaderboard pages, scores published at batch close, `miner_cli.py logs`, `reveals` / `reveal-download` for registered hotkeys, copy guard and improvement margin); rate limits updated (the signed `logs` and `reveal-download` calls count toward the miner limit); wallet settings (`MINER_WALLET_*`).
 - Validators: `VALIDATOR_WALLET_*`, `make up`, and that `MIN_IMPROVEMENT_PERCENT` must equal the challenge server's.
 - Competitive ranking and the API reference (miner, public endpoints) brought up to date.
+
+### H.3 Miner emission percentage from the challenge server
+- When the challenge server sets `MINER_EMISSION_PERCENTAGE` (server `b107d12`), the validator uses it instead of its own value, from `/validator/sync` (also between challenges) or `/challenges/active` on servers without sync. When the server doesn't set it, or doesn't send the field, the local `MINER_EMISSION_PERCENTAGE` applies as before.
+- A change is logged (with a warning when it overrides the local value) and reaches the chain with the next weight set.
+- Tests: `tests/test_emission_control.py`.

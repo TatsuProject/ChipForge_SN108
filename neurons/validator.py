@@ -114,6 +114,27 @@ class ChipForgeValidator:
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
+    def apply_emission_percentage(self, controlled: bool, server_value) -> float:
+        """The challenge server's miner emission percentage is authoritative when it sends one;
+        otherwise this validator's own MINER_EMISSION_PERCENTAGE applies. A change goes on chain
+        with the next weight set (the weights differ, so they are submitted)."""
+        local = float(self.config.miner_emission_percentage)
+        effective, source = local, "local MINER_EMISSION_PERCENTAGE"
+        if controlled and server_value is not None:
+            try:
+                effective, source = max(0.0, min(100.0, float(server_value))), "challenge server"
+            except (TypeError, ValueError):
+                logger.error(f"Ignoring invalid miner_emission_percentage from server: {server_value!r}")
+        if effective != self.weight_manager.miner_emission_percentage:
+            logger.info(f"Miner emission percentage: {self.weight_manager.miner_emission_percentage:g}% -> "
+                        f"{effective:g}% ({source})")
+            if source == "challenge server" and effective != local:
+                logger.warning(f"The challenge server sets the miner emission percentage to {effective:g}%; "
+                               f"this validator's MINER_EMISSION_PERCENTAGE={local:g} is not used")
+            self.weight_manager.miner_emission_percentage = effective
+            self.emission_manager.miner_emission_percentage = effective
+        return effective
+
     def request_stop(self):
         logger.info("Shutdown requested")
         self._stop.set()
@@ -373,6 +394,8 @@ class ChipForgeValidator:
                 challenge = None
                 server_accessible = False
 
+            if server_accessible:
+                self.apply_emission_percentage(*self.api_client.server_miner_emission_percentage(challenge))
             
             # Handle case: had challenge before, but not now
             if not challenge and self.state.last_challenge_id:

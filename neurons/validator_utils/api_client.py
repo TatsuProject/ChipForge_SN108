@@ -201,6 +201,16 @@ class APIClient:
     # Challenge state
     # ------------------------------------------------------------------
 
+    def server_miner_emission_percentage(self, challenge: Optional[Dict] = None):
+        """(controlled, value): the challenge server's miner emission percentage from the last
+        /validator/sync (or, on servers without sync, the active challenge). controlled=False
+        when the server doesn't send one; value None means "not set on the server"."""
+        if self._sync_state is not None and 'miner_emission_percentage' in self._sync_state:
+            return True, self._sync_state['miner_emission_percentage']
+        if isinstance(challenge, dict) and 'miner_emission_percentage' in challenge:
+            return True, challenge['miner_emission_percentage']
+        return False, None
+
     async def get_active_challenge(self) -> Optional[Dict]:
         """
         Get active challenge from server with connection error handling

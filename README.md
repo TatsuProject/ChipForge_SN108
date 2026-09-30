@@ -275,7 +275,9 @@ What the validator does each cycle:
 - puts weights on chain immediately when the winner changes (within the chain's rate limit) and refreshes them every `WEIGHTS_REFRESH_SECONDS`: the winner gets `MINER_EMISSION_PERCENTAGE` percent, the rest is burned to UID 0.
 
 Each validator picks its winner from its own evaluations; there is no winner sync between
-validators or with the challenge server. If the subnet sets a minimum improvement margin,
+validators or with the challenge server. The winner's share of the weight
+(`MINER_EMISSION_PERCENTAGE`) is the validator's own setting unless the challenge server sets one,
+in which case the server's value is used (the validator logs when it overrides the local value). If the subnet sets a minimum improvement margin,
 `MIN_IMPROVEMENT_PERCENT` in the validator's `.env` **must equal the challenge server's value**
 (default 0), otherwise validators disagree about who won.
 
