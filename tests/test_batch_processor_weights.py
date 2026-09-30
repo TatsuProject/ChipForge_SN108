@@ -80,3 +80,15 @@ async def test_min_improvement_margin(processor, monkeypatch):
     monkeypatch.setenv("MIN_IMPROVEMENT_PERCENT", "0")
     await bp.process_batch("c1", {"batch_id": "m2"})
     assert targets[-1].winner_hotkey == "hk_winner"
+
+
+async def test_batch_already_evaluated_by_this_validator_is_done_not_failed(processor):
+    """A re-batched submission this validator already scored comes back with 409 on download:
+    nothing to do, the batch is marked done (it used to count as failed and retry every loop)."""
+    bp, api, targets = processor
+    api.download_batch_submissions = AsyncMock(return_value={})
+    api.already_evaluated = {"s1"}
+    assert await bp.process_batch("c1", {"batch_id": "b9", "submissions": [{"submission_id": "s1"}]}) is True
+    assert "b9" in bp.state.evaluated_batches
+    api.already_evaluated = set()
+    assert await bp.process_batch("c1", {"batch_id": "b10", "submissions": [{"submission_id": "s2"}]}) is False

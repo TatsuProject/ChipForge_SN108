@@ -71,6 +71,8 @@ class WeightManager:
 
         self._last_applied: Optional[Tuple[Tuple[int, ...], Tuple[float, ...]]] = None
         self._last_applied_at: float = 0.0
+        self._last_description: Optional[str] = None
+        self._last_applied_wall: Optional[float] = None
         self._pending_logged: Optional[Tuple] = None
         # Backoff after a failed submission (unregistered hotkey, RPC down, ...): the same
         # weights are retried after 30s, 60s, ... up to 10 min instead of every loop.
@@ -206,6 +208,7 @@ class WeightManager:
             self._last_applied_at = time.monotonic()
             self._pending_logged = None
             self._failed_key, self._failures = None, 0
+            self._last_description, self._last_applied_wall = description, time.time()
             logger.info(f"Weights set on chain: {description}")
             return True
 
@@ -214,6 +217,21 @@ class WeightManager:
         logger.error(f"Chain rejected set_weights ({description}): {message} "
                      f"(retry in {self._retry_at - time.monotonic():.0f}s)")
         return False
+
+    def status_line(self, target: WeightTarget, banned_coldkeys: Optional[Set[str]] = None,
+                    ban_emissions: bool = False) -> str:
+        """One line on what is on chain and what is wanted, for the periodic status log."""
+        uids, weights, wanted = self.build(target, banned_coldkeys, ban_emissions)
+        if self._last_description is None:
+            on_chain = "nothing set since start"
+        else:
+            ago = int((time.time() - (self._last_applied_wall or time.time())) / 60)
+            on_chain = f"{self._last_description}, set {ago} min ago"
+        line = f"Weights on chain: {on_chain}"
+        if (tuple(uids), tuple(weights)) != self._last_applied:
+            reason = "waiting for the chain's rate limit" if not self._rate_limit_allows() else "being submitted"
+            line += f" | wanted: {wanted} ({reason})"
+        return line
 
     def _record_failure(self, key: Tuple) -> None:
         self._failures = self._failures + 1 if key == self._failed_key else 1

@@ -108,6 +108,13 @@ class BatchProcessor:
             logger.info(f"Downloaded {len(downloaded_submissions)} submissions")
 
             if not downloaded_submissions:
+                ids = {s.get('submission_id') for s in batch.get('submissions', [])}
+                if ids and ids <= self.api_client.already_evaluated:
+                    # Everything in this batch was already scored by this validator (re-batched
+                    # for another validator): done, not a failure
+                    logger.info(f"Batch {batch_id}: nothing left to evaluate for this validator")
+                    self.state.mark_batch_evaluated(batch_id)
+                    return True
                 logger.warning(f"No submissions downloaded for batch {batch_id}")
                 return False
 

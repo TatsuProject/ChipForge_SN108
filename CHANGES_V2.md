@@ -347,3 +347,9 @@ Owner decisions this branch follows:
 ### F.8 Challenge download always from the miner's own challenge server
 - **Problem:** the challenge's download link is stored when the challenge is activated, from the server's `CHALLENGE_SERVER_PROD_URL`. A testnet server with that set to `api.chipforge.io` stored production links, so miners on testnet tried to download from production (unreachable, and it doesn't have testnet challenges) and failed on every poll.
 - **Now:** a challenge-server download link (`…/api/v1/challenges/<id>/download`) is fetched from the miner's own `CHALLENGE_API_URL`, whatever host the stored link names. GitHub links and other URLs behave as before.
+
+### H.4 Clearer weight logs, fewer repeated lines, two validator fixes (found in two-laptop testing)
+- **Weight status line:** every `WEIGHT_STATUS_SECONDS` (300) the validator logs what is on chain and what it wants, e.g. `Weights on chain: winner UID 2 (5F6T…) 10%, burn 90% (current winner), set 12 min ago | wanted: burn (no reward target) (waiting for the chain's rate limit)`. "Setting weights" / "Weights set on chain" lines are unchanged.
+- **Fewer repeated lines:** the emission-phase and reward-target lines that were logged on every 10-second loop are logged at INFO only when they change (DEBUG otherwise), so they no longer bury the weight lines.
+- **Fix: re-batched submissions no longer loop.** When a submission this validator already scored is re-batched for another validator, the server answers its download with 409. That counted as a failed batch and was retried every loop until the deadline. Now it is "nothing to do": the batch is marked done.
+- **Fix: a failed batch respects the reward window.** The "batch failed" path rewarded the last champion even after its reward window had ended (weights flipped winner → burn → winner). It now uses the same rule as when idle.

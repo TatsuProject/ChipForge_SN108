@@ -156,3 +156,28 @@ def test_sdk_accepts_plain_lists_for_weights():
     out_uids, out_weights = convert_and_normalize_weights_and_uids([0, 2], [0.9, 0.1])
     assert list(out_uids) == [0, 2]
     assert max(out_weights) == 65535 and out_weights[0] > out_weights[1]
+
+
+def test_status_line_shows_on_chain_and_wanted(monkeypatch):
+    wm, subtensor = _manager(rate_limited=True)
+    line = wm.status_line(WeightTarget.winner("hk_winner"))
+    assert "nothing set since start" in line and "winner UID 2" in line and "rate limit" in line
+
+
+async def test_status_line_after_set():
+    wm, subtensor = _manager()
+    await wm.apply(WeightTarget.winner("hk_winner"))
+    line = wm.status_line(WeightTarget.winner("hk_winner"))
+    assert line.startswith("Weights on chain: winner UID 2") and "10%" in line and "wanted" not in line
+
+
+def test_info_on_change_logs_repeats_at_debug(caplog):
+    import logging
+    from validator_utils.logutil import info_on_change
+    log = logging.getLogger("t")
+    with caplog.at_level(logging.DEBUG, logger="t"):
+        for _ in range(3):
+            info_on_change(log, "k", "same")
+        info_on_change(log, "k", "different")
+    levels = [(r.levelname, r.getMessage()) for r in caplog.records]
+    assert levels == [("INFO", "same"), ("DEBUG", "same"), ("DEBUG", "same"), ("INFO", "different")]

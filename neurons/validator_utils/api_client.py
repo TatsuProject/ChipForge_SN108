@@ -66,6 +66,8 @@ class APIClient:
         # /validator/sync cache (see _sync)
         self._sync_supported: Optional[bool] = None
         self._sync_state: Optional[Dict] = None
+        # Submissions the server says this validator already evaluated (HTTP 409 on download)
+        self.already_evaluated: set = set()
         self._sync_etag: Optional[str] = None
         self._sync_fetched_at = 0.0
         self._sync_checked_at = 0.0
@@ -332,10 +334,14 @@ class APIClient:
         """Download one submission: {'content', 'filename', 'submission_id'} or None."""
         url = f"{self.api_url}/api/v1/challenges/{challenge_id}/submissions/{submission_id}/download"
         status, content, headers = await self._signed("GET", url, timeout=60, attempts=3, read="bytes")
+        if status == 409:
+            # A re-batched submission this validator already scored: nothing to do, not an error
+            self.already_evaluated.add(submission_id)
+            logger.info(f"Skipping {submission_id}: already evaluated by this validator")
+            return None
         if status != 200:
             hint = {401: "authentication failed", 403: "not in the exposed batch / not permitted",
-                    404: "submission not found or already fully evaluated",
-                    409: "already evaluated by this validator"}.get(status, "")
+                    404: "submission not found or already fully evaluated"}.get(status, "")
             logger.error(f"Download of {submission_id} failed: HTTP {status} {hint}")
             return None
         filename = None
