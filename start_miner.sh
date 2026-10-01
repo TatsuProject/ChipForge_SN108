@@ -6,6 +6,7 @@ source .env
 python neurons/miner.py \
     --netuid "$NETUID" \
     --subtensor.network "$SUBTENSOR_NETWORK" \
+    ${SUBTENSOR_CHAIN_ENDPOINT:+--subtensor.chain_endpoint "$SUBTENSOR_CHAIN_ENDPOINT"} \
     --wallet.path "${MINER_WALLET_DIR:-${WALLET_DIR:-$HOME/.bittensor/wallets}}" \
     --wallet.name "${MINER_WALLET_NAME:-$WALLET_NAME}" \
     --wallet.hotkey "$MINER_HOTKEY" \

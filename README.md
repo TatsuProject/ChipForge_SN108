@@ -38,6 +38,26 @@ ChipForge operates as a competitive platform where:
 - Access to Chipforge Challenge Server API
 - Chipforge EDA Server (for validators)
 
+### Before you start: wallet and registration
+
+Both miners and validators need a hotkey **registered on subnet 108** ([btcli docs](https://docs.learnbittensor.org/btcli)):
+
+```bash
+btcli wallet create --wallet-name mywallet --hotkey default          # coldkey + hotkey
+btcli subnets register --netuid 108 --network finney --wallet-name mywallet --hotkey default
+```
+
+The folder name you chose (`mywallet`) is what goes in `VALIDATOR_WALLET_NAME` / `MINER_WALLET_NAME`.
+
+Validators additionally need:
+- a **validator permit**, which the chain gives to the top-staked hotkeys of the subnet: stake to your hotkey
+  with `btcli stake add --netuid 108 ...`. Your influence on who gets paid is proportional to your stake;
+- a **`VALIDATOR_SECRET_KEY`** from the ChipForge team (ask on [Discord](https://discord.com/channels/799672011265015819/1408463235082092564));
+- the **[ChipForge EDA server](https://github.com/TatsuProject/chipforge_eda_server)** running and reachable
+  at `EDA_SERVER_URL` (default `http://localhost:8080`) **before** the validator starts.
+
+For testnet, use `--network test` with your test subnet's netuid, and set `NETUID` / `SUBTENSOR_NETWORK` in `.env` to match.
+
 ### Running with Docker (recommended)
 
 All settings live in `.env`; [`.env.example`](.env.example) documents every one of them.
@@ -45,7 +65,9 @@ All settings live in `.env`; [`.env.example`](.env.example) documents every one 
 ```bash
 git clone https://github.com/TatsuProject/ChipForge_SN108
 cd ChipForge_SN108
-cp .env.example .env        # set NETUID, the VALIDATOR_/MINER_ wallet settings (+ VALIDATOR_SECRET_KEY)
+cp .env.example .env        # defaults are for mainnet (netuid 108); set the VALIDATOR_/MINER_ wallet
+                            # settings (+ VALIDATOR_SECRET_KEY for a validator)
+make env-check              # after updating the repo: lists settings your .env is missing
 
 make up                     # validator
 make up ROLE=miner          # miner
@@ -61,6 +83,8 @@ make backup-state           # tar.gz of ./data into ./backups
 - **Health:** each neuron rewrites a heartbeat file every 30 s from its event loop; the container is marked unhealthy if it goes stale for 3 minutes, and `restart: unless-stopped` brings it back after crashes and reboots. Logs are rotated (5 × 50 MB).
 - **Miner CLI in Docker:** `make submit FILE=solution.zip`, or any command with `make cli ARGS="status"`.
 - `make test` runs the test-suite in a throwaway container.
+- **Updating:** `git pull`, then `make env-check` (add any new settings from `.env.example`), then `make up`
+  (it rebuilds the image). State in `./data` is kept.
 
 ### For Miners
 
@@ -74,7 +98,7 @@ https://docs.learnbittensor.org/btcli
 ```bash
 # Clone the repository
 git clone https://github.com/TatsuProject/ChipForge_SN108
-cd chipforge-subnet
+cd ChipForge_SN108
 
 # Create an isolated environment (Python 3.12 recommended)
 conda create -n chipforge-subnet python=3.12
@@ -260,7 +284,7 @@ https://github.com/TatsuProject/chipforge_eda_server
 The EDA server has no API key: keep its port (8080) closed to the internet, or bind it to
 `127.0.0.1` on the validator machine.
 
-Set parameters in `.env` (see `.env.example`): the validator's wallet is `VALIDATOR_WALLET_DIR`,
+Set parameters in `.env` (see `.env.example`; defaults are for mainnet): the validator's wallet is `VALIDATOR_WALLET_DIR`,
 `VALIDATOR_WALLET_NAME`, `VALIDATOR_HOTKEY`, and `VALIDATOR_SECRET_KEY` goes there too (never on the
 command line). Then run:
 ```bash
@@ -273,6 +297,10 @@ What the validator does each cycle:
 - downloads the exposed batch (each file's sha256 is checked against the hash the miner signed) and evaluates it on the EDA server within the batch's deadline,
 - submits scores, and if a submission beats the challenge's best qualified score, it becomes this validator's winner,
 - puts weights on chain immediately when the winner changes (within the chain's rate limit) and refreshes them every `WEIGHTS_REFRESH_SECONDS`: the winner gets `MINER_EMISSION_PERCENTAGE` percent, the rest is burned to UID 0.
+
+How many submissions a batch holds is set by the challenge server, and the validator evaluates all of
+them. `EDA_MAX_CONCURRENCY` only limits how many it sends to its EDA server at once (the rest wait their
+turn within the batch's deadline), so set it to what your EDA machine can run in parallel.
 
 Each validator picks its winner from its own evaluations; there is no winner sync between
 validators or with the challenge server. The winner's share of the weight
@@ -312,40 +340,22 @@ kill -9 <PID>
 
 - Download submissions from active batches
 - Evaluate designs using EDA tools
-- Submit scores based on multiple metrics:
-  - **Functionality** (0-100): Correctness and testbench passing
-  - These will be part of validation mechanism in future:
-    - **Area** (0-100): Resource utilization efficiency
-    - **Delay** (0-100): Timing performance
-    - **Power** (0-100): Power consumption optimization
-    - **Overall** (0-100): Weighted combination of all metrics
+- Submit the scores the EDA server returns: functionality, area, performance (delay), power and the
+  overall score, plus the functional and overall gates. How the metrics are weighted is set per
+  challenge by its evaluator bundle (see below)
 
 ## Evaluation Metrics
 
 ### Scoring System
 
-Each submission is evaluated across four key metrics:
+Each submission is evaluated across four metrics. Their weights and targets are set **per challenge**
+(in the challenge's hidden evaluator bundle), so they can differ between challenges. A submission only
+counts when it passes both gates: the functional gate (enough of the testbench passes) and the overall gate.
 
-1. **Functionality Score** (100% weight)
-   - Testbench pass/fail status
-   - Functional correctness verification
-   - Compliance with specifications
-
-2. **Area Score** (TBD)
-   - LUT utilization
-   - Register usage
-   - Memory block efficiency
-   - Overall resource optimization
-
-3. **Delay Score** (TBD)
-   - Maximum frequency achieved
-   - Critical path timing
-   - Setup/hold time margins
-
-4. **Power Score** (TBD)
-   - Static power consumption
-   - Dynamic power analysis
-   - Power efficiency metrics
+1. **Functionality Score**: share of the challenge's testbench that passes in simulation (Verilator)
+2. **Area Score**: synthesized cell area in µm² from the ASIC flow (OpenLane), compared with the challenge's target
+3. **Delay (performance) Score**: achieved speed (e.g. maximum frequency or throughput), compared with the target
+4. **Power Score**: estimated power in mW, compared with the target
 
 ### Competitive Ranking
 
@@ -417,7 +427,7 @@ The subnet uses a dynamic batch system:
 
 ### Authentication
 
-- **Signature-based auth**: All API calls require Ed25519 signatures
+- **Signature-based auth**: requests are signed with your Bittensor hotkey (sr25519)
 - **Validator secrets**: Additional secret keys for validator endpoints
 - **Hotkey verification**: Ensures submissions come from registered miners, and evaluated scores come from registered validators
 - **Timestamp validation**: Prevents replay attacks
@@ -462,9 +472,12 @@ make status
    - Verify network connectivity to challenge server
 
 4. **EDA Tool Integration**
-   - Ensure proper tool licensing and setup
-   - Check environment variable configuration
-   - Verify design constraints and timing requirements
+   - `curl http://localhost:8080/health` on the validator machine must answer `{"status": "ok"}`
+   - `EDA_SERVER_URL` in `.env` must point at it (with Docker host networking, `localhost` is the host)
+   - The EDA server's own README covers its setup and logs (`make logs` there)
+
+5. **Settings missing after an update**
+   - Run `make env-check`: it lists keys that `.env.example` has and your `.env` lacks
 
 ## Contributing
 

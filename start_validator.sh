@@ -9,6 +9,7 @@ mkdir -p logs
 python neurons/validator.py \
     --netuid "$NETUID" \
     --subtensor.network "$SUBTENSOR_NETWORK" \
+    ${SUBTENSOR_CHAIN_ENDPOINT:+--subtensor.chain_endpoint "$SUBTENSOR_CHAIN_ENDPOINT"} \
     --wallet.path "${VALIDATOR_WALLET_DIR:-${WALLET_DIR:-$HOME/.bittensor/wallets}}" \
     --wallet.name "${VALIDATOR_WALLET_NAME:-$WALLET_NAME}" \
     --wallet.hotkey "$VALIDATOR_HOTKEY" \
