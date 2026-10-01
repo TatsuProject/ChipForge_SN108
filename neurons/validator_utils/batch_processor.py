@@ -16,14 +16,32 @@ from .storage import data_path
 from .weight_manager import WeightTarget
 
 
+def _margin() -> float:
+    try:
+        return max(0.0, float(os.getenv("MIN_IMPROVEMENT_PERCENT", "0") or 0))
+    except ValueError:
+        return 0.0
+
+
 def beats(score: float, target: float) -> bool:
     """score beats target by at least MIN_IMPROVEMENT_PERCENT (0 = any higher score).
     Must match the challenge server's MIN_IMPROVEMENT_PERCENT."""
-    try:
-        margin = max(0.0, float(os.getenv("MIN_IMPROVEMENT_PERCENT", "0") or 0))
-    except ValueError:
-        margin = 0.0
-    return score > target + abs(target) * margin / 100.0
+    return score > target + abs(target) * _margin() / 100.0
+
+
+def explain(score: float, target: float, what: str = "score to beat") -> str:
+    """One log line: how score compares with target, including the MIN_IMPROVEMENT_PERCENT
+    margin, e.g. why 32.30 does not replace 32.23 when 0.5% is required."""
+    margin = _margin()
+    required = target + abs(target) * margin / 100.0
+    gain = f"{(score - target) / abs(target) * 100:+.2f}%" if target else "n/a"
+    head = f"score {score:.4f} vs {what} {target:.4f} ({gain})"
+    if score > required:
+        return f"{head}: beats it" + (f" by more than the required {margin:g}% (> {required:.4f})" if margin else "")
+    if margin and score > target:
+        return (f"{head}: higher, but MIN_IMPROVEMENT_PERCENT requires more than {margin:g}% "
+                f"(> {required:.4f}), so it is not a new winner")
+    return f"{head}: does not beat it"
 
 logger = logging.getLogger(__name__)
 
@@ -177,7 +195,11 @@ class BatchProcessor:
                         new_champion = hotkey
                         logger.info(f"New challenge champion found: {hotkey[:12]}... -> {overall_score} (beats previous: {current_best_score} and baseline snapshot: {evaluation_baseline_snapshot})")
                     else:
-                        logger.info(f"Submission {hotkey[:12]}... score {overall_score} beats previous ({current_best_score}) but does NOT beat baseline snapshot ({evaluation_baseline_snapshot}) - not eligible for reward")
+                        logger.info(f"Submission {submission_id} ({hotkey[:12]}...) not eligible for reward: "
+                                    f"{explain(overall_score, evaluation_baseline_snapshot, 'baseline snapshot')}")
+                elif hotkey:
+                    logger.info(f"Submission {submission_id} ({hotkey[:12]}...) not a new winner: "
+                                f"{explain(overall_score, new_best_score, 'challenge best')}")
 
             # Update challenge-wide best if we found a new champion
             if new_champion:

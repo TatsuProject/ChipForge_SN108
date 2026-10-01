@@ -92,3 +92,15 @@ async def test_batch_already_evaluated_by_this_validator_is_done_not_failed(proc
     assert "b9" in bp.state.evaluated_batches
     api.already_evaluated = set()
     assert await bp.process_batch("c1", {"batch_id": "b10", "submissions": [{"submission_id": "s2"}]}) is False
+
+
+def test_margin_is_explained_in_logs(monkeypatch):
+    from validator_utils.batch_processor import beats, explain
+    monkeypatch.setenv("MIN_IMPROVEMENT_PERCENT", "0.5")
+    assert not beats(32.30, 32.23)                       # +0.22% < 0.5%: not a new winner
+    msg = explain(32.30, 32.23, "challenge best")
+    assert "+0.22%" in msg and "requires more than 0.5%" in msg and "> 32.3911" in msg
+    assert "does not beat it" in explain(32.0, 32.23)
+    assert "beats it by more than the required 0.5%" in explain(33.0, 32.23)
+    monkeypatch.setenv("MIN_IMPROVEMENT_PERCENT", "0")
+    assert beats(32.30, 32.23) and explain(32.30, 32.23).endswith("beats it")
