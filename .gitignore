@@ -188,3 +188,6 @@ data/
 backups/
 heartbeat-*
 .env.backup-*
+
+# Local change log (kept on disk, not pushed)
+CHANGES_V2.md
