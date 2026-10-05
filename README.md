@@ -50,6 +50,8 @@ btcli subnets register --netuid 108 --network finney --wallet-name mywallet --ho
 The folder name you chose (`mywallet`) is what goes in `VALIDATOR_WALLET_NAME` / `MINER_WALLET_NAME`.
 
 Validators additionally need:
+- **hardware**: minimum 16 physical cores + 32 GB RAM, recommended 24 physical cores + 48 GB RAM
+  (physical cores, not vCPUs); see [docs/validator_requirements.md](docs/validator_requirements.md);
 - a **validator permit**, which the chain gives to the top-staked hotkeys of the subnet: stake to your hotkey
   with `btcli stake add --netuid 108 ...`. Your influence on who gets paid is proportional to your stake;
 - a **`VALIDATOR_SECRET_KEY`** from the ChipForge team (ask on [Discord](https://discord.com/channels/799672011265015819/1408463235082092564));
