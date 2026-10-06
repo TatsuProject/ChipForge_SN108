@@ -255,6 +255,8 @@ class APIClient:
             result = {
                 'winner_baseline_score': challenge.get('winner_baseline_score'),
                 'ban_emissions': challenge.get('ban_emissions', False),
+                # The margin a new winner needs (0 until the challenge's first winner); absent on older servers
+                'min_improvement_percent': challenge.get('min_improvement_percent'),
                 'batch_download_window_seconds': state['batch_windows']['download_seconds'],
                 'batch_evaluation_window_seconds': state['batch_windows']['evaluation_seconds'],
             }

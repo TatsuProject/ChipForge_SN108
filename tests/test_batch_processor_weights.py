@@ -104,3 +104,29 @@ def test_margin_is_explained_in_logs(monkeypatch):
     assert "beats it by more than the required 0.5%" in explain(33.0, 32.23)
     monkeypatch.setenv("MIN_IMPROVEMENT_PERCENT", "0")
     assert beats(32.30, 32.23) and explain(32.30, 32.23).endswith("beats it")
+
+
+async def test_server_margin_overrides_local(processor, monkeypatch):
+    """The server's min_improvement_percent is used instead of the local MIN_IMPROVEMENT_PERCENT:
+    0 before the challenge's first winner (any higher score wins), the configured % after."""
+    bp, api, targets = processor
+    api.evaluate_submissions_with_eda_server = AsyncMock(return_value={
+        "s1": {"overall_score": 11.0, "functional_gate": True, "overall_gate": True}})        # +10% over 10.0
+    monkeypatch.setenv("MIN_IMPROVEMENT_PERCENT", "20")                                       # local says 20%
+    api.get_challenge_info = AsyncMock(return_value={"winner_baseline_score": 10.0, "min_improvement_percent": 0.0})
+    await bp.process_batch("c1", {"batch_id": "s1"})
+    assert targets[-1].winner_hotkey == "hk_winner"                # first winner: server says 0%
+
+    bp.state.current_challenge_best = (None, 0.0)
+    targets.clear()
+    api.get_challenge_info = AsyncMock(return_value={"winner_baseline_score": 10.0, "min_improvement_percent": 20.0})
+    monkeypatch.setenv("MIN_IMPROVEMENT_PERCENT", "0")                                        # local says 0%
+    await bp.process_batch("c1", {"batch_id": "s2"})
+    assert all(t.winner_hotkey != "hk_winner" for t in targets)    # server's 20% applies: 11 <= 12
+
+
+def test_margin_argument_takes_precedence(monkeypatch):
+    from validator_utils.batch_processor import beats, explain
+    monkeypatch.setenv("MIN_IMPROVEMENT_PERCENT", "20")
+    assert beats(55, 50, 0.0) and not beats(55, 50) and not beats(55, 50, 20.0)
+    assert "requires more than 20%" in explain(55, 50, margin=20.0)

@@ -8,7 +8,7 @@ Handles batch evaluation and processing logic
 import logging
 import os
 import traceback
-from typing import Dict
+from typing import Dict, Optional
 from dotenv import load_dotenv
 load_dotenv()
 from .api_client import parse_server_time
@@ -16,23 +16,30 @@ from .storage import data_path
 from .weight_manager import WeightTarget
 
 
-def _margin() -> float:
+def _margin(margin: Optional[float] = None) -> float:
+    """The minimum improvement in percent: the challenge server's value when it sends one
+    (it is 0 until the challenge has its first winner), else this validator's
+    MIN_IMPROVEMENT_PERCENT (older servers)."""
+    if margin is not None:
+        try:
+            return max(0.0, float(margin))
+        except (TypeError, ValueError):
+            pass
     try:
         return max(0.0, float(os.getenv("MIN_IMPROVEMENT_PERCENT", "0") or 0))
     except ValueError:
         return 0.0
 
 
-def beats(score: float, target: float) -> bool:
-    """score beats target by at least MIN_IMPROVEMENT_PERCENT (0 = any higher score).
-    Must match the challenge server's MIN_IMPROVEMENT_PERCENT."""
-    return score > target + abs(target) * _margin() / 100.0
+def beats(score: float, target: float, margin: Optional[float] = None) -> bool:
+    """score beats target by more than the minimum improvement (0 = any higher score)."""
+    return score > target + abs(target) * _margin(margin) / 100.0
 
 
-def explain(score: float, target: float, what: str = "score to beat") -> str:
-    """One log line: how score compares with target, including the MIN_IMPROVEMENT_PERCENT
-    margin, e.g. why 32.30 does not replace 32.23 when 0.5% is required."""
-    margin = _margin()
+def explain(score: float, target: float, what: str = "score to beat", margin: Optional[float] = None) -> str:
+    """One log line: how score compares with target, including the minimum improvement,
+    e.g. why 32.30 does not replace 32.23 when 0.5% is required."""
+    margin = _margin(margin)
     required = target + abs(target) * margin / 100.0
     gain = f"{(score - target) / abs(target) * 100:+.2f}%" if target else "n/a"
     head = f"score {score:.4f} vs {what} {target:.4f} ({gain})"
@@ -98,6 +105,7 @@ class BatchProcessor:
 
             # CRITICAL: Fetch FRESH baseline BEFORE evaluation (it may have changed since last check)
             logger.info(f"Fetching fresh baseline score for challenge {challenge_id} before evaluation")
+            challenge_info = None
             try:
                 challenge_info = await self.api_client.get_challenge_info(challenge_id, fresh=True)
                 if challenge_info and 'winner_baseline_score' in challenge_info:
@@ -119,6 +127,16 @@ class BatchProcessor:
             # Store baseline snapshot for this evaluation (captured BEFORE submitting scores)
             evaluation_baseline_snapshot = self.state.winner_baseline_score
             logger.info(f"Baseline snapshot for this evaluation: {evaluation_baseline_snapshot}")
+            # The minimum improvement in force, snapshotted with the baseline: the server's value
+            # (0 until the challenge's first winner), or the local MIN_IMPROVEMENT_PERCENT on older servers
+            server_margin = (challenge_info or {}).get('min_improvement_percent')
+            margin_snapshot = _margin(server_margin)
+            local_margin = _margin()
+            source = "challenge server" if server_margin is not None else "local MIN_IMPROVEMENT_PERCENT"
+            logger.info(f"Minimum improvement for this evaluation: {margin_snapshot:g}% ({source})")
+            if server_margin is not None and local_margin and margin_snapshot != local_margin:
+                logger.info(f"The challenge server sets the minimum improvement to {margin_snapshot:g}%; "
+                            f"this validator's MIN_IMPROVEMENT_PERCENT={local_margin:g} is not used")
 
             # Download submissions
             logger.info(f"Downloading submissions for batch {batch_id}")
@@ -189,17 +207,17 @@ class BatchProcessor:
                     continue
 
                 # Check if score beats both current best AND baseline snapshot (from BEFORE submission)
-                if hotkey and beats(overall_score, new_best_score):
-                    if beats(overall_score, evaluation_baseline_snapshot):
+                if hotkey and beats(overall_score, new_best_score, margin_snapshot):
+                    if beats(overall_score, evaluation_baseline_snapshot, margin_snapshot):
                         new_best_score = overall_score
                         new_champion = hotkey
                         logger.info(f"New challenge champion found: {hotkey[:12]}... -> {overall_score} (beats previous: {current_best_score} and baseline snapshot: {evaluation_baseline_snapshot})")
                     else:
                         logger.info(f"Submission {submission_id} ({hotkey[:12]}...) not eligible for reward: "
-                                    f"{explain(overall_score, evaluation_baseline_snapshot, 'baseline snapshot')}")
+                                    f"{explain(overall_score, evaluation_baseline_snapshot, 'baseline snapshot', margin_snapshot)}")
                 elif hotkey:
                     logger.info(f"Submission {submission_id} ({hotkey[:12]}...) not a new winner: "
-                                f"{explain(overall_score, new_best_score, 'challenge best')}")
+                                f"{explain(overall_score, new_best_score, 'challenge best', margin_snapshot)}")
 
             # Update challenge-wide best if we found a new champion
             if new_champion:

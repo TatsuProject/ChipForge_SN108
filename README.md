@@ -252,7 +252,7 @@ For more details, see [MINER_CLI_COMMANDS.md](MINER_CLI_COMMANDS.md).
   The request is signed with your hotkey (an unregistered hotkey gets 403), downloads are limited per day and
   logged, and the file is checked against the winner's signed hash before it is saved.
 - **Copies don't win:** a file byte-identical to a winning design is refused at submission, and the subnet can
-  require a new winner to beat the score to beat by a minimum margin (`MIN_IMPROVEMENT_PERCENT`).
+  require each winner after the first to beat the previous winner by a minimum margin (`MIN_IMPROVEMENT_PERCENT`).
 
 #### Solution Format
 
@@ -307,9 +307,10 @@ turn within the batch's deadline), so set it to what your EDA machine can run in
 Each validator picks its winner from its own evaluations; there is no winner sync between
 validators or with the challenge server. The winner's share of the weight
 (`MINER_EMISSION_PERCENTAGE`) is the validator's own setting unless the challenge server sets one,
-in which case the server's value is used (the validator logs when it overrides the local value). If the subnet sets a minimum improvement margin,
-`MIN_IMPROVEMENT_PERCENT` in the validator's `.env` **must equal the challenge server's value**
-(default 0), otherwise validators disagree about who won.
+in which case the server's value is used (the validator logs when it overrides the local value). The
+minimum improvement margin works the same way: the challenge server sends the margin in force (0 until
+a challenge has its first winner, then its `MIN_IMPROVEMENT_PERCENT`), and the validator uses it. The
+`MIN_IMPROVEMENT_PERCENT` in the validator's `.env` is only a fallback for servers that don't send one.
 
 #### Running with nohup (background process)
 
@@ -364,7 +365,7 @@ counts when it passes both gates: the functional gate (enough of the testbench p
 - Submissions are ranked by overall score (the average of the validators that evaluated them)
 - The challenge server decides the winner when a batch closes, from every validator's results: a
   submission's score is the highest gate-passing score it received, and the best one in the batch wins
-  if it beats the score to beat (plus `MIN_IMPROVEMENT_PERCENT` if the subnet sets one). Ties go to the
+  if it beats the score to beat (from the second winner on, plus `MIN_IMPROVEMENT_PERCENT` if the subnet sets one). Ties go to the
   earlier submission, and the score to beat then rises to the new winner's score
 - Weights reward the highest-scoring submission with `MINER_EMISSION_PERCENTAGE` of the validator's weight; the rest is burned
 - Emission burning occurs when no submissions exceed quality thresholds
