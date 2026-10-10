@@ -234,7 +234,10 @@ class ChipForgeValidator:
                 # Check if it's the same challenge we were working on
                 if self.state.last_challenge_id == challenge_id:
                     logger.info(f"Continuing with same challenge {challenge_id}")
-                    # Keep current challenge best as-is
+                    # Keep current challenge best, unless the subnet voided a record or changed the
+                    # score to beat while this validator was down (weights are restored below)
+                    if challenge_info:
+                        self.apply_baseline_epoch(challenge_info, retarget=False)
                 else:
                     logger.info(f"New challenge {challenge_id} detected during crash recovery")
                     # Reset for new challenge
@@ -362,6 +365,51 @@ class ChipForgeValidator:
             # Don't raise exception - this is a non-critical update check
 
     
+    def apply_baseline_epoch(self, info: dict, retarget: bool = True) -> bool:
+        """The challenge server bumps baseline_epoch when it voids a record (exploit, cheating) or an
+        admin changes the score to beat. Then this validator's local challenge best and winner are
+        reset to the server's: otherwise a voided score would stay the bar to beat here, and a
+        voided miner would keep being rewarded. Returns True when a reset happened."""
+        epoch = info.get('baseline_epoch')
+        if epoch is None:                        # older server
+            return False
+        if self.state.baseline_epoch is None:    # first time seen: remember it, nothing to undo
+            self.state.baseline_epoch = epoch
+            self.state.save_state()
+            return False
+        if epoch == self.state.baseline_epoch:
+            return False
+        server_score = float(info.get('winner_baseline_score') or 0.0)
+        cw = info.get('current_winner') or None
+        old = self.state.current_challenge_best
+        logger.warning(
+            f"The subnet changed the score to beat (epoch {self.state.baseline_epoch} -> {epoch}, e.g. a voided "
+            f"record): local best {old[0][:12] if old[0] else 'None'}... {old[1]} -> "
+            f"{(cw['hotkey'][:12] + '... ' + str(cw['score'])) if cw else 'no winner'}, score to beat {server_score}")
+        self.state.winner_baseline_score = server_score
+        em = self.emission_manager
+        if cw:
+            self.state.current_challenge_best = (cw['hotkey'], float(cw['score']))
+            start = parse_server_time(cw.get('qualified_at')) or datetime.now(timezone.utc)
+            self.state.current_challenge_best_timestamp = start
+            em.current_winner = cw['hotkey']
+            em.current_winner_score = float(cw['score'])
+            em.winner_qualified_baseline = server_score
+            em.winner_reward_start_time = start           # its original window: an old record is not paid again
+            em.current_phase = "winner_reward"
+        else:
+            self.state.current_challenge_best = (None, 0.0)
+            self.state.current_challenge_best_timestamp = None
+            em.current_winner = None
+            em.current_winner_score = 0.0
+            em.current_phase = "burn_until_submission"
+        em.save_state()
+        self.state.baseline_epoch = epoch
+        self.state.save_state()
+        if retarget:
+            self._target_current_challenge_reward()
+        return True
+
     def _target_current_challenge_reward(self):
         """Weight target while no batch is being evaluated: keep rewarding the current
         challenge winner during its reward window, otherwise burn."""
@@ -619,6 +667,9 @@ class ChipForgeValidator:
                                 self.state.winner_baseline_score = challenge_info['winner_baseline_score']
                                 self.state.save_state()
                         
+                        # A voided record or a manual change of the score to beat
+                        self.apply_baseline_epoch(challenge_info)
+
                         # Update ban_emissions flag
                         if 'ban_emissions' in challenge_info:
                             if self.state.ban_emissions != challenge_info['ban_emissions']:

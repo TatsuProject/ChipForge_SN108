@@ -257,6 +257,9 @@ class APIClient:
                 'ban_emissions': challenge.get('ban_emissions', False),
                 # The margin a new winner needs (0 until the challenge's first winner); absent on older servers
                 'min_improvement_percent': challenge.get('min_improvement_percent'),
+                # Bumped by the subnet when it voids a record or changes the score to beat (absent on older servers)
+                'baseline_epoch': challenge.get('baseline_epoch'),
+                'current_winner': challenge.get('current_winner'),
                 'batch_download_window_seconds': state['batch_windows']['download_seconds'],
                 'batch_evaluation_window_seconds': state['batch_windows']['evaluation_seconds'],
             }

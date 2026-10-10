@@ -30,6 +30,9 @@ class ValidatorState:
         self.current_challenge_expires_at: Optional[datetime] = None
         self.current_challenge_best_timestamp: Optional[datetime] = None  # When current best was found
         self.winner_baseline_score: float = 0.0  # Baseline score for winner validation
+        # Last challenge-server baseline_epoch seen: a new value means the subnet voided a record or
+        # changed the score to beat, and the local challenge best is reset to the server's
+        self.baseline_epoch: Optional[int] = None
         self.ban_emissions: bool = False  # Emergency emissions ban flag
         self.batch_download_window_seconds: int = 0  # 0 means use hardcoded fallback
         self.batch_evaluation_window_seconds: int = 0  # 0 means use hardcoded fallback
@@ -58,6 +61,7 @@ class ValidatorState:
                     self.current_challenge_best_timestamp = datetime.fromisoformat(self.current_challenge_best_timestamp)
 
                 self.winner_baseline_score = data.get('winner_baseline_score', 0.0)
+                self.baseline_epoch = data.get('baseline_epoch')
                 self.ban_emissions = data.get('ban_emissions', False)
                 self.batch_download_window_seconds = data.get('batch_download_window_seconds', 0)
                 self.batch_evaluation_window_seconds = data.get('batch_evaluation_window_seconds', 0)
@@ -79,6 +83,7 @@ class ValidatorState:
                 'current_challenge_expires_at': self.current_challenge_expires_at.isoformat() if self.current_challenge_expires_at else None,
                 'current_challenge_best_timestamp': self.current_challenge_best_timestamp.isoformat() if self.current_challenge_best_timestamp else None,
                 'winner_baseline_score': self.winner_baseline_score,
+                'baseline_epoch': self.baseline_epoch,
                 'ban_emissions': self.ban_emissions,
                 'batch_download_window_seconds': self.batch_download_window_seconds,
                 'batch_evaluation_window_seconds': self.batch_evaluation_window_seconds,
