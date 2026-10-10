@@ -388,17 +388,26 @@ class ChipForgeValidator:
             f"{(cw['hotkey'][:12] + '... ' + str(cw['score'])) if cw else 'no winner'}, score to beat {server_score}")
         self.state.winner_baseline_score = server_score
         em = self.emission_manager
+        # The bar here is exactly the server's score to beat (also after a manual change), so this
+        # validator and the server always agree on what a new winner must beat
         if cw:
-            self.state.current_challenge_best = (cw['hotkey'], float(cw['score']))
-            start = parse_server_time(cw.get('qualified_at')) or datetime.now(timezone.utc)
+            self.state.current_challenge_best = (cw['hotkey'], server_score)
+            now = datetime.now(timezone.utc)
+            ends = parse_server_time(cw.get('reward_expires_at'))
+            hours = float(em.total_hours_for_winner_reward or 0)
+            if ends is not None and hours > 0:
+                # The server's reward end (a restored record resumes only its unpaid hours)
+                start = ends - timedelta(hours=hours)
+            else:
+                start = parse_server_time(cw.get('qualified_at')) or now
             self.state.current_challenge_best_timestamp = start
             em.current_winner = cw['hotkey']
             em.current_winner_score = float(cw['score'])
             em.winner_qualified_baseline = server_score
-            em.winner_reward_start_time = start           # its original window: an old record is not paid again
+            em.winner_reward_start_time = start
             em.current_phase = "winner_reward"
         else:
-            self.state.current_challenge_best = (None, 0.0)
+            self.state.current_challenge_best = (None, server_score)
             self.state.current_challenge_best_timestamp = None
             em.current_winner = None
             em.current_winner_score = 0.0
