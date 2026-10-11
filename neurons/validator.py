@@ -30,6 +30,7 @@ from validator_utils import (
 )
 from chipforge.heartbeat import heartbeat_loop
 from validator_utils.weight_manager import WeightTarget
+from validator_utils.reward_ladder import RewardLadder
 from validator_utils.logutil import info_on_change
 
 # How often the validator logs what is on chain and what it wants (seconds)
@@ -78,10 +79,38 @@ class ChipForgeValidator:
 
     def set_weight_target(self, target: WeightTarget):
         """Record what should be rewarded. The chain is updated by apply_weights(), which
-        runs after every cycle (and so right after a batch that found a new winner)."""
+        runs after every cycle (and so right after a batch that found a new winner).
+        While the server runs the record ladder, the ladder decides instead (see effective_target)."""
         if target != self.weight_target:
-            logger.info(f"Weight target: {'winner ' + target.winner_hotkey[:12] + '...' if target.winner_hotkey else 'burn'} ({target.reason})")
+            note = " - not used: the record ladder decides" if self.reward_ladder.active else ""
+            log = logger.debug if note else logger.info
+            log(f"Weight target: {target.describe()} ({target.reason}){note}")
         self.weight_target = target
+
+    def refresh_reward_ladder(self):
+        """Adopt the reward_ladder of the last /validator/sync. A server reached without one (an older
+        version) turns the ladder off and the validator rewards its own challenge winner again."""
+        state = self.api_client._sync_state if self.api_client else None
+        if state is None:
+            return                                   # server not reached yet: keep what is on disk
+        if 'reward_ladder' in state:
+            self.reward_ladder.update(state['reward_ladder'])
+        elif self.reward_ladder.active:
+            logger.warning("Challenge server sends no reward_ladder: back to rewarding this validator's own winner")
+            self.reward_ladder.clear()
+
+    def effective_target(self) -> WeightTarget:
+        """The ladder's places at this moment when the server runs the ladder, else the legacy target."""
+        if not self.reward_ladder.active:
+            return self.weight_target
+        held = self.reward_ladder.places()
+        waiting = self.reward_ladder.in_probation()
+        reason = "record ladder" + (f", {waiting} record(s) in probation" if waiting else "")
+        target = WeightTarget.ladder(held, reason if held else f"no record being paid ({reason})")
+        if target != self._last_ladder_target:
+            logger.info(f"Weight target: {target.describe()} ({target.reason})")
+            self._last_ladder_target = target
+        return target
 
     def set_weights_with_ban_check(self, context: str = "", winner_hotkey: str = None):
         """Reward winner_hotkey (or burn when None). Bans, ban_emissions and the emission
@@ -95,14 +124,16 @@ class ChipForgeValidator:
     async def apply_weights(self):
         """Submit the current target if it changed or a refresh is due (see WeightManager)."""
         try:
+            self.refresh_reward_ladder()
+            target = self.effective_target()
             await self.weight_manager.apply(
-                self.weight_target, self._active_banned_coldkeys(), self.state.ban_emissions
+                target, self._active_banned_coldkeys(), self.state.ban_emissions
             )
             now = time.monotonic()
             if now - self._last_weight_status >= WEIGHT_STATUS_SECONDS:
                 self._last_weight_status = now
                 logger.info(self.weight_manager.status_line(
-                    self.weight_target, self._active_banned_coldkeys(), self.state.ban_emissions))
+                    target, self._active_banned_coldkeys(), self.state.ban_emissions))
         except Exception as e:
             logger.error(f"Error applying weights: {e}")
 
@@ -168,6 +199,9 @@ class ChipForgeValidator:
             refresh_seconds=int(os.getenv("WEIGHTS_REFRESH_SECONDS", "1200")),
         )
         self.weight_target = WeightTarget.burn("startup")
+        # Record ladder from the challenge server (kept on disk); decides the weights when active
+        self.reward_ladder = RewardLadder()
+        self._last_ladder_target = None
         self.metagraph_sync_seconds = int(os.getenv("METAGRAPH_SYNC_SECONDS", "600"))
         self._last_metagraph_sync = datetime.now(timezone.utc)
         self._stop = asyncio.Event()
