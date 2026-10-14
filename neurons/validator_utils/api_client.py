@@ -77,6 +77,11 @@ class APIClient:
         self.eda_max_concurrency = max(1, int(os.getenv("EDA_MAX_CONCURRENCY", "4")))
         # Seconds kept free before the server's evaluation deadline for submitting scores
         self.eda_deadline_buffer = int(os.getenv("EDA_DEADLINE_BUFFER_SECONDS", "90"))
+        # Of an EDA request's budget, the EDA server gets all but this: a run stopped at its limit
+        # then answers with where it stopped (EDA_TIMEOUT_<STAGE>) before this validator gives up.
+        self.eda_answer_margin = 60
+        # A submission whose EDA time limit would be shorter than this is not sent (it cannot finish)
+        self.eda_min_limit = 120
 
         # Directories
         self.base_dir = data_path('validator_data')
@@ -483,10 +488,22 @@ class APIClient:
             return dl_window + eval_window - 45 - self.eda_deadline_buffer
         return 2640
 
+    def _fair_limit(self, deadline: Optional[datetime], window_start: Optional[datetime]) -> Optional[float]:
+        """The run time every submission of the batch is entitled to: the evaluation window (from the
+        close of downloads to the deadline) minus the margins. An EDA run cut shorter than this (it waited
+        for an earlier submission, or the batch was picked up late) is not held against the submission."""
+        if deadline is None or window_start is None:
+            return None
+        fair = (deadline - window_start).total_seconds() - self.eda_deadline_buffer - self.eda_answer_margin
+        return fair if fair > 0 else None
+
     async def evaluate_submissions_with_eda_server(self, challenge_id: str, submissions: Dict[str, bytes],
-                                                   deadline: Optional[datetime] = None) -> Dict[str, Dict]:
+                                                   deadline: Optional[datetime] = None,
+                                                   window_start: Optional[datetime] = None) -> Dict[str, Dict]:
         """Evaluate submissions on the EDA server, at most EDA_MAX_CONCURRENCY at a time, each
-        within the time left before the server's evaluation deadline."""
+        within the time left before the server's evaluation deadline. The EDA server is told that time
+        (time_limit_s) and the time every submission of the batch is entitled to (fair_limit_s), so it
+        stops a run on the batch's clock and says whose fault a timeout is."""
         logger.info(f"Evaluating {len(submissions)} submissions with EDA server using test cases")
 
         if self.use_dummy_evaluation:
@@ -499,14 +516,20 @@ class APIClient:
             return {}
         evaluator_bytes = evaluator_zip_path.read_bytes()
         semaphore = asyncio.Semaphore(self.eda_max_concurrency)
+        fair_limit = self._fair_limit(deadline, window_start)
 
         async def evaluate_single_submission(submission_id: str, submission_data: bytes) -> tuple:
             async with semaphore:
                 budget = self._eda_time_budget(deadline)
-                if budget < 30:
+                eda_limit = budget - self.eda_answer_margin
+                if eda_limit < self.eda_min_limit:
                     return submission_id, self._generate_fallback_evaluation(
                         submission_id,
-                        evaluation_details={'status': 'timeout', 'error': 'No time left before the evaluation window closes'},
+                        evaluation_details=self._timeout_details(
+                            'VALIDATOR_NO_TIME_TO_START',
+                            f"Not sent to the EDA server: only {max(0, budget):.0f}s of the batch's evaluation time "
+                            "was left. Not a property of the submission: it will be evaluated again in a later batch.",
+                            budget=budget),
                         timeout_occurred=True,
                     )
                 form_data = aiohttp.FormData()
@@ -515,8 +538,12 @@ class APIClient:
                 form_data.add_field('evaluator_zip', evaluator_bytes, filename=f'{challenge_id}_validator.zip',
                                     content_type='application/zip')
                 form_data.add_field('submission_id', submission_id)
+                form_data.add_field('time_limit_s', f"{eda_limit:.0f}")
+                if fair_limit is not None:
+                    form_data.add_field('fair_limit_s', f"{fair_limit:.0f}")
                 logger.info(f"Sending {submission_id} to EDA server ({len(submission_data)} bytes, "
-                            f"time budget {budget:.0f}s)")
+                            f"time limit {eda_limit:.0f}s"
+                            + (f", full window {fair_limit:.0f}s" if fair_limit is not None else "") + ")")
                 try:
                     async with self.session.post(f"{self.eda_server_url}/evaluate", data=form_data,
                                                  timeout=aiohttp.ClientTimeout(total=budget)) as response:
@@ -527,18 +554,30 @@ class APIClient:
                         error_text = await response.text()
                         logger.error(f"EDA server error for {submission_id}: {response.status} - {error_text[:500]}")
                         return submission_id, self._generate_fallback_evaluation(
-                            submission_id, evaluation_details={'status': 'eda_http_error', 'http_status': response.status})
+                            submission_id, evaluation_details={
+                                'status': 'eda_http_error', 'code': 'VALIDATOR_EDA_HTTP_ERROR', 'where': 'validator',
+                                'http_status': response.status,
+                                'message': f"The EDA server answered HTTP {response.status}. Not a property of the "
+                                           "submission: it will be evaluated again in a later batch."})
                 except asyncio.TimeoutError:
                     logger.error(f"Timeout evaluating {submission_id} with EDA server after {budget:.0f}s")
                     return submission_id, self._generate_fallback_evaluation(
                         submission_id,
-                        evaluation_details={'status': 'timeout', 'error': f'EDA server evaluation timed out after {budget:.0f} seconds'},
+                        evaluation_details=self._timeout_details(
+                            'VALIDATOR_EDA_NO_RESPONSE',
+                            f"Timeout in the validator: the EDA server did not answer within the {budget:.0f}s left "
+                            "of the batch's evaluation time. Not a property of the submission: it will be "
+                            "evaluated again in a later batch.", budget=budget),
                         timeout_occurred=True,
                     )
                 except Exception as e:
                     logger.error(f"Exception during EDA evaluation for {submission_id}: {e}")
                     return submission_id, self._generate_fallback_evaluation(
-                        submission_id, evaluation_details={'status': 'eda_unreachable', 'error': str(e)[:300]})
+                        submission_id, evaluation_details={
+                            'status': 'eda_unreachable', 'code': 'VALIDATOR_EDA_UNREACHABLE', 'where': 'validator',
+                            'error': str(e)[:300],
+                            'message': "The validator could not reach its EDA server. Not a property of the "
+                                       "submission: it will be evaluated again in a later batch."})
 
         results = await asyncio.gather(
             *[evaluate_single_submission(sid, data) for sid, data in submissions.items()],
@@ -567,10 +606,12 @@ class APIClient:
             error = {'message': str(error)}
         if eda_result.get('result') == 'ERROR' or final_score.get('overall') is None:
             logger.error(f"EDA system error for {submission_id}: {error.get('code')} {error.get('message')}")
-            return self._generate_fallback_evaluation(submission_id, evaluation_details={
-                'status': 'eda_system_error', 'code': error.get('code'), 'stage': error.get('stage'),
-                'message': error.get('message'), 'retryable': error.get('retryable'),
-            })
+            details = {'status': 'eda_system_error', 'code': error.get('code'), 'stage': error.get('stage'),
+                       'where': error.get('where') or 'eda_server', 'message': error.get('message'),
+                       'retryable': error.get('retryable')}
+            if error.get('timing'):
+                details['timing'] = error['timing']
+            return self._generate_fallback_evaluation(submission_id, evaluation_details=details)
 
         # Extract functionality score from verilator results
         verilator_results = eda_result.get('verilator_results', {})
@@ -614,7 +655,8 @@ class APIClient:
 
         if error:
             # Miner-fault rejection: tell the miner what failed and where
-            details['error'] = {k: error.get(k) for k in ('code', 'stage', 'message', 'detail') if error.get(k)}
+            details['error'] = {k: error.get(k) for k in ('code', 'stage', 'where', 'message', 'detail', 'timing')
+                                if error.get(k)}
 
         openlane_success = openlane_results.get('success', False)
         if openlane_success:
@@ -654,6 +696,9 @@ class APIClient:
         if evaluation_details is None:
             evaluation_details = {'status': 'failed', 'error': 'EDA server unavailable or error occurred'}
 
+        code, message = evaluation_details.get('code'), evaluation_details.get('message')
+        notes = (f"Evaluation FAILED for {submission_id} - {code}: {message}" if code and message
+                 else f"Evaluation FAILED for {submission_id} - EDA server unavailable or error occurred")
         return {
             'overall_score': 0.0,
             'functionality_score': 0.0,
@@ -664,9 +709,18 @@ class APIClient:
             'functional_gate': False,
             'overall_gate': False,
             'timeout_occurred': timeout_occurred,
-            'evaluation_notes': f"Evaluation FAILED for {submission_id} - EDA server unavailable or error occurred",
+            'evaluation_notes': notes,
             'evaluation_details': json.dumps(evaluation_details),
         }
+
+    @staticmethod
+    def _timeout_details(code: str, message: str, budget: Optional[float] = None) -> Dict:
+        """evaluation_details of a timeout on the validator's side (never the submission's fault)."""
+        d = {'status': 'timeout', 'code': code, 'where': 'validator', 'message': message,
+             'error': message, 'retryable': True}
+        if budget is not None:
+            d['timing'] = {'budget_s': round(max(0.0, budget), 1)}
+        return d
 
     def build_timeout_evaluation(self, submission_id: str, timeout_seconds: int) -> Dict:
         """Build a zero-score evaluation dict for a submission that timed out at the batch level"""
@@ -680,8 +734,13 @@ class APIClient:
             'functional_gate': False,
             'overall_gate': False,
             'timeout_occurred': True,
-            'evaluation_notes': f"Evaluation timed out for {submission_id} - batch processing exceeded {timeout_seconds}s time limit",
-            'evaluation_details': json.dumps({'status': 'batch_timeout', 'error': f'Batch processing timed out after {timeout_seconds} seconds'}),
+            'evaluation_notes': (f"Evaluation timed out for {submission_id} - VALIDATOR_BATCH_TIMEOUT: the batch was not "
+                                 f"finished within its {timeout_seconds:.0f}s"),
+            'evaluation_details': json.dumps({
+                'status': 'batch_timeout', 'code': 'VALIDATOR_BATCH_TIMEOUT', 'where': 'validator', 'retryable': True,
+                'error': f'Batch processing timed out after {timeout_seconds:.0f} seconds',
+                'message': (f"Timeout in the validator: the batch was not finished within its {timeout_seconds:.0f}s. "
+                            "Not a property of the submission: it will be evaluated again in a later batch.")}),
         }
 
     async def _dummy_evaluate_submissions(self, submissions: Dict[str, bytes]) -> Dict[str, Dict]:

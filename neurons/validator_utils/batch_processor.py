@@ -157,7 +157,8 @@ class BatchProcessor:
             # Evaluate with EDA server, within the server's evaluation deadline for this batch
             logger.info(f"Evaluating {len(downloaded_submissions)} submissions with EDA server")
             evaluations = await self.api_client.evaluate_submissions_with_eda_server(
-                challenge_id, downloaded_submissions, deadline=parse_server_time(batch.get('evaluation_ends_at'))
+                challenge_id, downloaded_submissions, deadline=parse_server_time(batch.get('evaluation_ends_at')),
+                window_start=parse_server_time(batch.get('expires_at'))
             )
             if not evaluations:
                 logger.error(f"No evaluations received from EDA server")

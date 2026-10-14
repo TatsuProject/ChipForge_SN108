@@ -304,6 +304,17 @@ How many submissions a batch holds is set by the challenge server, and the valid
 them. `EDA_MAX_CONCURRENCY` only limits how many it sends to its EDA server at once (the rest wait their
 turn within the batch's deadline), so set it to what your EDA machine can run in parallel.
 
+How long an evaluation may run is set by the challenge server alone: every batch has an evaluation
+deadline. With each submission the validator sends its EDA server the time left before that deadline
+(`time_limit_s`, minus `EDA_DEADLINE_BUFFER_SECONDS` for submitting scores and a minute for the answer)
+and the time every submission of the batch is entitled to (`fair_limit_s`, the evaluation window minus
+the same margins). The EDA server stops a run at its limit and says where (`EDA_TIMEOUT_BUILD`,
+`EDA_TIMEOUT_SIMULATION`, ...). A run that had the full window and still timed out scores 0; one cut
+shorter (it waited for an earlier submission) is reported as a failed evaluation, and the challenge
+server evaluates it again in a later batch. Timeouts on the validator's side are named too
+(`VALIDATOR_NO_TIME_TO_START`, `VALIDATOR_EDA_NO_RESPONSE`, `VALIDATOR_BATCH_TIMEOUT`). An EDA server
+older than this ignores the two fields and applies its own `EVAL_TIMEOUT_S`.
+
 **Record ladder.** The challenge server decides the records (when a batch closes, from every
 validator's results) and sends, in `/validator/sync`, the ladder rules and every record in probation or
 being paid, each with its window (`pays_from` = end of probation, `pays_until`). The validator computes

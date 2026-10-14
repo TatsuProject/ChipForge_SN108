@@ -1,6 +1,7 @@
 """Validator <-> EDA server and download handling (Phase B)."""
 import asyncio
 import hashlib
+import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -172,3 +173,95 @@ async def test_eda_preflight(client_factory):
     def refuse(kw):
         raise OSError("connection refused")
     assert not await client_factory(refuse).eda_server_ready()
+
+
+# --- the batch deadline travels to the EDA server (time_limit_s / fair_limit_s) ---------------
+
+def _form_fields(call):
+    """The plain (non-file) form fields of a recorded EDA request."""
+    out = {}
+    for type_options, _headers, value in call[1]["data"]._fields:
+        if "filename" not in type_options:
+            out[type_options["name"]] = value
+    return out
+
+
+async def test_eda_gets_the_time_left_and_the_full_window(client_factory):
+    client = client_factory(lambda kw: FakeResponse(json_data=ACCEPTED))
+    now = datetime.now(timezone.utc)
+    deadline, window_start = now + timedelta(seconds=3600), now - timedelta(seconds=60)
+    await client.evaluate_submissions_with_eda_server("c1", {"s1": b"PK"}, deadline=deadline, window_start=window_start)
+    fields = _form_fields(client.session.calls[0])
+    budget = client.session.calls[0][1]["timeout"].total
+    # the EDA server gets the budget minus the margin for its answer; the validator waits the whole budget
+    assert abs(float(fields["time_limit_s"]) - (budget - client.eda_answer_margin)) <= 1
+    want_fair = 3660 - client.eda_deadline_buffer - client.eda_answer_margin
+    assert abs(float(fields["fair_limit_s"]) - want_fair) <= 1
+
+
+async def test_without_a_window_start_no_fair_limit_is_sent(client_factory):
+    client = client_factory(lambda kw: FakeResponse(json_data=ACCEPTED))
+    await client.evaluate_submissions_with_eda_server("c1", {"s1": b"PK"},
+                                                      deadline=datetime.now(timezone.utc) + timedelta(seconds=900))
+    fields = _form_fields(client.session.calls[0])
+    assert "time_limit_s" in fields and "fair_limit_s" not in fields
+
+
+EDA_MINER_TIMEOUT = {"success": True, "result": "REJECTED", "functionality_score": 0.0,
+                     "error": {"code": "EDA_TIMEOUT_BUILD", "category": "timeout", "fault": "miner", "retryable": False,
+                               "stage": "build", "where": "eda_server/verilator",
+                               "message": "Timeout in the EDA server (verilator) during building the simulator",
+                               "timing": {"limit_s": 3500.0, "used_s": 3500.2, "queued_s": 0.0,
+                                          "limited_by": "batch_deadline"}},
+                     "final_score": {"overall": 0.0, "overall_gate": False, "functional_gate": False}}
+EDA_SYSTEM_TIMEOUT = {"success": False, "result": "ERROR",
+                      "error": {"code": "EDA_TIMEOUT_SIMULATION", "category": "timeout", "fault": "system",
+                                "retryable": True, "stage": "simulation", "where": "eda_server/verilator",
+                                "message": "Timeout in the EDA server (verilator) during the model simulations",
+                                "timing": {"limit_s": 900.0, "queued_s": 2600.0}},
+                      "final_score": {"overall": None, "overall_gate": False, "scored": False}}
+
+
+async def test_eda_timeout_with_the_full_window_is_the_miners_zero_with_where_and_timing(client_factory):
+    client = client_factory(lambda kw: FakeResponse(json_data=EDA_MINER_TIMEOUT))
+    ev = (await client.evaluate_submissions_with_eda_server("c1", {"s1": b"PK"}))["s1"]
+    assert ev["overall_score"] == 0.0 and not ev["timeout_occurred"] and "FAILED" not in ev["evaluation_notes"].upper()
+    assert "EDA_TIMEOUT_BUILD (build)" in ev["evaluation_notes"]
+    err = json.loads(ev["evaluation_details"])["error"]
+    assert err["code"] == "EDA_TIMEOUT_BUILD" and err["where"] == "eda_server/verilator"
+    assert err["timing"]["limit_s"] == 3500.0
+
+
+async def test_eda_timeout_cut_short_is_a_retryable_failure_naming_where(client_factory):
+    client = client_factory(lambda kw: FakeResponse(json_data=EDA_SYSTEM_TIMEOUT))
+    ev = (await client.evaluate_submissions_with_eda_server("c1", {"s1": b"PK"}))["s1"]
+    assert "FAILED" in ev["evaluation_notes"].upper() and "EDA_TIMEOUT_SIMULATION" in ev["evaluation_notes"]
+    d = json.loads(ev["evaluation_details"])
+    assert d["status"] == "eda_system_error" and d["where"] == "eda_server/verilator" and d["timing"]["queued_s"] == 2600.0
+
+
+async def test_eda_not_answering_in_time_is_a_validator_timeout(client_factory):
+    def hang(kw):
+        raise asyncio.TimeoutError()
+    client = client_factory(hang)
+    ev = (await client.evaluate_submissions_with_eda_server(
+        "c1", {"s1": b"PK"}, deadline=datetime.now(timezone.utc) + timedelta(seconds=900)))["s1"]
+    d = json.loads(ev["evaluation_details"])
+    assert ev["timeout_occurred"] is True and d["code"] == "VALIDATOR_EDA_NO_RESPONSE" and d["where"] == "validator"
+    assert "VALIDATOR_EDA_NO_RESPONSE" in ev["evaluation_notes"] and "FAILED" in ev["evaluation_notes"].upper()
+
+
+async def test_no_time_to_start_names_the_validator(client_factory):
+    client = client_factory(lambda kw: FakeResponse(json_data=ACCEPTED))
+    deadline = datetime.now(timezone.utc) + timedelta(seconds=client.eda_deadline_buffer + client.eda_answer_margin + 60)
+    ev = (await client.evaluate_submissions_with_eda_server("c1", {"s1": b"PK"}, deadline=deadline))["s1"]
+    d = json.loads(ev["evaluation_details"])
+    assert client.session.calls == [] and ev["timeout_occurred"] is True
+    assert d["code"] == "VALIDATOR_NO_TIME_TO_START" and d["retryable"] is True
+
+
+def test_batch_timeout_evaluation_names_the_validator(client_factory):
+    client = client_factory(lambda kw: FakeResponse(json_data=ACCEPTED))
+    ev = client.build_timeout_evaluation("s1", 1234.5)
+    d = json.loads(ev["evaluation_details"])
+    assert ev["timeout_occurred"] is True and d["code"] == "VALIDATOR_BATCH_TIMEOUT" and "1234s" in d["message"]
