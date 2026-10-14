@@ -809,10 +809,12 @@ class ChipForgeValidator:
                 self._target_current_challenge_reward()
                 return
 
-            # Time budget: the server's evaluation deadline for this batch, not our pickup time
+            # Time budget: the server's evaluation deadline for this batch, not our pickup time. Results
+            # are accepted until results_due_at (the deadline plus the server's grace for submitting
+            # them); the EDA evaluations themselves stop before evaluation_ends_at (api_client).
             _BATCH_SAFETY_BUFFER = 15
             _MIN_BATCH_SECONDS = int(os.getenv("MIN_BATCH_SECONDS", "180"))
-            deadline = parse_server_time(batch.get('evaluation_ends_at'))
+            deadline = parse_server_time(batch.get('results_due_at')) or parse_server_time(batch.get('evaluation_ends_at'))
             if deadline is not None:
                 batch_timeout = (deadline - datetime.now(timezone.utc)).total_seconds() - _BATCH_SAFETY_BUFFER
                 if batch_timeout < _MIN_BATCH_SECONDS:
