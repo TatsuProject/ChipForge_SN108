@@ -137,7 +137,9 @@ async def test_new_winner_waits_for_rate_limit_then_goes_out():
     wm, subtensor = _manager(rate_limited=True)
     assert await wm.apply(WeightTarget.winner("hk_winner")) is False
     assert subtensor.set_weights.call_count == 0
-    subtensor.blocks_since_last_update.return_value = 100       # window reopens
+    subtensor.blocks_since_last_update.return_value = 100       # exactly the limit: the chain refuses it
+    assert await wm.apply(WeightTarget.winner("hk_winner")) is False
+    subtensor.blocks_since_last_update.return_value = 102       # two blocks of margin: goes out
     assert await wm.apply(WeightTarget.winner("hk_winner")) is True
     assert subtensor.set_weights.call_count == 1
 

@@ -121,11 +121,11 @@ def report(records: List[Dict], now: datetime, size: int, ratio: float,
     probation = sum(record_state(r, now) == "probation" for r in records)
     if not rows:
         return (), ["Reward ladder: no record in probation or being paid - the miners' share is burned"]
-    burned = 100.0 if not paid_total else 100.0 - miner_percentage
     head = (f"Reward ladder ({size} places, ratio {ratio:g}): {paying} paying, {probation} in probation; "
-            f"miners get {miner_percentage:g}% of the weight, burn {burned:g}%"
-            + ("" if paid_total else " (nothing payable now: the miners' share is burned too)")
-            + (" (unpaid places' share goes to the paid ones)" if 0 < paid_total < 0.999999 else ""))
+            + (f"miners get {miner_percentage:g}% of the weight, burn {100.0 - miner_percentage:g}%"
+               + (" (unpaid places' share goes to the paid ones)" if paid_total < 0.999999 else "")
+               if paid_total else
+               f"nothing payable now: burn 100% (miners' share {miner_percentage:g}% when a record is paid)"))
     return tuple(sig) + (miner_percentage,), [head] + rows
 
 

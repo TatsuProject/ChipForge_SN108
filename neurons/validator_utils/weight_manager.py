@@ -227,7 +227,9 @@ class WeightManager:
             limit = self.subtensor.weights_rate_limit(netuid=self.config.netuid)
             if since is None or limit is None:
                 return True
-            return int(since) >= int(limit)
+            # Two blocks of margin: on testnet (2026-10-15) every set_weights sent as soon as
+            # since reached the limit was refused, and the retry 2-3 blocks later went through
+            return int(since) >= int(limit) + 2
         except Exception as e:
             logger.debug(f"Could not read weights rate limit: {e}")
             return True

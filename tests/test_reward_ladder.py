@@ -196,3 +196,103 @@ def test_ladder_report_is_logged_once_per_change_and_legacy_lines_go_to_debug(tm
     v.api_client._sync_state = {"challenge": None}          # older server: the own-winner logs are back
     v.refresh_reward_ladder()
     assert not RewardLog.ladder_active
+
+
+# --- corner cases (audit 2026-10-15): bans, emissions ban, voids, restarts, boundaries -------------
+# The server's side of each case is in chipforge_challenge_server tests/test_core_flows.py.
+
+def _paying(sid, hotkey, decided_hours_ago, score=1.0):
+    return rec(sid, hotkey, decided_hours_ago, score, probation=1, paid=24)
+
+
+def test_banned_in_probation_is_not_paid_once_its_window_opens():
+    """Banned while in probation: when the window opens the place is skipped and its share goes
+    to the others; banned alone = burn."""
+    recs = [rec("b", "H_banned", 0.5, 50, probation=1, paid=24), _paying("d", "HD", 5)]
+    later = NOW + timedelta(hours=1)                                       # b's probation is over
+    target = WeightTarget.ladder(rl.places(recs, later, 3, 0.6), "t")
+    assert [hk for hk, _ in target.places] == ["H_banned", "HD"]           # the ban does not move places
+    uids, weights, desc = _manager(10.0).build(target, banned_coldkeys={"ck_bad"})
+    assert uids == [0, 2] and weights == [0.9, 0.1] and "banned" in desc   # HD gets the whole 10%
+    alone = WeightTarget.ladder(rl.places(recs[:1], later, 3, 0.6), "t")
+    assert _manager(10.0).build(alone, banned_coldkeys={"ck_bad"})[:2] == ([0], [1.0])
+    assert _manager(10.0).build(alone)[:2] == ([0, 5], [0.9, 0.1])         # unbanned: paid again
+
+
+def test_challenge_scoped_ban_stops_applying_when_the_quest_is_no_longer_current(tmp_path, monkeypatch):
+    """GAP: a ban scoped to quest A is enforced only while A is the validator's current quest. After
+    A ends (or B starts), A's records are still in their paid windows and the banned miner is paid."""
+    monkeypatch.setenv("CHIPFORGE_DATA_DIR", str(tmp_path))
+    from validator_utils.banned_coldkeys import BannedColdkeysManager
+    bans = BannedColdkeysManager()
+    bans.update_from_response("quest_a", {"bans": [{"coldkey": "ck_bad", "scope": "challenge", "challenge_id": "quest_a"}]})
+    assert bans.get_active_ban_set("quest_a") == {"ck_bad"}
+    assert bans.get_active_ban_set(None) == set()                         # quest A over: no active quest
+    assert bans.get_active_ban_set("quest_b") == set()                    # quest B running
+    target = WeightTarget(None, "t", (("H_banned", 1.0),))
+    assert _manager(10.0).build(target, banned_coldkeys=bans.get_active_ban_set(None))[:2] == ([0, 5], [0.9, 0.1])
+    # a permanent ban survives (cached on disk)
+    bans.update_from_response("quest_a", {"bans": [{"coldkey": "ck_bad", "scope": "permanent"}]})
+    assert BannedColdkeysManager().get_active_ban_set(None) == {"ck_bad"}
+
+
+def test_ban_emissions_burns_everything_and_the_report_says_so():
+    recs = [_paying("d", "HD", 5), _paying("c", "HC", 4)]
+    target = WeightTarget.ladder(rl.places(recs, NOW, 3, 0.6), "t")
+    assert _manager(10.0).build(target, ban_emissions=True)[:2] == ([0], [1.0])
+    _, lines = rl.report(recs, NOW, 3, 0.6, lambda hk: _manager(10.0).payability(hk), 0.0)
+    assert "miners get 0% of the weight, burn 100%" in lines[0] and "-> 0.00% of all weight" in lines[1]
+
+
+def test_voided_record_stops_being_paid_on_the_next_sync_but_not_while_the_server_is_down(tmp_path, monkeypatch):
+    soon = datetime.now(timezone.utc)
+    a = {"submission_id": "a", "hotkey": "HD", "score": 1, "qualified_at": (soon - timedelta(hours=30)).isoformat(),
+         "pays_from": (soon - timedelta(hours=6)).isoformat(), "pays_until": (soon + timedelta(hours=18)).isoformat()}
+    b = {**a, "submission_id": "b", "hotkey": "HC", "qualified_at": (soon - timedelta(hours=29)).isoformat()}
+    v = _validator(tmp_path, monkeypatch, {"reward_ladder": {"size": 3, "decay_ratio": 0.6, "records": [a, b]}})
+    v.refresh_reward_ladder()
+    assert [hk for hk, _ in v.effective_target().places] == ["HC", "HD"]
+    v.api_client._sync_state = None                                       # server down: keeps paying b
+    v.refresh_reward_ladder()
+    assert [hk for hk, _ in v.effective_target().places] == ["HC", "HD"]
+    v.api_client._sync_state = {"reward_ladder": {"size": 3, "decay_ratio": 0.6, "records": [a]}}   # b voided
+    v.refresh_reward_ladder()
+    assert v.effective_target().places == (("HD", 1.0),)
+    assert rl.RewardLadder().schedule["records"] == [a]                   # a restart keeps the new schedule
+
+
+def test_deregistered_then_re_registered_miner_is_paid_under_its_new_uid():
+    target = WeightTarget(None, "t", (("HA", 0.6), ("HD", 0.4)))
+    wm = _manager(100.0)
+    assert wm.build(target)[:2] == ([4, 2], [0.6, 0.4])
+    wm.metagraph.hotkeys[4] = "someone_else"                              # HA deregistered
+    assert wm.build(target)[:2] == ([2], [1.0])
+    wm.metagraph.hotkeys[3] = "HA"                                        # HA back under UID 3
+    assert wm.build(target)[:2] == ([3, 2], [0.6, 0.4])
+
+
+def test_unpayable_record_still_holds_a_place():
+    """Places are chosen before payability: a banned (or unregistered) newer record takes a place,
+    so an older payable record beyond `size` is not paid; the share goes to the paid places."""
+    recs = [_paying("new", "H_banned", 3), _paying("mid", "HD", 4), _paying("old", "HC", 5)]
+    target = WeightTarget.ladder(rl.places(recs, NOW, 2, 0.6), "t")
+    assert [hk for hk, _ in target.places] == ["H_banned", "HD"]           # HC is third: no place
+    uids, weights, _ = _manager(100.0).build(target, banned_coldkeys={"ck_bad"})
+    assert uids == [2] and weights == [1.0]
+
+
+def test_window_boundaries():
+    r = rec("x", "HD", 10, 1, probation=2, paid=3)
+    starts, ends = rl._time(r["pays_from"]), rl._time(r["pays_until"])
+    assert rl.record_state(r, starts - timedelta(microseconds=1)) == "probation"
+    assert rl.record_state(r, starts) == "paying"
+    assert rl.record_state(r, ends - timedelta(microseconds=1)) == "paying"
+    assert rl.record_state(r, ends) == "finished"
+    zero = rec("z", "HD", 0, 1, probation=0, paid=1)                       # PROBATION_HOURS=0: paid at once
+    assert rl.record_state(zero, NOW) == "paying"
+
+
+def test_miner_emission_percentage_extremes():
+    target = WeightTarget(None, "t", (("HD", 0.6), ("HC", 0.4)))
+    assert _manager(0.0).build(target)[:2] == ([0], [1.0])
+    assert _manager(100.0).build(target)[:2] == ([2, 3], [0.6, 0.4])       # no burn UID entry at all

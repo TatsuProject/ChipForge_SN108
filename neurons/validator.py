@@ -595,7 +595,7 @@ class ChipForgeValidator:
                         grace_period_minutes = grace_period_elapsed / 60
                         
                         if grace_period_elapsed < 600:  # 10 minutes = 600 seconds
-                            logger.info(f"Grace period active ({grace_period_minutes:.1f}/10 min) - waiting for {self.state.last_challenge_id}")
+                            info_on_change(logger, "grace_period", f"Grace period active (up to 10 min) - waiting for {self.state.last_challenge_id}")
                             
                             # Check emission manager for reward eligibility
                             current_challenge_score = self.state.current_challenge_best[1]
@@ -662,7 +662,7 @@ class ChipForgeValidator:
                     reward_hotkey = self.emission_manager.get_reward_hotkey()
 
                     if reward_hotkey:
-                        logger.info(f"No active challenge, but rewarding winner {reward_hotkey[:12]}... (emission manager active)")
+                        info_on_change(reward_log, "reward_target", f"No active challenge, but rewarding winner {reward_hotkey[:12]}... (emission manager active)")
                         self.set_weights_with_ban_check(context="no active challenge - emission manager winner", winner_hotkey=reward_hotkey)
                     else:
                         reward_log.info("No active challenge, no winner reward period - burning emissions")
@@ -832,7 +832,7 @@ class ChipForgeValidator:
                 else:
                     batch_id = batch['batch_id']
                     if batch_id in self.state.evaluated_batches:
-                        logger.info(f"Batch {batch_id} already processed")
+                        info_on_change(logger, "batch_processed", f"Batch {batch_id} already processed")
                         already_processed_batch = True
 
             if not batch or already_processed_batch:
