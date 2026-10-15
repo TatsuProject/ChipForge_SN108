@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 load_dotenv()
 from .api_client import parse_server_time
 from .storage import data_path
+from .logutil import RewardLog
 from .weight_manager import WeightTarget
 
 
@@ -51,10 +52,29 @@ def explain(score: float, target: float, what: str = "score to beat", margin: Op
     return f"{head}: does not beat it"
 
 logger = logging.getLogger(__name__)
+reward_log = RewardLog(logger)   # this validator's own winner tracking: DEBUG while the record ladder decides
 
 
 class BatchProcessor:
     """Handles batch processing logic for the validator"""
+
+    @staticmethod
+    def _log_results(batch: Dict, results: Dict, hotkeys: Dict, score_to_beat: float, margin: float) -> None:
+        """One line per result of this batch, against the server's score to beat. With the record
+        ladder the server decides records when the batch closes, from every validator's results."""
+        uids = {s['submission_id']: s.get('miner_uid') for s in batch.get('submissions', [])}
+        for sid, ev in results.items():
+            hk = hotkeys.get(sid) or ""
+            who = f"{sid[:8]} (UID {uids.get(sid) if uids.get(sid) is not None else '?'}, {hk[:8]}...)"
+            score = float(ev.get('overall_score') or 0)
+            if not (ev.get('functional_gate') and ev.get('overall_gate')):
+                logger.info(f"Result {who}: score {score:.4f}, EDA gates failed (functional={bool(ev.get('functional_gate'))}, "
+                            f"overall={bool(ev.get('overall_gate'))}) - cannot set a record")
+            elif beats(score, score_to_beat, margin):
+                logger.info(f"Result {who}: {explain(score, score_to_beat, margin=margin)} - "
+                            f"candidate record; the server decides when the batch closes")
+            else:
+                logger.info(f"Result {who}: {explain(score, score_to_beat, margin=margin)} - not a record")
     
     def __init__(self, api_client, state, emission_manager, set_weight_target):
         self.api_client = api_client
@@ -189,7 +209,10 @@ class BatchProcessor:
 
             current_best_hotkey, current_best_score = self.state.current_challenge_best
 
-            logger.info(f"Current challenge best: {current_best_hotkey[:12] if current_best_hotkey else 'None'}... -> {current_best_score}")
+            reward_log.info(f"Current challenge best: {current_best_hotkey[:12] if current_best_hotkey else 'None'}... -> {current_best_score}")
+            if RewardLog.ladder_active:
+                self._log_results(batch, successful_submissions, submission_hotkeys,
+                                  evaluation_baseline_snapshot, margin_snapshot)
 
             # Find if any submission in this batch beats the challenge-wide best AND baseline SNAPSHOT
             new_champion = None
@@ -204,7 +227,7 @@ class BatchProcessor:
                 overall_gate = eval_data.get('overall_gate', False)
 
                 if not functional_gate or not overall_gate:
-                    logger.info(f"Submission {submission_id} ({hotkey[:12] if hotkey else 'unknown'}...) FAILED gates - functional_gate: {functional_gate}, overall_gate: {overall_gate} - skipping winner comparison")
+                    reward_log.info(f"Submission {submission_id} ({hotkey[:12] if hotkey else 'unknown'}...) FAILED gates - functional_gate: {functional_gate}, overall_gate: {overall_gate} - skipping winner comparison")
                     continue
 
                 # Check if score beats both current best AND baseline snapshot (from BEFORE submission)
@@ -212,12 +235,12 @@ class BatchProcessor:
                     if beats(overall_score, evaluation_baseline_snapshot, margin_snapshot):
                         new_best_score = overall_score
                         new_champion = hotkey
-                        logger.info(f"New challenge champion found: {hotkey[:12]}... -> {overall_score} (beats previous: {current_best_score} and baseline snapshot: {evaluation_baseline_snapshot})")
+                        reward_log.info(f"New challenge champion found: {hotkey[:12]}... -> {overall_score} (beats previous: {current_best_score} and baseline snapshot: {evaluation_baseline_snapshot})")
                     else:
-                        logger.info(f"Submission {submission_id} ({hotkey[:12]}...) not eligible for reward: "
+                        reward_log.info(f"Submission {submission_id} ({hotkey[:12]}...) not eligible for reward: "
                                     f"{explain(overall_score, evaluation_baseline_snapshot, 'baseline snapshot', margin_snapshot)}")
                 elif hotkey:
-                    logger.info(f"Submission {submission_id} ({hotkey[:12]}...) not a new winner: "
+                    reward_log.info(f"Submission {submission_id} ({hotkey[:12]}...) not a new winner: "
                                 f"{explain(overall_score, new_best_score, 'challenge best', margin_snapshot)}")
 
             # Update challenge-wide best if we found a new champion
@@ -236,20 +259,20 @@ class BatchProcessor:
 
             else:
                 # No new champion found - check emission management policy
-                logger.info(f"No submissions beat challenge best of {current_best_score}")
+                reward_log.info(f"No submissions beat challenge best of {current_best_score}")
 
                 # Get reward hotkey from emission manager (NO baseline check - winner already qualified)
                 reward_hotkey = self.emission_manager.get_reward_hotkey(current_best_hotkey, current_best_score)
                 should_burn = self.emission_manager.should_burn_emissions(current_best_score)
 
                 if reward_hotkey and not should_burn:
-                    logger.info(f"Challenge active, winner {reward_hotkey[:12]}... taking reward until next good submission")
+                    reward_log.info(f"Challenge active, winner {reward_hotkey[:12]}... taking reward until next good submission")
                     self.set_weight_target(WeightTarget.winner(reward_hotkey, "current winner"))
                 else:
                     if self.emission_manager.current_winner:
-                        logger.info("Challenge active, submissions found but winner reward period expired - burning emissions")
+                        reward_log.info("Challenge active, submissions found but winner reward period expired - burning emissions")
                     else:
-                        logger.info("Challenge active, submissions checking but no qualified winner - burning emissions")
+                        reward_log.info("Challenge active, submissions checking but no qualified winner - burning emissions")
                     self.set_weight_target(WeightTarget.burn("no qualified winner"))
 
             # Mark batch as processed

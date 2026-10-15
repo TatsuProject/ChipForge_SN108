@@ -31,7 +31,7 @@ from validator_utils import (
 from chipforge.heartbeat import heartbeat_loop
 from validator_utils.weight_manager import WeightTarget
 from validator_utils.reward_ladder import RewardLadder
-from validator_utils.logutil import info_on_change
+from validator_utils.logutil import RewardLog, info_on_change
 
 # How often the validator logs what is on chain and what it wants (seconds)
 WEIGHT_STATUS_SECONDS = int(os.getenv("WEIGHT_STATUS_SECONDS", "300"))
@@ -40,6 +40,7 @@ from validator_utils.api_client import parse_server_time
 # Configure logging with daily rotation
 setup_validator_logging(log_level="INFO")
 logger = logging.getLogger(__name__)
+reward_log = RewardLog(logger)   # own-winner reward path: DEBUG while the record ladder decides
 
 
 class ChipForgeValidator:
@@ -98,6 +99,7 @@ class ChipForgeValidator:
         elif self.reward_ladder.active:
             logger.warning("Challenge server sends no reward_ladder: back to rewarding this validator's own winner")
             self.reward_ladder.clear()
+        RewardLog.ladder_active = self.reward_ladder.active
 
     def effective_target(self) -> WeightTarget:
         """The ladder's places at this moment when the server runs the ladder, else the legacy target."""
@@ -108,8 +110,15 @@ class ChipForgeValidator:
         reason = "record ladder" + (f", {waiting} record(s) in probation" if waiting else "")
         target = WeightTarget.ladder(held, reason if held else f"no record being paid ({reason})")
         if target != self._last_ladder_target:
-            logger.info(f"Weight target: {target.describe()} ({target.reason})")
+            logger.debug(f"Weight target: {target.describe()} ({target.reason})")
             self._last_ladder_target = target
+        banned = self._active_banned_coldkeys()
+        miner_pct = 0.0 if self.state.ban_emissions else self.weight_manager.miner_emission_percentage
+        signature, lines = self.reward_ladder.report(lambda hk: self.weight_manager.payability(hk, banned), miner_pct)
+        if signature != self._last_ladder_report:
+            self._last_ladder_report = signature
+            for line in lines:
+                logger.info(line)
         return target
 
     def set_weights_with_ban_check(self, context: str = "", winner_hotkey: str = None):
@@ -201,7 +210,9 @@ class ChipForgeValidator:
         self.weight_target = WeightTarget.burn("startup")
         # Record ladder from the challenge server (kept on disk); decides the weights when active
         self.reward_ladder = RewardLadder()
+        RewardLog.ladder_active = self.reward_ladder.active
         self._last_ladder_target = None
+        self._last_ladder_report = None
         self.metagraph_sync_seconds = int(os.getenv("METAGRAPH_SYNC_SECONDS", "600"))
         self._last_metagraph_sync = datetime.now(timezone.utc)
         self._stop = asyncio.Event()
@@ -313,7 +324,7 @@ class ChipForgeValidator:
                         remaining_time = remaining_seconds / 3600
                 
                 if remaining_time and remaining_time > 0:
-                    logger.info(f"Challenge has expired, decided winner {self.emission_manager.current_winner[:12]}... is taking reward, remaining time {remaining_time:.1f}h")
+                    reward_log.info(f"Challenge has expired, decided winner {self.emission_manager.current_winner[:12]}... is taking reward, remaining time {remaining_time:.1f}h")
                 else:
                     logger.info("Challenge has expired, winner reward period also expired")
             
@@ -463,10 +474,10 @@ class ChipForgeValidator:
             return
         reward_hotkey = self.emission_manager.get_reward_hotkey(current_best_hotkey, current_best_score)
         if reward_hotkey:
-            info_on_change(logger, "reward_target", f"Rewarding current challenge winner {reward_hotkey[:12]}... (reward window active)")
+            info_on_change(reward_log, "reward_target", f"Rewarding current challenge winner {reward_hotkey[:12]}... (reward window active)")
             self.set_weights_with_ban_check(context="current challenge winner", winner_hotkey=reward_hotkey)
         else:
-            info_on_change(logger, "reward_target", "No winner in its reward window - burning emissions")
+            info_on_change(reward_log, "reward_target", "No winner in its reward window - burning emissions")
             self.burn_weights("no reward target")
 
     async def run_evaluation_cycle(self):
@@ -517,7 +528,7 @@ class ChipForgeValidator:
                             current_challenge_score = self.state.current_challenge_best[1]
                             
                             if self.emission_manager.should_burn_emissions(current_challenge_score):
-                                logger.info("Server unreachable - burning emissions (reward period expired)")
+                                reward_log.info("Server unreachable - burning emissions (reward period expired)")
                                 self.burn_weights("no reward target")
                             else:
                                 # Get reward hotkey from emission manager (respects timer)
@@ -526,10 +537,10 @@ class ChipForgeValidator:
                                 
                                 reward_hotkey = self.emission_manager.get_reward_hotkey(current_best_hotkey, current_best_score)
                                 if reward_hotkey:
-                                    logger.info(f"Server unreachable - using cached winner {reward_hotkey[:12]}... (reward period active)")
+                                    reward_log.info(f"Server unreachable - using cached winner {reward_hotkey[:12]}... (reward period active)")
                                     self.set_weights_with_ban_check(context="server unreachable - cached winner", winner_hotkey=reward_hotkey)
                                 else:
-                                    logger.info("Server unreachable - no qualified winner, burning emissions")
+                                    reward_log.info("Server unreachable - no qualified winner, burning emissions")
                                     self.burn_weights("no reward target")
                         else:
                             logger.info(f"Cached state: {self.state.last_challenge_id} expired locally")
@@ -561,7 +572,7 @@ class ChipForgeValidator:
                         current_challenge_score = self.state.current_challenge_best[1]
                         
                         if self.emission_manager.should_burn_emissions(current_challenge_score):
-                            logger.info("Grace period started - burning emissions (no active reward period)")
+                            reward_log.info("Grace period started - burning emissions (no active reward period)")
                             self.burn_weights("no reward target")
                         else:
                             # Get reward hotkey from emission manager (respects timer)
@@ -570,10 +581,10 @@ class ChipForgeValidator:
                             
                             reward_hotkey = self.emission_manager.get_reward_hotkey(current_best_hotkey, current_best_score)
                             if reward_hotkey:
-                                logger.info(f"Grace period: Using cached winner {reward_hotkey[:12]}... (reward period active)")
+                                reward_log.info(f"Grace period: Using cached winner {reward_hotkey[:12]}... (reward period active)")
                                 self.set_weights_with_ban_check(context="grace period - cached winner", winner_hotkey=reward_hotkey)
                             else:
-                                logger.info("Grace period: No qualified winner - burning emissions")
+                                reward_log.info("Grace period: No qualified winner - burning emissions")
                                 self.burn_weights("no reward target")
 
                         self.next_batch_check = datetime.now(timezone.utc) + timedelta(seconds=30)
@@ -590,7 +601,7 @@ class ChipForgeValidator:
                             current_challenge_score = self.state.current_challenge_best[1]
                             
                             if self.emission_manager.should_burn_emissions(current_challenge_score):
-                                logger.info("Grace period active - burning emissions (reward period expired)")
+                                reward_log.info("Grace period active - burning emissions (reward period expired)")
                                 self.burn_weights("no reward target")
                             else:
                                 # Get reward hotkey from emission manager (respects timer)
@@ -599,10 +610,10 @@ class ChipForgeValidator:
                                 
                                 reward_hotkey = self.emission_manager.get_reward_hotkey(current_best_hotkey, current_best_score)
                                 if reward_hotkey:
-                                    logger.info(f"Grace period: Using cached winner {reward_hotkey[:12]}... (reward period active)")
+                                    reward_log.info(f"Grace period: Using cached winner {reward_hotkey[:12]}... (reward period active)")
                                     self.set_weights_with_ban_check(context="grace period - cached winner", winner_hotkey=reward_hotkey)
                                 else:
-                                    logger.info("Grace period: Reward period expired - burning emissions")
+                                    reward_log.info("Grace period: Reward period expired - burning emissions")
                                     self.burn_weights("no reward target")
                             
                             self.next_batch_check = datetime.now(timezone.utc) + timedelta(seconds=30)
@@ -643,9 +654,9 @@ class ChipForgeValidator:
                 
                 if self.emission_manager.should_burn_emissions(0.0):
                     if current_winner:
-                        logger.info(f"No active challenge, winner {current_winner[:12]}... reward period expired - burning emissions")
+                        reward_log.info(f"No active challenge, winner {current_winner[:12]}... reward period expired - burning emissions")
                     else:
-                        logger.info("No active challenge, no submissions found - burning emissions")
+                        reward_log.info("No active challenge, no submissions found - burning emissions")
                     self.burn_weights("no reward target")
                 else:
                     reward_hotkey = self.emission_manager.get_reward_hotkey()
@@ -654,7 +665,7 @@ class ChipForgeValidator:
                         logger.info(f"No active challenge, but rewarding winner {reward_hotkey[:12]}... (emission manager active)")
                         self.set_weights_with_ban_check(context="no active challenge - emission manager winner", winner_hotkey=reward_hotkey)
                     else:
-                        logger.info("No active challenge, no winner reward period - burning emissions")
+                        reward_log.info("No active challenge, no winner reward period - burning emissions")
                         self.burn_weights("no reward target")
                 
                 self.next_batch_check = datetime.now(timezone.utc) + timedelta(seconds=10)
@@ -894,7 +905,7 @@ class ChipForgeValidator:
             if not success:
                 # Fallback
                 # Same rule as when idle: the current winner only while its reward window lasts
-                logger.info("Batch processing failed - keeping the current reward target")
+                reward_log.info("Batch processing failed - keeping the current reward target")
                 self._target_current_challenge_reward()
 
             self.consecutive_errors = 0

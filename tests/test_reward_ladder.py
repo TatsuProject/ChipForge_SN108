@@ -109,6 +109,10 @@ def _validator(tmp_path, monkeypatch, sync_state):
     v = ChipForgeValidator.__new__(ChipForgeValidator)
     v.reward_ladder = rl.RewardLadder()
     v._last_ladder_target = None
+    v._last_ladder_report = None
+    v.weight_manager = _manager(10.0)
+    v.banned_coldkeys = SimpleNamespace(get_active_ban_set=lambda challenge_id: set())
+    v.state = SimpleNamespace(last_challenge_id="c", ban_emissions=False)
     v.weight_target = WeightTarget.winner("HC", "own winner")
     v.api_client = SimpleNamespace(_sync_state=sync_state)
     return v
@@ -139,3 +143,56 @@ def test_all_records_in_probation_means_burn(tmp_path, monkeypatch):
     v.refresh_reward_ladder()
     target = v.effective_target()
     assert target.winner_hotkey is None and not target.places and "1 record(s) in probation" in target.reason
+
+
+# --- logs: one ladder report when something changes, legacy reward lines silenced ----------------
+
+def test_report_names_uids_states_and_unpayable_places():
+    """The testnet run of 2026-10-15: UID 0 (the burn UID) holds place 1, an unregistered hotkey
+    place 3, one record is in probation."""
+    recs = [rec("r4", "hk_owner", 0.1, 100, probation=0, paid=1), rec("r3", "HD", 0.3, 50, probation=0, paid=1),
+            rec("r2", "hk_unregistered", 0.4, 30, probation=0, paid=1), rec("r5", "HC", 0.05, 120, probation=1, paid=1),
+            rec("old", "HB", 3, 10, probation=0, paid=1)]
+    wm = _manager(10.0)
+    sig, lines = rl.report(recs, NOW, 3, 0.4, lambda hk: wm.payability(hk), 10.0)
+    text = "\n".join(lines)
+    assert lines[0] == ("Reward ladder (3 places, ratio 0.4): 3 paying, 1 in probation; miners get 10% of the weight, "
+                        "burn 90% (unpaid places' share goes to the paid ones)")
+    assert "#1 UID 0 hk_owner... score 100: 64.1% of the miners' share -> 0.00% of all weight" in text
+    assert "NOT PAID (is the burn UID)" in text
+    assert "#2 UID 2 HD... score 50: 25.6% of the miners' share -> 10.00% of all weight" in text
+    assert "#3 no UID hk_unreg... score 30: 10.3% of the miners' share -> 0.00% of all weight" in text
+    assert "NOT PAID (not registered)" in text
+    # all three payable: 64.1 / 25.6 / 10.3 % of the miners' 10%
+    ok = rl.report(recs[1:2] + [rec("x", "HA", 0.2, 60, probation=0, paid=1)], NOW, 3, 0.4, lambda hk: wm.payability(hk), 10.0)[1]
+    assert "#1 UID 4 HA... score 60: 71.4% of the miners' share -> 7.14% of all weight" in "\n".join(ok)
+    assert "#2 UID 2 HD... score 50: 28.6% of the miners' share -> 2.86% of all weight" in "\n".join(ok)
+    assert "probation UID 3 HC... score 120: paid from 12:57 UTC (in 57m)" in text
+    assert "old" not in [s[0] for s in sig[:-1]]                               # finished records are left out
+    assert rl.report(recs, NOW, 3, 0.4, lambda hk: wm.payability(hk), 10.0)[0] == sig    # same state: same signature
+    assert rl.report(recs, NOW, 3, 0.4, lambda hk: wm.payability(hk), 20.0)[0] != sig    # miners' % changed
+    assert rl.report([], NOW, 3, 0.4, lambda hk: wm.payability(hk))[1] == [
+        "Reward ladder: no record in probation or being paid - the miners' share is burned"]
+
+
+def test_ladder_report_is_logged_once_per_change_and_legacy_lines_go_to_debug(tmp_path, monkeypatch, caplog):
+    import logging
+    from validator_utils.logutil import RewardLog
+    soon = datetime.now(timezone.utc)
+    paying = {"submission_id": "p", "hotkey": "HD", "score": 1, "qualified_at": (soon - timedelta(hours=30)).isoformat(),
+              "pays_from": (soon - timedelta(hours=6)).isoformat(), "pays_until": (soon + timedelta(hours=18)).isoformat()}
+    v = _validator(tmp_path, monkeypatch, {"reward_ladder": {"size": 3, "decay_ratio": 0.6, "records": [paying]}})
+    v.refresh_reward_ladder()
+    assert RewardLog.ladder_active
+    with caplog.at_level(logging.INFO):
+        v.effective_target()
+        v.effective_target()
+        RewardLog(logging.getLogger("validator_utils.emission_manager")).info("Winner reward active: ...")
+    infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert sum(m.startswith("Reward ladder (") for m in infos) == 1
+    assert any("#1 UID 2 HD... score 1: 100.0% of the miners' share -> 10.00% of all weight" in m for m in infos)
+    assert not any("Winner reward active" in m for m in infos)
+
+    v.api_client._sync_state = {"challenge": None}          # older server: the own-winner logs are back
+    v.refresh_reward_ladder()
+    assert not RewardLog.ladder_active

@@ -66,6 +66,21 @@ def test_burn_cases(target, kwargs):
 
 # --- submission --------------------------------------------------------------------------
 
+async def test_set_weights_logs_show_the_exact_vector(caplog):
+    import logging
+    from validator_utils import weight_manager as wm_module
+    wm, _ = _manager()
+    wm_module.logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.INFO, logger=wm_module.logger.name):
+            assert await wm.apply(WeightTarget.winner("hk_winner"))
+    finally:
+        wm_module.logger.removeHandler(caplog.handler)
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith(("Setting weights", "Weights set on chain"))]
+    assert {l.split(":")[0] for l in lines} == {"Setting weights", "Weights set on chain"}
+    assert all(l.endswith("| weights [UID 0: 0.9, UID 2: 0.1] (sum 1)") for l in lines)
+
+
 async def test_apply_submits_lists_without_waiting_for_finalization():
     wm, subtensor = _manager()
     assert await wm.apply(WeightTarget.winner("hk_winner"))

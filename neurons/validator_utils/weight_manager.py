@@ -61,6 +61,12 @@ class WeightTarget:
         return f"winner {self.winner_hotkey[:12]}..." if self.winner_hotkey else "burn"
 
 
+def weights_vector(uids: List[int], weights: List[float]) -> str:
+    """The exact vector sent to set_weights, e.g. "[UID 0: 0.9, UID 4: 0.086207, UID 2: 0.013793] (sum 1)"."""
+    pairs = ", ".join(f"UID {u}: {w:g}" for u, w in zip(uids, weights))
+    return f"[{pairs}] (sum {round(sum(weights), 6):g})"
+
+
 def response_succeeded(response) -> bool:
     """bittensor>=10 returns ExtrinsicResponse, which is always truthy (it defines
     __len__ == 2). Read .success; accept plain bools / (success, msg) tuples too."""
@@ -159,6 +165,11 @@ class WeightManager:
             f"burn {100 - self.miner_emission_percentage:g}% ({target.reason})",
         )
 
+    def payability(self, hotkey: str, banned_coldkeys: Optional[Set[str]] = None) -> Tuple[Optional[int], Optional[str]]:
+        """(uid or None, why it cannot be paid or None), for logs."""
+        _, why = self._unpayable(hotkey, banned_coldkeys)
+        return self.get_hotkey_uid(hotkey), why
+
     def _unpayable(self, hotkey: str, banned_coldkeys: Optional[Set[str]]) -> Tuple[Optional[int], Optional[str]]:
         """(uid, None) when hotkey can be paid, else (None, why not)."""
         uid = self.get_hotkey_uid(hotkey)
@@ -236,6 +247,7 @@ class WeightManager:
         """Submit the weights for `target` if they changed or a refresh is due.
         Returns True when the chain now has these weights (just set, or already set)."""
         uids, weights, description = self.build(target, banned_coldkeys, ban_emissions)
+        description = f"{description} | weights {weights_vector(uids, weights)}"
         key = (tuple(uids), tuple(weights))
         changed = key != self._last_applied
         refresh_due = (time.monotonic() - self._last_applied_at) >= self.refresh_seconds
