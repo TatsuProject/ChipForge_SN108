@@ -219,9 +219,10 @@ def test_banned_in_probation_is_not_paid_once_its_window_opens():
     assert _manager(10.0).build(alone)[:2] == ([0, 5], [0.9, 0.1])         # unbanned: paid again
 
 
-def test_challenge_scoped_ban_stops_applying_when_the_quest_is_no_longer_current(tmp_path, monkeypatch):
-    """GAP: a ban scoped to quest A is enforced only while A is the validator's current quest. After
-    A ends (or B starts), A's records are still in their paid windows and the banned miner is paid."""
+def test_local_ban_list_covers_only_the_current_quest(tmp_path, monkeypatch):
+    """The validator's own ban list applies a quest-A ban only while A is its current quest. A's
+    records still paid after A ended are covered by the server's banned flag on each record
+    (test_server_banned_record_is_not_paid_after_its_quest_ended)."""
     monkeypatch.setenv("CHIPFORGE_DATA_DIR", str(tmp_path))
     from validator_utils.banned_coldkeys import BannedColdkeysManager
     bans = BannedColdkeysManager()
@@ -296,3 +297,53 @@ def test_miner_emission_percentage_extremes():
     target = WeightTarget(None, "t", (("HD", 0.6), ("HC", 0.4)))
     assert _manager(0.0).build(target)[:2] == ([0], [1.0])
     assert _manager(100.0).build(target)[:2] == ([2, 3], [0.6, 0.4])       # no burn UID entry at all
+
+
+def test_ban_emissions_from_sync_applies_with_no_active_quest(tmp_path, monkeypatch):
+    soon = datetime.now(timezone.utc)
+    paying = {"submission_id": "p", "hotkey": "HD", "score": 1, "qualified_at": (soon - timedelta(hours=30)).isoformat(),
+              "pays_from": (soon - timedelta(hours=6)).isoformat(), "pays_until": (soon + timedelta(hours=18)).isoformat()}
+    ladder = {"size": 3, "decay_ratio": 0.6, "records": [paying]}
+    v = _validator(tmp_path, monkeypatch, {"challenge": None, "reward_ladder": ladder, "ban_emissions": True})
+    v.state.save_state = lambda: None
+    v.refresh_reward_ladder()
+    assert v.state.ban_emissions is True
+    assert v.weight_manager.build(v.effective_target(), ban_emissions=v.state.ban_emissions)[:2] == ([0], [1.0])
+    v.api_client._sync_state = {"challenge": None, "reward_ladder": ladder, "ban_emissions": False}   # lifted
+    v.refresh_reward_ladder()
+    assert v.state.ban_emissions is False
+    assert v.weight_manager.build(v.effective_target(), ban_emissions=False)[:2] == ([0, 2], [0.9, 0.1])
+    v.api_client._sync_state = {"challenge": None, "reward_ladder": ladder}                 # older server: unchanged
+    v.state.ban_emissions = True
+    v.refresh_reward_ladder()
+    assert v.state.ban_emissions is True
+
+
+def test_server_banned_record_is_not_paid_after_its_quest_ended(tmp_path, monkeypatch):
+    """Coldkey banned for quest A: the server sends A's records with banned=true, so they are not
+    paid even when no quest (or quest B) is current and the local ban list has nothing for A."""
+    soon = datetime.now(timezone.utc)
+
+    def paying(sid, hotkey, hours_ago, banned=False):
+        return {"submission_id": sid, "hotkey": hotkey, "score": 1, "banned": banned,
+                "qualified_at": (soon - timedelta(hours=hours_ago)).isoformat(),
+                "pays_from": (soon - timedelta(hours=6)).isoformat(), "pays_until": (soon + timedelta(hours=18)).isoformat()}
+    a, b = paying("a", "HA", 30, banned=True), paying("b", "HD", 31)
+    v = _validator(tmp_path, monkeypatch, {"challenge": None, "reward_ladder": {"size": 3, "decay_ratio": 0.6, "records": [a, b]}})
+    v.state.last_challenge_id = None
+    v.refresh_reward_ladder()
+    target = v.effective_target()
+    assert [hk for hk, _ in target.places] == ["HA", "HD"] and target.banned == ("HA",)    # keeps its place
+    uids, weights, desc = v.weight_manager.build(target, banned_coldkeys=set())
+    assert uids == [0, 2] and weights == [0.9, 0.1] and "coldkey banned for its quest" in desc
+    _, lines = v.reward_ladder.report(lambda hk: v.weight_manager.payability(hk, set()), 10.0)
+    assert any("#1 UID 4 HA..." in l and "NOT PAID (coldkey banned for its quest)" in l and "-> 0.00% of all weight" in l
+               for l in lines)
+
+    v.api_client._sync_state = {"challenge": None, "reward_ladder": {"size": 3, "decay_ratio": 0.6,
+                                                                     "records": [{**a, "banned": False}, b]}}   # unbanned
+    v.refresh_reward_ladder()
+    target = v.effective_target()
+    assert target.banned == () and v.weight_manager.build(target)[:2] == ([0, 4, 2], [0.9, 0.0625, 0.0375])
+    only = WeightTarget.ladder([{"hotkey": "HA", "share": 1.0, "banned": True}], "t")
+    assert v.weight_manager.build(only)[:2] == ([0], [1.0])                                 # banned alone: burn

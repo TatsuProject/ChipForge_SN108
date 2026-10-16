@@ -11,7 +11,9 @@ At any moment the places go to the records inside their paid window: one per hot
 record), newest first, at most `size`; place i gets decay_ratio^(i-1), normalised over the places
 held. WeightManager then gives each place its share of the miners' emission
 (miner_emission_percentage; the rest is burned) and drops places whose hotkey is unregistered or
-banned, sharing their part among the others. No place = burn.
+banned, sharing their part among the others. No place = burn. "Banned" is this validator's ban
+list for its current quest, or a record the server sent with banned=true (coldkey banned
+permanently or for that record's own quest, which still applies after the quest has ended).
 
 The validator computes the places on its own clock from the last schedule it received (kept on
 disk), so probation ends and windows close on time even when the server is unreachable or the
@@ -90,7 +92,11 @@ def report(records: List[Dict], now: datetime, size: int, ratio: float,
     percentage) and what it gets of all the validator's weight once unpaid places' share is
     given to the others."""
     held = {p["submission_id"]: p for p in places(records, now, size, ratio)}
-    pay = {sid: payable(p["hotkey"]) for sid, p in held.items()}
+
+    def payable_record(r):
+        uid, why = payable(r["hotkey"])
+        return uid, why or ("coldkey banned for its quest" if r.get("banned") else None)
+    pay = {sid: payable_record(p) for sid, p in held.items()}
     paid_total = sum(p["share"] for sid, p in held.items() if not pay[sid][1])
     newest_held = {p["hotkey"] for p in held.values()}
     rows, sig = [], []
@@ -98,7 +104,7 @@ def report(records: List[Dict], now: datetime, size: int, ratio: float,
         state = record_state(r, now)
         if state == "finished":
             continue
-        uid, why = pay[r["submission_id"]] if r["submission_id"] in pay else payable(r["hotkey"])
+        uid, why = pay[r["submission_id"]] if r["submission_id"] in pay else payable_record(r)
         who = f"{'UID ' + str(uid) if uid is not None else 'no UID'} {r['hotkey'][:8]}... score {float(r.get('score') or 0):g}"
         p = held.get(r["submission_id"])
         if p:

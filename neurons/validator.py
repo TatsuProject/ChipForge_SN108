@@ -100,6 +100,12 @@ class ChipForgeValidator:
             logger.warning("Challenge server sends no reward_ladder: back to rewarding this validator's own winner")
             self.reward_ladder.clear()
         RewardLog.ladder_active = self.reward_ladder.active
+        # Sent outside the challenge too, so an emissions ban applies between quests (older servers
+        # send it only with the active challenge, handled where the challenge is polled)
+        if 'ban_emissions' in state and bool(state['ban_emissions']) != self.state.ban_emissions:
+            logger.warning(f"Emissions ban status changed: {self.state.ban_emissions} -> {bool(state['ban_emissions'])}")
+            self.state.ban_emissions = bool(state['ban_emissions'])
+            self.state.save_state()
 
     def effective_target(self) -> WeightTarget:
         """The ladder's places at this moment when the server runs the ladder, else the legacy target."""

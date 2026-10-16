@@ -40,6 +40,9 @@ class WeightTarget:
     reason: str = ""
     # Record ladder: ((hotkey, share), ...) with shares summing to 1; overrides winner_hotkey
     places: Tuple[Tuple[str, float], ...] = ()
+    # Held places the server marked banned (coldkey banned permanently or for the record's quest):
+    # never paid, whatever quest is current
+    banned: Tuple[str, ...] = ()
 
     @classmethod
     def burn(cls, reason: str = "") -> "WeightTarget":
@@ -53,7 +56,8 @@ class WeightTarget:
     def ladder(cls, places: List[Dict], reason: str = "") -> "WeightTarget":
         """From reward_ladder.places(): no place = burn."""
         held = tuple((p["hotkey"], round(float(p["share"]), 9)) for p in places)
-        return cls(None, reason, held) if held else cls.burn(reason)
+        banned = tuple(p["hotkey"] for p in places if p.get("banned"))
+        return cls(None, reason, held, banned) if held else cls.burn(reason)
 
     def describe(self) -> str:
         if self.places:
@@ -186,7 +190,8 @@ class WeightManager:
                       banned_coldkeys: Optional[Set[str]]) -> Tuple[List[int], List[float], str]:
         paid, skipped = [], []
         for hotkey, share in target.places:
-            uid, why = self._unpayable(hotkey, banned_coldkeys)
+            uid, why = (None, "coldkey banned for its quest") if hotkey in target.banned \
+                else self._unpayable(hotkey, banned_coldkeys)
             if uid is None:
                 skipped.append(f"{hotkey[:8]}... {why}")
             else:
