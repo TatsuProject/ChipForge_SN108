@@ -120,7 +120,8 @@ class ChipForgeValidator:
             self._last_ladder_target = target
         banned = self._active_banned_coldkeys()
         miner_pct = 0.0 if self.state.ban_emissions else self.weight_manager.miner_emission_percentage
-        signature, lines = self.reward_ladder.report(lambda hk: self.weight_manager.payability(hk, banned), miner_pct)
+        signature, lines = self.reward_ladder.report(lambda hk: self.weight_manager.payability(hk, banned), miner_pct,
+                                                     emissions_banned=bool(self.state.ban_emissions))
         if signature != self._last_ladder_report:
             self._last_ladder_report = signature
             for line in lines:

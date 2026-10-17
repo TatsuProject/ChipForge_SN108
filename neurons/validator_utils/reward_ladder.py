@@ -85,12 +85,13 @@ def _in(seconds: float) -> str:
 
 def report(records: List[Dict], now: datetime, size: int, ratio: float,
            payable: Callable[[str], Tuple[Optional[int], Optional[str]]],
-           miner_percentage: float = 100.0) -> Tuple[tuple, List[str]]:
+           miner_percentage: float = 100.0, emissions_banned: bool = False) -> Tuple[tuple, List[str]]:
     """The ladder as log lines, and a signature that changes when the lines would say something new
     (a record changes state or place, becomes unpayable, or the miners' percentage changes).
     payable(hotkey) -> (uid, why not paid). Each place shows its ladder share (of the miners'
     percentage) and what it gets of all the validator's weight once unpaid places' share is
-    given to the others."""
+    given to the others. emissions_banned: the server banned emissions, so nothing is paid and
+    every place says so (their own reasons, if any, still show)."""
     held = {p["submission_id"]: p for p in places(records, now, size, ratio)}
 
     def payable_record(r):
@@ -113,6 +114,8 @@ def report(records: List[Dict], now: datetime, size: int, ratio: float,
                     f"paid until {_time(r['pays_until']):%H:%M} UTC ({_in((_time(r['pays_until']) - now).total_seconds())} left)")
             if why:
                 line += f" - NOT PAID ({why}): its share goes to the other places, or is burned if none"
+            elif emissions_banned:
+                line += " - NOT PAID (emissions banned by challenge server): burned"
         elif state == "paying":
             line = (f"  -- {who}: in its paid window but holds no place "
                     + ("(the same miner's newer record does)" if r["hotkey"] in newest_held else f"({size} newer records hold them)"))
@@ -121,6 +124,8 @@ def report(records: List[Dict], now: datetime, size: int, ratio: float,
                     f"(in {_in((_time(r['pays_from']) - now).total_seconds())})")
             if why:
                 line += f" - will not be paid ({why})"
+            elif emissions_banned:
+                line += " - not paid while emissions are banned"
         rows.append(line)
         sig.append((r["submission_id"], state, p["place"] if p else None, why))
     paying = len(held)
@@ -128,11 +133,12 @@ def report(records: List[Dict], now: datetime, size: int, ratio: float,
     if not rows:
         return (), ["Reward ladder: no record in probation or being paid - the miners' share is burned"]
     head = (f"Reward ladder ({size} places, ratio {ratio:g}): {paying} paying, {probation} in probation; "
-            + (f"miners get {miner_percentage:g}% of the weight, burn {100.0 - miner_percentage:g}%"
+            + ("emissions banned by challenge server: burn 100%, nothing paid to miners" if emissions_banned else
+               f"miners get {miner_percentage:g}% of the weight, burn {100.0 - miner_percentage:g}%"
                + (" (unpaid places' share goes to the paid ones)" if paid_total < 0.999999 else "")
                if paid_total else
                f"nothing payable now: burn 100% (miners' share {miner_percentage:g}% when a record is paid)"))
-    return tuple(sig) + (miner_percentage,), [head] + rows
+    return tuple(sig) + (miner_percentage, emissions_banned), [head] + rows
 
 
 # ---------------------------------------------------------------------------
@@ -192,11 +198,12 @@ class RewardLadder:
         return places(self.schedule["records"], now, int(self.schedule.get("size", 3)),
                       float(self.schedule.get("decay_ratio", 0.6)))
 
-    def report(self, payable, miner_percentage: float = 100.0, now: Optional[datetime] = None) -> Tuple[tuple, List[str]]:
+    def report(self, payable, miner_percentage: float = 100.0, now: Optional[datetime] = None,
+               emissions_banned: bool = False) -> Tuple[tuple, List[str]]:
         now = now or datetime.now(timezone.utc)
         sched = self.schedule or {}
         return report(sched.get("records", []), now, int(sched.get("size", 3)),
-                      float(sched.get("decay_ratio", 0.6)), payable, miner_percentage)
+                      float(sched.get("decay_ratio", 0.6)), payable, miner_percentage, emissions_banned)
 
     def in_probation(self, now: Optional[datetime] = None) -> int:
         now = now or datetime.now(timezone.utc)

@@ -168,7 +168,7 @@ def test_report_names_uids_states_and_unpayable_places():
     assert "#1 UID 4 HA... score 60: 71.4% of the miners' share -> 7.14% of all weight" in "\n".join(ok)
     assert "#2 UID 2 HD... score 50: 28.6% of the miners' share -> 2.86% of all weight" in "\n".join(ok)
     assert "probation UID 3 HC... score 120: paid from 12:57 UTC (in 57m)" in text
-    assert "old" not in [s[0] for s in sig[:-1]]                               # finished records are left out
+    assert "old" not in [s[0] for s in sig[:-2]]                               # finished records are left out
     assert rl.report(recs, NOW, 3, 0.4, lambda hk: wm.payability(hk), 10.0)[0] == sig    # same state: same signature
     assert rl.report(recs, NOW, 3, 0.4, lambda hk: wm.payability(hk), 20.0)[0] != sig    # miners' % changed
     assert rl.report([], NOW, 3, 0.4, lambda hk: wm.payability(hk))[1] == [
@@ -243,6 +243,13 @@ def test_ban_emissions_burns_everything_and_the_report_says_so():
     assert _manager(10.0).build(target, ban_emissions=True)[:2] == ([0], [1.0])
     _, lines = rl.report(recs, NOW, 3, 0.6, lambda hk: _manager(10.0).payability(hk), 0.0)
     assert "miners get 0% of the weight, burn 100%" in lines[0] and "-> 0.00% of all weight" in lines[1]
+    sig, lines = rl.report(recs + [rec("p", "HA", 1, 9)], NOW, 3, 0.6, lambda hk: _manager(10.0).payability(hk), 0.0,
+                           emissions_banned=True)
+    assert "emissions banned by challenge server: burn 100%" in lines[0]
+    assert all("NOT PAID (emissions banned by challenge server)" in l for l in lines if l.startswith("  #"))
+    assert any(l.startswith("  probation") and "not paid while emissions are banned" in l for l in lines)
+    assert rl.report(recs, NOW, 3, 0.6, lambda hk: _manager(10.0).payability(hk), 0.0)[0] != \
+        rl.report(recs, NOW, 3, 0.6, lambda hk: _manager(10.0).payability(hk), 0.0, emissions_banned=True)[0]
 
 
 def test_voided_record_stops_being_paid_on_the_next_sync_but_not_while_the_server_is_down(tmp_path, monkeypatch):
