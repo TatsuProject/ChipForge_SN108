@@ -38,11 +38,13 @@ class WeightTarget:
     """What the validator wants to reward right now."""
     winner_hotkey: Optional[str] = None   # None = burn (unless `places` is set)
     reason: str = ""
-    # Record ladder: ((hotkey, share), ...) with shares summing to 1; overrides winner_hotkey
+    # Record ladder: ((hotkey, share), ...) with shares summing to 1; overrides winner_hotkey.
+    # A hotkey can appear more than once (repeat_hotkeys): it is paid the sum of its places.
     places: Tuple[Tuple[str, float], ...] = ()
-    # Held places the server marked banned (coldkey banned permanently or for the record's quest):
-    # never paid, whatever quest is current
-    banned: Tuple[str, ...] = ()
+    # Indexes into `places` of the places the server marked banned (coldkey banned permanently or
+    # for that record's quest): never paid, whatever quest is current. Per place, not per hotkey:
+    # the same hotkey's record of another quest is still paid.
+    banned: Tuple[int, ...] = ()
 
     @classmethod
     def burn(cls, reason: str = "") -> "WeightTarget":
@@ -56,7 +58,7 @@ class WeightTarget:
     def ladder(cls, places: List[Dict], reason: str = "") -> "WeightTarget":
         """From reward_ladder.places(): no place = burn."""
         held = tuple((p["hotkey"], round(float(p["share"]), 9)) for p in places)
-        banned = tuple(p["hotkey"] for p in places if p.get("banned"))
+        banned = tuple(i for i, p in enumerate(places) if p.get("banned"))
         return cls(None, reason, held, banned) if held else cls.burn(reason)
 
     def describe(self) -> str:
@@ -189,8 +191,8 @@ class WeightManager:
     def _build_ladder(self, target: WeightTarget,
                       banned_coldkeys: Optional[Set[str]]) -> Tuple[List[int], List[float], str]:
         paid, skipped = [], []
-        for hotkey, share in target.places:
-            uid, why = (None, "coldkey banned for its quest") if hotkey in target.banned \
+        for i, (hotkey, share) in enumerate(target.places):
+            uid, why = (None, "coldkey banned for its quest") if i in target.banned \
                 else self._unpayable(hotkey, banned_coldkeys)
             if uid is None:
                 skipped.append(f"{hotkey[:8]}... {why}")
@@ -203,6 +205,15 @@ class WeightManager:
         if miner_fraction <= 0.0:
             return [BURN_UID], [1.0], f"burn (miner emission percentage is 0; ladder {len(paid)} place(s))"
         total = sum(s for _, _, s in paid)                  # skipped places' share goes to the others
+        merged: Dict[int, List] = {}                        # one entry per UID: a hotkey's places add up
+        for uid, hotkey, share in paid:
+            if uid in merged:
+                merged[uid][1] += share
+                merged[uid][2] += 1
+            else:
+                merged[uid] = [hotkey, share, 1]
+        paid = [(uid, hk, s) for uid, (hk, s, _) in merged.items()]
+        counts = {uid: n for uid, (_, _, n) in merged.items()}
         uids, weights = [], []
         if miner_fraction < 1.0:
             uids.append(BURN_UID)
@@ -210,7 +221,8 @@ class WeightManager:
         for uid, _, share in paid:
             uids.append(uid)
             weights.append(round(miner_fraction * share / total, 6))
-        places = ", ".join(f"UID {uid} ({hk[:8]}...) {miner_fraction * s / total * 100:.2f}%" for uid, hk, s in paid)
+        places = ", ".join(f"UID {uid} ({hk[:8]}...) {miner_fraction * s / total * 100:.2f}%"
+                           + (f" ({counts[uid]} places)" if counts[uid] > 1 else "") for uid, hk, s in paid)
         burn = f", burn {100 - self.miner_emission_percentage:g}%" if miner_fraction < 1.0 else ""
         return uids, weights, f"ladder: {places}{burn}{note} ({target.reason})"
 
