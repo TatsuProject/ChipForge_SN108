@@ -168,7 +168,7 @@ def test_report_names_uids_states_and_unpayable_places():
     assert "#1 UID 4 HA... score 60: 71.4% of the miners' share -> 7.14% of all weight" in "\n".join(ok)
     assert "#2 UID 2 HD... score 50: 28.6% of the miners' share -> 2.86% of all weight" in "\n".join(ok)
     assert "probation UID 3 HC... score 120: paid from 12:57 UTC (in 57m)" in text
-    assert "old" not in [s[0] for s in sig[:-2]]                               # finished records are left out
+    assert "old" not in [s[0] for s in sig[:-3]]                               # finished records are left out
     assert rl.report(recs, NOW, 3, 0.4, lambda hk: wm.payability(hk), 10.0)[0] == sig    # same state: same signature
     assert rl.report(recs, NOW, 3, 0.4, lambda hk: wm.payability(hk), 20.0)[0] != sig    # miners' % changed
     assert rl.report([], NOW, 3, 0.4, lambda hk: wm.payability(hk))[1] == [
@@ -340,7 +340,7 @@ def test_server_banned_record_is_not_paid_after_its_quest_ended(tmp_path, monkey
     v.state.last_challenge_id = None
     v.refresh_reward_ladder()
     target = v.effective_target()
-    assert [hk for hk, _ in target.places] == ["HA", "HD"] and target.banned == ("HA",)    # keeps its place
+    assert [hk for hk, _ in target.places] == ["HA", "HD"] and target.banned == (0,)    # keeps its place (index into places)
     uids, weights, desc = v.weight_manager.build(target, banned_coldkeys=set())
     assert uids == [0, 2] and weights == [0.9, 0.1] and "coldkey banned for its quest" in desc
     _, lines = v.reward_ladder.report(lambda hk: v.weight_manager.payability(hk, set()), 10.0)
@@ -354,3 +354,40 @@ def test_server_banned_record_is_not_paid_after_its_quest_ended(tmp_path, monkey
     assert target.banned == () and v.weight_manager.build(target)[:2] == ([0, 4, 2], [0.9, 0.0625, 0.0375])
     only = WeightTarget.ladder([{"hotkey": "HA", "share": 1.0, "banned": True}], "t")
     assert v.weight_manager.build(only)[:2] == ([0], [1.0])                                 # banned alone: burn
+
+
+def test_repeat_hotkeys_one_hotkey_holds_several_places_and_is_paid_their_sum():
+    """Same vectors as the server's test_ladder_repeat_hotkeys_gives_each_record_a_place_and_the_hotkey_their_sum."""
+    recs = [_paying("b", "HC", 7), _paying("a1", "HD", 6), _paying("a2", "HD", 5)]
+    one = rl.places(recs, NOW, 3, 0.6)
+    assert [p["submission_id"] for p in one] == ["a2", "b"] and [round(p["share"], 4) for p in one] == [0.625, 0.375]
+    many = rl.places(recs, NOW, 3, 0.6, repeat_hotkeys=True)
+    assert [p["submission_id"] for p in many] == ["a2", "a1", "b"]
+
+    # one entry per UID on chain: HD (UID 2) gets places 1 + 2, HC (UID 3) place 3
+    uids, weights, desc = _manager(10.0).build(WeightTarget.ladder(many, "t"))
+    assert uids == [0, 2, 3] and weights == [0.9, 0.081633, 0.018367] and "(2 places)" in desc
+    assert _manager(10.0).build(WeightTarget.ladder(one, "t"))[:2] == ([0, 2, 3], [0.9, 0.0625, 0.0375])
+    # all three records by one hotkey: 100% of the miners' share, never more
+    solo = rl.places([_paying("x1", "HD", 7), _paying("x2", "HD", 6), _paying("x3", "HD", 5)], NOW, 3, 0.6, True)
+    assert _manager(10.0).build(WeightTarget.ladder(solo, "t"))[:2] == ([0, 2], [0.9, 0.1])
+
+
+def test_repeat_hotkeys_a_ban_for_one_quest_skips_only_that_quests_place():
+    recs = [_paying("old", "HD", 7), {**_paying("new", "HD", 5), "banned": True}, _paying("c", "HC", 6)]
+    target = WeightTarget.ladder(rl.places(recs, NOW, 3, 0.6, repeat_hotkeys=True), "t")
+    uids, weights, desc = _manager(10.0).build(target)
+    assert uids == [0, 3, 2] and "coldkey banned for its quest" in desc       # HD still paid for its other record
+    assert round(sum(weights), 6) == 1.0
+
+
+def test_repeat_hotkeys_comes_from_the_server_schedule(tmp_path, monkeypatch):
+    monkeypatch.setattr(rl, "data_path", lambda name: tmp_path / name)
+    ladder = rl.RewardLadder()
+    recs = [_paying("b", "HC", 7), _paying("a1", "HD", 6), _paying("a2", "HD", 5)]
+    ladder.update({"size": 3, "decay_ratio": 0.6, "records": recs})               # older server: off
+    assert len(ladder.places(NOW)) == 2
+    ladder.update({"size": 3, "decay_ratio": 0.6, "repeat_hotkeys": True, "records": recs})
+    assert len(ladder.places(NOW)) == 3
+    sig, lines = ladder.report(lambda hk: _manager(10.0).payability(hk), 10.0, now=NOW)
+    assert "repeat hotkeys" in lines[0]
