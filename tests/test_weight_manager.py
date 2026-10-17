@@ -66,6 +66,21 @@ def test_burn_cases(target, kwargs):
 
 # --- submission --------------------------------------------------------------------------
 
+async def test_set_weights_logs_show_the_exact_vector(caplog):
+    import logging
+    from validator_utils import weight_manager as wm_module
+    wm, _ = _manager()
+    wm_module.logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.INFO, logger=wm_module.logger.name):
+            assert await wm.apply(WeightTarget.winner("hk_winner"))
+    finally:
+        wm_module.logger.removeHandler(caplog.handler)
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith(("Setting weights", "Weights set on chain"))]
+    assert {l.split(":")[0] for l in lines} == {"Setting weights", "Weights set on chain"}
+    assert all(l.endswith("| weights [UID 0: 0.9, UID 2: 0.1] (sum 1)") for l in lines)
+
+
 async def test_apply_submits_lists_without_waiting_for_finalization():
     wm, subtensor = _manager()
     assert await wm.apply(WeightTarget.winner("hk_winner"))
@@ -122,7 +137,9 @@ async def test_new_winner_waits_for_rate_limit_then_goes_out():
     wm, subtensor = _manager(rate_limited=True)
     assert await wm.apply(WeightTarget.winner("hk_winner")) is False
     assert subtensor.set_weights.call_count == 0
-    subtensor.blocks_since_last_update.return_value = 100       # window reopens
+    subtensor.blocks_since_last_update.return_value = 100       # exactly the limit: the chain refuses it
+    assert await wm.apply(WeightTarget.winner("hk_winner")) is False
+    subtensor.blocks_since_last_update.return_value = 102       # two blocks of margin: goes out
     assert await wm.apply(WeightTarget.winner("hk_winner")) is True
     assert subtensor.set_weights.call_count == 1
 

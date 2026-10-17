@@ -8,7 +8,7 @@ Handles emission phases based on challenge lifecycle
 import os
 import logging
 
-from .logutil import info_on_change
+from .logutil import RewardLog, info_on_change
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple
 from dotenv import load_dotenv
@@ -16,7 +16,7 @@ load_dotenv()
 
 from .storage import atomic_write_json, data_path, load_json
 
-logger = logging.getLogger(__name__)
+logger = RewardLog(logging.getLogger(__name__))
 
 
 class EmissionManager:

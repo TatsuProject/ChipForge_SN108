@@ -10,7 +10,7 @@ ChipForge operates as a competitive platform where:
 - **Miners** submit hardware design solutions (Verilog/SystemVerilog)
 - **Validators** evaluate submissions using industry-standard EDA tools (Verilator, Yosys, Icarus, Openlane)
 - **Challenges** are rotated periodically with different design requirements
-- **Rewards** are distributed based on performance metrics and competitive scoring - This is a winner-takes-all reward mechanism
+- **Rewards** go to the latest records: every submission that beats the score to beat becomes a record, waits out a probation, and is then paid for a fixed window, sharing the miner reward with the other records being paid (the record ladder)
 
 ## Architecture
 
@@ -297,8 +297,8 @@ A miner can run from the same folder with its own wallet (`MINER_WALLET_*`, `mak
 What the validator does each cycle:
 - polls the challenge server (`/validator/sync`, one cached request for challenge, batch, bans and test-case version),
 - downloads the exposed batch (each file's sha256 is checked against the hash the miner signed) and evaluates it on the EDA server within the batch's deadline,
-- submits scores, and if a submission beats the challenge's best qualified score, it becomes this validator's winner,
-- puts weights on chain immediately when the winner changes (within the chain's rate limit) and refreshes them every `WEIGHTS_REFRESH_SECONDS`: the winner gets `MINER_EMISSION_PERCENTAGE` percent, the rest is burned to UID 0.
+- submits scores,
+- pays the record ladder: puts weights on chain as soon as the places change (a probation ends, a window closes, a new record; within the chain's rate limit) and refreshes them every `WEIGHTS_REFRESH_SECONDS`. The places share `MINER_EMISSION_PERCENTAGE` percent, the rest is burned to UID 0.
 
 How many submissions a batch holds is set by the challenge server, and the validator evaluates all of
 them. `EDA_MAX_CONCURRENCY` only limits how many it sends to its EDA server at once (the rest wait their
@@ -315,8 +315,23 @@ server evaluates it again in a later batch. Timeouts on the validator's side are
 (`VALIDATOR_NO_TIME_TO_START`, `VALIDATOR_EDA_NO_RESPONSE`, `VALIDATOR_BATCH_TIMEOUT`). An EDA server
 older than this ignores the two fields and applies its own `EVAL_TIMEOUT_S`.
 
-Each validator picks its winner from its own evaluations; there is no winner sync between
-validators or with the challenge server. The winner's share of the weight
+**Record ladder.** The challenge server decides the records (when a batch closes, from every
+validator's results) and sends, in `/validator/sync`, the ladder rules and every record in probation or
+being paid, each with its window (`pays_from` = end of probation, `pays_until`). The validator computes
+the places itself on its own clock (`neurons/validator_utils/reward_ladder.py`, the same algorithm as the
+server), so probation ends and windows close on time even while the server is unreachable; the last
+schedule is kept on disk (`reward_ladder.json` in `CHIPFORGE_DATA_DIR`) and survives restarts:
+
+- the places go to the records being paid, one per hotkey (its newest), newest first, at most the
+  ladder size (default 3);
+- place *i* gets ratio^(i-1) of the miners' share, normalised over the places held (ratio 0.6:
+  100% | 62.5/37.5% | 51.0/30.6/18.4%);
+- a place whose hotkey is unregistered, is the burn UID or has a banned coldkey is skipped and its part
+  goes to the other places; with no payable place, or while every record is in probation, everything is
+  burned. The challenge server's `ban_emissions` burns everything.
+
+Against a challenge server without the ladder (older version), the validator falls back to picking
+its winner from its own evaluations. The miners' share of the weight
 (`MINER_EMISSION_PERCENTAGE`) is the validator's own setting unless the challenge server sets one,
 in which case the server's value is used (the validator logs when it overrides the local value). The
 minimum improvement margin works the same way: the challenge server sends the margin in force (0 until
@@ -378,9 +393,10 @@ counts when it passes both gates: the functional gate (enough of the testbench p
   submission's score is the highest gate-passing score it received, and the best one in the batch wins
   if it beats the score to beat (from the second winner on, plus `MIN_IMPROVEMENT_PERCENT` if the subnet sets one). Ties go to the
   earlier submission, and the score to beat then rises to the new winner's score
-- Weights reward the highest-scoring submission with `MINER_EMISSION_PERCENTAGE` of the validator's weight; the rest is burned
-- Emission burning occurs when no submissions exceed quality thresholds
-- The winner of a challenge will keep getting reward for specific time after challenge expiration
+- Every winner is a record: it earns nothing during its probation (the subnet can review and void it), then is paid for a fixed window
+- The records being paid share `MINER_EMISSION_PERCENTAGE` of each validator's weight on the record ladder (see "Record ladder" above); the rest is burned
+- Emissions are burned while no record is being paid
+- Records keep their windows after the challenge ends; the next challenge's records rank above them
 - The chain decides who is actually paid (highest incentive); the leaderboard shows it and which validators agree
 - Winning designs may be revealed to registered neurons after a delay (see "Results, logs and revealed winning designs")
 

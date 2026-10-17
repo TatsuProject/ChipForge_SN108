@@ -4,11 +4,14 @@ Weight Manager for ChipForge Validator
 
 Every weight decision goes through two steps:
 
-  1. The validator picks a *target*: burn, or reward winner X (WeightTarget).
+  1. The validator picks a *target*: burn, reward winner X, or pay the record ladder's places
+     (WeightTarget).
   2. apply() turns the target into chain weights with ONE policy (build()):
-       - winner gets `miner_emission_percentage`, the rest goes to the burn UID
-       - burn when emissions are banned, the winner's coldkey is banned, or the
-         winner is no longer registered
+       - the miners get `miner_emission_percentage` (a single winner all of it; ladder places their
+         share of it), the rest goes to the burn UID
+       - a winner / place whose hotkey is unregistered, the burn UID or has a banned coldkey gets
+         nothing: a ladder shares that part among the remaining places, and burns it when none is left
+       - burn everything when emissions are banned
      and submits them only when they changed, or when a periodic refresh is due
      (so the validator stays active on chain), and only when the chain's weights
      rate limit allows it. A changed target that is rate limited stays pending and
@@ -23,7 +26,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -33,8 +36,13 @@ BURN_UID = 0
 @dataclass(frozen=True)
 class WeightTarget:
     """What the validator wants to reward right now."""
-    winner_hotkey: Optional[str] = None   # None = burn
+    winner_hotkey: Optional[str] = None   # None = burn (unless `places` is set)
     reason: str = ""
+    # Record ladder: ((hotkey, share), ...) with shares summing to 1; overrides winner_hotkey
+    places: Tuple[Tuple[str, float], ...] = ()
+    # Held places the server marked banned (coldkey banned permanently or for the record's quest):
+    # never paid, whatever quest is current
+    banned: Tuple[str, ...] = ()
 
     @classmethod
     def burn(cls, reason: str = "") -> "WeightTarget":
@@ -43,6 +51,24 @@ class WeightTarget:
     @classmethod
     def winner(cls, hotkey: str, reason: str = "") -> "WeightTarget":
         return cls(hotkey, reason)
+
+    @classmethod
+    def ladder(cls, places: List[Dict], reason: str = "") -> "WeightTarget":
+        """From reward_ladder.places(): no place = burn."""
+        held = tuple((p["hotkey"], round(float(p["share"]), 9)) for p in places)
+        banned = tuple(p["hotkey"] for p in places if p.get("banned"))
+        return cls(None, reason, held, banned) if held else cls.burn(reason)
+
+    def describe(self) -> str:
+        if self.places:
+            return "ladder " + ", ".join(f"{hk[:8]}... {s * 100:.1f}%" for hk, s in self.places)
+        return f"winner {self.winner_hotkey[:12]}..." if self.winner_hotkey else "burn"
+
+
+def weights_vector(uids: List[int], weights: List[float]) -> str:
+    """The exact vector sent to set_weights, e.g. "[UID 0: 0.9, UID 4: 0.086207, UID 2: 0.013793] (sum 1)"."""
+    pairs = ", ".join(f"UID {u}: {w:g}" for u, w in zip(uids, weights))
+    return f"[{pairs}] (sum {round(sum(weights), 6):g})"
 
 
 def response_succeeded(response) -> bool:
@@ -116,6 +142,8 @@ class WeightManager:
 
         if ban_emissions:
             return (*burn, f"burn (emissions banned by challenge server; {target.reason})")
+        if target.places:
+            return self._build_ladder(target, banned_coldkeys)
         if not target.winner_hotkey:
             return (*burn, f"burn ({target.reason})")
 
@@ -141,6 +169,51 @@ class WeightManager:
             f"burn {100 - self.miner_emission_percentage:g}% ({target.reason})",
         )
 
+    def payability(self, hotkey: str, banned_coldkeys: Optional[Set[str]] = None) -> Tuple[Optional[int], Optional[str]]:
+        """(uid or None, why it cannot be paid or None), for logs."""
+        _, why = self._unpayable(hotkey, banned_coldkeys)
+        return self.get_hotkey_uid(hotkey), why
+
+    def _unpayable(self, hotkey: str, banned_coldkeys: Optional[Set[str]]) -> Tuple[Optional[int], Optional[str]]:
+        """(uid, None) when hotkey can be paid, else (None, why not)."""
+        uid = self.get_hotkey_uid(hotkey)
+        if uid is None:
+            return None, "not registered"
+        if uid == BURN_UID:
+            return None, "is the burn UID"
+        coldkey = self._get_coldkey_for_uid(uid)
+        if banned_coldkeys and coldkey and coldkey in banned_coldkeys:
+            return None, f"coldkey {coldkey[:12]}... banned"
+        return uid, None
+
+    def _build_ladder(self, target: WeightTarget,
+                      banned_coldkeys: Optional[Set[str]]) -> Tuple[List[int], List[float], str]:
+        paid, skipped = [], []
+        for hotkey, share in target.places:
+            uid, why = (None, "coldkey banned for its quest") if hotkey in target.banned \
+                else self._unpayable(hotkey, banned_coldkeys)
+            if uid is None:
+                skipped.append(f"{hotkey[:8]}... {why}")
+            else:
+                paid.append((uid, hotkey, share))
+        note = f"; skipped: {', '.join(skipped)}" if skipped else ""
+        if not paid:
+            return [BURN_UID], [1.0], f"burn (no payable ladder place{note}; {target.reason})"
+        miner_fraction = self.miner_emission_percentage / 100.0
+        if miner_fraction <= 0.0:
+            return [BURN_UID], [1.0], f"burn (miner emission percentage is 0; ladder {len(paid)} place(s))"
+        total = sum(s for _, _, s in paid)                  # skipped places' share goes to the others
+        uids, weights = [], []
+        if miner_fraction < 1.0:
+            uids.append(BURN_UID)
+            weights.append(round(1.0 - miner_fraction, 6))
+        for uid, _, share in paid:
+            uids.append(uid)
+            weights.append(round(miner_fraction * share / total, 6))
+        places = ", ".join(f"UID {uid} ({hk[:8]}...) {miner_fraction * s / total * 100:.2f}%" for uid, hk, s in paid)
+        burn = f", burn {100 - self.miner_emission_percentage:g}%" if miner_fraction < 1.0 else ""
+        return uids, weights, f"ladder: {places}{burn}{note} ({target.reason})"
+
     # ------------------------------------------------------------------
     # Chain
     # ------------------------------------------------------------------
@@ -159,7 +232,9 @@ class WeightManager:
             limit = self.subtensor.weights_rate_limit(netuid=self.config.netuid)
             if since is None or limit is None:
                 return True
-            return int(since) >= int(limit)
+            # Two blocks of margin: on testnet (2026-10-15) every set_weights sent as soon as
+            # since reached the limit was refused, and the retry 2-3 blocks later went through
+            return int(since) >= int(limit) + 2
         except Exception as e:
             logger.debug(f"Could not read weights rate limit: {e}")
             return True
@@ -179,6 +254,7 @@ class WeightManager:
         """Submit the weights for `target` if they changed or a refresh is due.
         Returns True when the chain now has these weights (just set, or already set)."""
         uids, weights, description = self.build(target, banned_coldkeys, ban_emissions)
+        description = f"{description} | weights {weights_vector(uids, weights)}"
         key = (tuple(uids), tuple(weights))
         changed = key != self._last_applied
         refresh_due = (time.monotonic() - self._last_applied_at) >= self.refresh_seconds
