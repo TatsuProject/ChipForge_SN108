@@ -17,7 +17,7 @@ bittensor-cli==9.23.2
 bittensor-drand==2.0.0
 bittensor-wallet==4.1.0
 bt-decode==0.8.0
-certifi==2026.7.22
+certifi==2026.10.23
 cffi==2.1.1
 charset-normalizer==3.5.1
 click==8.5.0
