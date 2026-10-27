@@ -115,6 +115,57 @@ async def test_download_with_wrong_hash_is_discarded(client_factory):
     assert (client.submissions_dir / "b1" / "x.zip").exists()        # saved under the basename only
 
 
+def _commit(content, **over):
+    obj = {"schema": "cf-chain-commit/1", "subtensor_genesis_hash": "ab" * 32, "netuid": 108, "hotkey": "5Miner",
+           "block_number": 1, "block_hash": "cd" * 32, "block_timestamp_ms": 1793000000000,
+           "package_sha256": hashlib.sha256(content).hexdigest()}
+    obj.update(over)
+    return json.dumps(obj, separators=(",", ":"))
+
+
+@pytest.mark.parametrize("case", ["ok", "header_only", "none", "wrong_sha", "listing_vs_header", "bad_json"])
+async def test_chain_commit_is_kept_verbatim_or_the_design_discarded(client_factory, case):
+    client = client_factory(lambda kw: FakeResponse())
+    content = b"PK-design"
+    good = _commit(content)
+    listed, header = {
+        "ok": (good, good), "header_only": (None, good), "none": (None, None),
+        "wrong_sha": (_commit(content, package_sha256="00" * 32),) * 2,
+        "listing_vs_header": (good, _commit(content, block_number=2)), "bad_json": ("{", None),
+    }[case]
+
+    async def fake_download(challenge_id, submission_id):
+        return {"content": content, "filename": "d.zip", "submission_id": submission_id, "chain_commit": header}
+    client.download_submission = fake_download
+    batch = {"batch_id": "b1", "submissions": [
+        {"submission_id": "s1", "file_hash": hashlib.sha256(content).hexdigest(), "chain_commit": listed}]}
+    downloaded = await client.download_batch_submissions("c1", batch)
+    if case in ("ok", "header_only"):
+        assert downloaded == {"s1": content} and client.chain_commits["s1"] == good      # text unchanged
+    elif case == "none":                                                                    # older server
+        assert downloaded == {"s1": content} and "s1" not in client.chain_commits
+    else:
+        assert downloaded == {} and "s1" not in client.chain_commits
+
+
+async def test_v2_fields_are_sent_with_the_score(client_factory):
+    client = client_factory(lambda kw: FakeResponse())
+    sent = {}
+
+    async def fake_signed(method, url, form=None, **kw):
+        sent.update(form)
+        return 200, "{}", {}
+    client._signed = fake_signed
+    ev = {"overall_score": 4.06, "functionality_score": 0, "area_score": 0, "delay_score": 0, "power_score": 0,
+          "passed_testbench": True, "eval_status": "PASSED", "projection_hash": "7a" * 32}
+    assert await client.submit_evaluation("c1", "s1", ev)
+    assert sent["eval_status"] == "PASSED" and sent["projection_hash"] == "7a" * 32
+    ev.pop("eval_status"), ev.pop("projection_hash")
+    sent.clear()
+    assert await client.submit_evaluation("c1", "s1", ev)
+    assert "eval_status" not in sent and "projection_hash" not in sent
+
+
 # --- EDA responses -----------------------------------------------------------------------
 
 async def test_accepted_result_is_scored(client_factory):

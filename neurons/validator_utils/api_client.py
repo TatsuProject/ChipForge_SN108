@@ -35,6 +35,26 @@ def safe_filename(name: Optional[str], fallback: str) -> str:
     return base if base and base not in (".", "..") and _SAFE_FILENAME.match(base) else fallback
 
 
+def check_chain_commit(content: bytes, listed: Optional[str], header: Optional[str]) -> tuple:
+    """(chain_commit text or None, problem or None) for a downloaded design.
+
+    The batch listing and the download header must carry the same text, and its package_sha256 must
+    be the sha256 of the exact bytes received. Older servers send none: (None, None).
+    """
+    if listed and header and listed != header:
+        return None, "chain_commit differs between the batch listing and the download"
+    text = listed or header
+    if not text:
+        return None, None
+    try:
+        package_sha256 = json.loads(text)['package_sha256']
+    except (ValueError, TypeError, KeyError):
+        return None, "chain_commit is not valid cf-chain-commit/1 JSON"
+    if package_sha256 != hashlib.sha256(content).hexdigest():
+        return None, "zip sha256 differs from chain_commit package_sha256"
+    return text, None
+
+
 def parse_server_time(value) -> Optional[datetime]:
     try:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00")) if value else None
@@ -68,6 +88,9 @@ class APIClient:
         self._sync_state: Optional[Dict] = None
         # Submissions the server says this validator already evaluated (HTTP 409 on download)
         self.already_evaluated: set = set()
+        # submission_id -> cf-chain-commit/1 JSON text from the challenge server, passed to the v2
+        # EDA server verbatim (every validator must send the identical object)
+        self.chain_commits: Dict[str, str] = {}
         self._sync_etag: Optional[str] = None
         self._sync_fetched_at = 0.0
         self._sync_checked_at = 0.0
@@ -361,7 +384,8 @@ class APIClient:
         if not content.startswith(b'PK'):
             logger.warning(f"Downloaded {submission_id} does not look like a ZIP file")
         logger.info(f"Downloaded {submission_id}: {len(content)} bytes")
-        return {'content': content, 'filename': filename or f"{submission_id}.zip", 'submission_id': submission_id}
+        return {'content': content, 'filename': filename or f"{submission_id}.zip", 'submission_id': submission_id,
+                'chain_commit': headers.get('X-Chain-Commit')}
 
     async def submit_evaluation(self, challenge_id: str, submission_id: str, evaluation: Dict) -> bool:
         """Submit one evaluation (form data). Retries network errors and 5xx."""
@@ -382,6 +406,10 @@ class APIClient:
             'evaluation_notes': evaluation.get('evaluation_notes', ''),
             'evaluation_details': details,
         }
+        # v2 evaluator: result status and projection hash, compared across validators by the server
+        for key in ('eval_status', 'projection_hash'):
+            if evaluation.get(key):
+                form_data[key] = str(evaluation[key])
         logger.debug(f"Submitting evaluation for {submission_id}: score={form_data['overall_score']}, "
                      f"gates={form_data['functional_gate']}/{form_data['overall_gate']}")
         url = f"{self.api_url}/api/v1/challenges/{challenge_id}/submissions/{submission_id}/submit_score"
@@ -422,6 +450,8 @@ class APIClient:
         
         # Hash the miner signed, when the server provides it (challenge server >= 2026-09)
         expected_hash = {s['submission_id']: s.get('file_hash') for s in submissions}
+        listed_commit = {s['submission_id']: s.get('chain_commit') for s in submissions}
+        self.chain_commits = {k: v for k, v in self.chain_commits.items() if k in listed_commit}
 
         # Create download tasks
         tasks = []
@@ -446,6 +476,13 @@ class APIClient:
                 if expected and hashlib.sha256(content).hexdigest() != expected:
                     logger.error(f"Download of {submission_id} does not match the hash the miner signed - discarded")
                     continue
+                commit, problem = check_chain_commit(content, listed_commit.get(submission_id), result.get('chain_commit'))
+                if problem:
+                    # Never send or score a design whose bytes differ from its commitment
+                    logger.error(f"Download of {submission_id}: {problem} - discarded")
+                    continue
+                if commit:
+                    self.chain_commits[submission_id] = commit
                 downloaded[submission_id] = content
                 
                 logger.info(f"Successfully downloaded {submission_id}: {len(content)} bytes")
