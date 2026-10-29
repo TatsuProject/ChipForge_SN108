@@ -391,3 +391,27 @@ def test_repeat_hotkeys_comes_from_the_server_schedule(tmp_path, monkeypatch):
     assert len(ladder.places(NOW)) == 3
     sig, lines = ladder.report(lambda hk: _manager(10.0).payability(hk), 10.0, now=NOW)
     assert "repeat hotkeys" in lines[0]
+
+
+@pytest.mark.parametrize("bad", [
+    {"decay_ratio": -1}, {"decay_ratio": 0}, {"decay_ratio": float("nan")}, {"decay_ratio": 2},
+    {"size": 0}, {"size": 10_000},
+])
+def test_malformed_ladder_settings_are_rejected_and_previous_kept(tmp_path, monkeypatch, bad):
+    from validator_utils.reward_ladder import RewardLadder
+    monkeypatch.setenv("CHIPFORGE_DATA_DIR", str(tmp_path))
+    good = {"size": 3, "decay_ratio": 0.6, "records": []}
+    ladder = RewardLadder()
+    assert ladder.update(good)
+    assert not ladder.update({**good, **bad})
+    assert ladder.schedule == good
+
+
+@pytest.mark.parametrize("record_patch", [{"hotkey": 5}, {"hotkey": ""}, {"submission_id": 7}, {"score": "x"},
+                                          {"score": float("inf")}])
+def test_malformed_ladder_records_are_rejected(tmp_path, monkeypatch, record_patch):
+    from validator_utils.reward_ladder import RewardLadder
+    monkeypatch.setenv("CHIPFORGE_DATA_DIR", str(tmp_path))
+    rec = {"hotkey": "5H", "submission_id": "s", "score": 1.0, "qualified_at": "2026-10-01T00:00:00+00:00",
+           "pays_from": "2026-10-01T00:00:00+00:00", "pays_until": "2026-10-02T00:00:00+00:00"}
+    assert not RewardLadder().update({"size": 3, "decay_ratio": 0.6, "records": [{**rec, **record_patch}]})

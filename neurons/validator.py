@@ -825,8 +825,10 @@ class ChipForgeValidator:
                 except Exception as e:
                     logger.error(f"Error downloading test cases for challenge {challenge_id}: {e}")
             
-            # Get current batch
-            batch = await self.api_client.get_current_batch(challenge_id)
+            # Get current batch. Split evaluation mode: an idle validator asks for its own design, but only
+            # while its EDA server is up (a claimed design it can't evaluate would wait for nothing)
+            batch = await self.api_client.get_current_batch(
+                challenge_id, claim=await self.api_client.eda_server_ready())
             already_processed_batch = False
             if batch:
                 # Validate batch structure
@@ -880,6 +882,9 @@ class ChipForgeValidator:
                 batch_timeout = (dl_window + eval_window - 45) if dl_window > 0 and eval_window > 0 \
                     else self.batch_processing_timeout
                 logger.info(f"Batch timeout from batch windows (no server deadline): {batch_timeout:.0f}s")
+            # Split mode: heartbeats while evaluating, so a validator that dies mid-run is noticed early
+            heartbeat = asyncio.create_task(self.api_client.heartbeat_loop(batch_id)) \
+                if str(batch_id).startswith("split-") else None
             try:
                 success = await asyncio.wait_for(
                     self.batch_processor.process_batch(challenge_id, batch),
@@ -905,7 +910,10 @@ class ChipForgeValidator:
                 logger.error(f"Exception during batch processing: {e}")
                 logger.error(f"Traceback: {traceback.format_exc()}")
                 success = False
-            
+            finally:
+                if heartbeat is not None:
+                    heartbeat.cancel()
+
             if success:
                 self._background(self.miner_comms.notify_miners_batch_complete(batch_id))
             

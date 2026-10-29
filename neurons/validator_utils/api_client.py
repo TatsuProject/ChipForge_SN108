@@ -35,6 +35,52 @@ def safe_filename(name: Optional[str], fallback: str) -> str:
     return base if base and base not in (".", "..") and _SAFE_FILENAME.match(base) else fallback
 
 
+MAX_RESPONSE_BYTES = int(float(os.getenv("MAX_RESPONSE_MB", "100")) * 1024 * 1024)
+
+
+class ResponseTooLarge(Exception):
+    """A server answered with more than MAX_RESPONSE_MB: refused before it can exhaust memory."""
+
+
+async def read_capped(response, limit: Optional[int] = None) -> bytes:
+    """The response body, refusing more than `limit` bytes (MAX_RESPONSE_MB) whatever the server sends."""
+    limit = limit or MAX_RESPONSE_BYTES
+    length = getattr(response, "content_length", None)
+    if isinstance(length, int) and length > limit:
+        raise ResponseTooLarge(f"announced {length} bytes (limit {limit})")
+    content = getattr(response, "content", None)
+    if content is not None and hasattr(content, "iter_chunked"):
+        buf = bytearray()
+        async for chunk in content.iter_chunked(1 << 16):
+            buf += chunk
+            if len(buf) > limit:
+                raise ResponseTooLarge(f"more than {limit} bytes")
+        return bytes(buf)
+    data = await response.read()
+    if len(data) > limit:
+        raise ResponseTooLarge(f"{len(data)} bytes (limit {limit})")
+    return data
+
+
+async def json_capped(response):
+    """response.json() with the MAX_RESPONSE_MB limit."""
+    if not hasattr(response, "read") and not hasattr(getattr(response, "content", None), "iter_chunked"):
+        return await response.json()          # minimal test doubles
+    return json.loads(await read_capped(response))
+
+
+def path_component(value, what: str = "id") -> str:
+    """A server-provided id used as one path component (directory or file name stem): plain characters
+    only, never absolute, never '..'. Anything else is replaced by a hash, so a malicious or broken server
+    can never make the validator write outside its data directory."""
+    text = str(value or "")
+    if re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}", text) and text not in (".", ".."):
+        return text
+    safe = f"{what}-{hashlib.sha256(text.encode()).hexdigest()[:16]}"
+    logger.warning(f"Unsafe {what} from the server ({text[:60]!r}); using {safe} as its path name")
+    return safe
+
+
 def check_chain_commit(content: bytes, listed: Optional[str], header: Optional[str]) -> tuple:
     """(chain_commit text or None, problem or None) for a downloaded design.
 
@@ -149,22 +195,29 @@ class APIClient:
         return params, headers
 
     async def _signed(self, method: str, url: str, *, form: Optional[Dict] = None, timeout: float = 30,
-                      attempts: int = 1, read: str = "text", extra_headers: Optional[Dict] = None):
+                      attempts: int = 1, read: str = "text", extra_headers: Optional[Dict] = None,
+                      extra_params: Optional[Dict] = None):
         """Signed request with retries on network errors and 5xx (fresh signature and nonce
         per attempt). Returns (status, body, headers); status None = unreachable."""
         for attempt in range(attempts):
             params, headers = self._auth(method, url, form)
+            if extra_params:
+                params.update(extra_params)
             if extra_headers:
                 headers.update(extra_headers)
             try:
                 async with self.session.request(method, url, params=params, headers=headers, data=form,
                                                 timeout=aiohttp.ClientTimeout(total=timeout)) as response:
-                    body = await (response.read() if read == "bytes" else response.text())
+                    raw = await read_capped(response)
+                    body = raw if read == "bytes" else raw.decode("utf-8", errors="replace")
                     if response.status >= 500 and attempt < attempts - 1:
                         logger.warning(f"{method} {urlparse(url).path}: HTTP {response.status}, retrying")
                         await asyncio.sleep(2 ** attempt)
                         continue
                     return response.status, body, response.headers
+            except ResponseTooLarge as e:
+                logger.error(f"{method} {urlparse(url).path}: response refused, too large ({e})")
+                return None, None, None
             except (asyncio.TimeoutError, aiohttp.ClientError) as e:
                 logger.warning(f"{method} {urlparse(url).path} failed (attempt {attempt + 1}/{attempts}): {e!r}")
                 if attempt < attempts - 1:
@@ -214,7 +267,7 @@ class APIClient:
         return None
 
     def _testcases_version_file(self, challenge_id: str) -> Path:
-        return self.base_dir / 'testcases' / f"{challenge_id}.version"
+        return self.base_dir / 'testcases' / f"{path_component(challenge_id, 'challenge')}.version"
 
     def _needs_testcases(self, challenge_id: str, version: Optional[str], flag: bool) -> bool:
         """Download test cases only when their version changed (sync) or, on older servers,
@@ -260,7 +313,7 @@ class APIClient:
                 if response.status != 200:
                     logger.debug(f"No active challenge found: HTTP {response.status}")
                     return {"status": "None"}
-                challenge = await response.json()
+                challenge = await json_capped(response)
                 if isinstance(challenge, dict) and challenge.get('status') == 'no_active_challenge':
                     return {"status": "no_active_challenge"}
                 if not isinstance(challenge, dict) or 'challenge_id' not in challenge:
@@ -305,7 +358,7 @@ class APIClient:
             async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as response:
                 if response.status != 200:
                     return None
-                challenge = await response.json()
+                challenge = await json_capped(response)
         except Exception as e:
             logger.error(f"Error getting challenge info: {e}")
             return None
@@ -323,15 +376,23 @@ class APIClient:
             result['download_new_testcases'] = True
         return result
 
-    async def get_current_batch(self, challenge_id: str) -> Optional[Dict]:
-        """The batch currently exposed for evaluation (as this validator sees it), or None."""
+    async def get_current_batch(self, challenge_id: str, claim: bool = False) -> Optional[Dict]:
+        """The batch currently exposed for evaluation (as this validator sees it), or None.
+
+        Split evaluation mode: the challenge server hands each validator its own design (a batch of one).
+        claim=True means this validator is idle and its EDA server is ready: when nothing is waiting for
+        it, ask the server for work (an older server ignores the parameter)."""
         state = await self._sync()
         if state is not None and (state.get('challenge') or {}).get('challenge_id') == challenge_id:
             batch = state.get('batch')
-            return batch if batch and batch.get('batch_id') else None
+            if batch and batch.get('batch_id'):
+                return batch
+            if not claim:
+                return None
 
         status, body, _ = await self._signed(
-            "GET", f"{self.api_url}/api/v1/challenges/{challenge_id}/batch/current", timeout=15)
+            "GET", f"{self.api_url}/api/v1/challenges/{challenge_id}/batch/current", timeout=15,
+            extra_params={'claim': 'true'} if claim else None)
         if status != 200:
             if status is not None:
                 logger.debug(f"No current batch: HTTP {status}")
@@ -341,6 +402,24 @@ class APIClient:
             logger.info(f"Found current batch: {batch['batch_id']} with {batch.get('available_submissions', 0)} submissions")
             return batch
         return None
+
+    async def heartbeat(self, batch_id: str) -> bool:
+        """Split mode: tell the challenge server this validator is still evaluating its assignment."""
+        status, _, _ = await self._signed(
+            "POST", f"{self.api_url}/api/v1/validator/assignments/{batch_id}/heartbeat", timeout=15)
+        return status == 200
+
+    async def heartbeat_loop(self, batch_id: str, every_seconds: Optional[float] = None) -> None:
+        """Heartbeats until cancelled (the evaluation finished). Missing heartbeats make the server hand the
+        design to another validator, so the loop never stops on errors."""
+        every = every_seconds or float(os.getenv("SPLIT_HEARTBEAT_SECONDS", "300"))
+        while True:
+            try:
+                if not await self.heartbeat(batch_id):
+                    logger.warning(f"Heartbeat for {batch_id} not accepted (assignment expired or reassigned)")
+            except Exception as e:
+                logger.warning(f"Heartbeat for {batch_id} failed: {e}")
+            await asyncio.sleep(every)
 
     async def get_banned_coldkeys(self, challenge_id: str) -> Optional[Dict]:
         """Permanent + this challenge's bans ({"count", "bans": [...]}), or None on failure
@@ -488,7 +567,7 @@ class APIClient:
                 logger.info(f"Successfully downloaded {submission_id}: {len(content)} bytes")
                 
                 # Save to local file using server-provided filename
-                batch_dir = self.submissions_dir / batch['batch_id']
+                batch_dir = self.submissions_dir / path_component(batch['batch_id'], 'batch')
                 batch_dir.mkdir(exist_ok=True)
                 
                 file_path = batch_dir / filename
@@ -585,7 +664,7 @@ class APIClient:
                     async with self.session.post(f"{self.eda_server_url}/evaluate", data=form_data,
                                                  timeout=aiohttp.ClientTimeout(total=budget)) as response:
                         if response.status == 200:
-                            result = await response.json()
+                            result = await json_capped(response)
                             logger.debug(f"EDA response for {submission_id}: {result}")
                             return submission_id, self._transform_eda_response(result, submission_id)
                         error_text = await response.text()
@@ -825,13 +904,13 @@ class APIClient:
     
     def get_testcase_files(self, challenge_id: str) -> tuple:
         """Get test case files for a challenge"""
-        evaluator_zip_path = self.base_dir / 'testcases' / f"{challenge_id}_validator.zip"
+        evaluator_zip_path = self.base_dir / 'testcases' / f"{path_component(challenge_id, 'challenge')}_validator.zip"
         return evaluator_zip_path
 
     def check_testcase_files_exist(self, challenge_id: str) -> bool:
         """Check if all required test case files exist for a challenge"""
         try:
-            evaluator_zip_path = self.base_dir / 'testcases' / f"{challenge_id}_validator.zip"
+            evaluator_zip_path = self.base_dir / 'testcases' / f"{path_component(challenge_id, 'challenge')}_validator.zip"
             
             if not evaluator_zip_path.exists():
                 logger.warning(f"Missing test case file: {evaluator_zip_path}")

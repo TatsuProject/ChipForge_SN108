@@ -316,3 +316,24 @@ def test_batch_timeout_evaluation_names_the_validator(client_factory):
     ev = client.build_timeout_evaluation("s1", 1234.5)
     d = json.loads(ev["evaluation_details"])
     assert ev["timeout_occurred"] is True and d["code"] == "VALIDATOR_BATCH_TIMEOUT" and "1234s" in d["message"]
+
+
+@pytest.mark.parametrize("batch_id", ["/tmp/evil", "../../etc", "..", "a/b", "x" * 300, ""])
+async def test_server_batch_id_never_escapes_the_data_dir(client_factory, batch_id, tmp_path):
+    client = client_factory(lambda kw: FakeResponse())
+    content = b"PK-design"
+
+    async def fake_download(challenge_id, submission_id):
+        return {"content": content, "filename": "../../evil.sh", "submission_id": submission_id}
+    client.download_submission = fake_download
+    batch = {"batch_id": batch_id, "submissions": [
+        {"submission_id": "s1", "file_hash": hashlib.sha256(content).hexdigest()}]}
+    assert await client.download_batch_submissions("c1", batch) == {"s1": content}
+    written = [p for p in tmp_path.rglob("*") if p.is_file() and p.read_bytes() == content]
+    assert written and all(client.submissions_dir in p.parents for p in written)
+
+
+def test_challenge_id_never_escapes_the_testcases_dir(client_factory):
+    client = client_factory(lambda kw: FakeResponse(), with_testcases=False)
+    for cid in ("../../x", "/etc/passwd", "a/b"):
+        assert client.get_testcase_files(cid).parent == client.base_dir / "testcases"

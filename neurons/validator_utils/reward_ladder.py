@@ -25,6 +25,7 @@ validator falls back to rewarding its own challenge winner.
 """
 
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -173,10 +174,20 @@ class RewardLadder:
             return False
         try:
             for r in schedule["records"]:              # reject a malformed schedule as a whole
-                _time(r["qualified_at"]), _time(r["pays_from"]), _time(r["pays_until"]), r["hotkey"]
-            int(schedule.get("size", 3)), float(schedule.get("decay_ratio", 0.6))
+                _time(r["qualified_at"]), _time(r["pays_from"]), _time(r["pays_until"])
+                if not isinstance(r["hotkey"], str) or not r["hotkey"]:
+                    raise ValueError("hotkey must be a non-empty string")
+                if "submission_id" in r and not isinstance(r["submission_id"], str):
+                    raise ValueError("submission_id must be a string")
+                if r.get("score") is not None and not math.isfinite(float(r["score"])):
+                    raise ValueError("score must be a finite number")
+            size, ratio = int(schedule.get("size", 3)), float(schedule.get("decay_ratio", 0.6))
+            if not 1 <= size <= 64:
+                raise ValueError(f"size {size} outside 1-64")
+            if not (math.isfinite(ratio) and 0 < ratio <= 1):  # <= 0 or NaN would break or flip the shares
+                raise ValueError(f"decay_ratio {ratio} outside (0, 1]")
         except (KeyError, TypeError, ValueError) as e:
-            logger.error(f"Ignoring malformed reward_ladder from server: {e}")
+            logger.error(f"Ignoring malformed reward_ladder from server (keeping the previous one): {e}")
             return False
         if schedule == self.schedule:
             return False

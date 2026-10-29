@@ -209,3 +209,54 @@ def test_absurd_winner_reward_hours_from_server_ignored(tmp_path, monkeypatch):
     assert em.total_hours_for_winner_reward == 48
     em.update_winner_reward_hours_from_server(10 ** 6)
     assert em.total_hours_for_winner_reward == em.local_winner_reward_hours
+
+
+# --- split evaluation mode ---------------------------------------------------------------
+
+ASSIGNED = {"batch_id": "split-abc", "status": "exposed", "evaluation_mode": "split",
+            "submissions": [{"submission_id": "s9", "hotkey": "5M"}]}
+
+
+async def test_claim_asks_for_work_only_when_sync_shows_none(make_client):
+    idle = dict(SYNC, batch={"batch_id": None, "submissions": []})
+    client = make_client({"/api/v1/validator/sync": lambda m, kw: Resp(200, idle, {"ETag": '"e1"'}),
+                          "/api/v1/challenges/c1/batch/current": lambda m, kw: Resp(200, ASSIGNED)})
+    assert await client.get_current_batch("c1") is None                       # not ready: never claims
+    assert [c[1] for c in client.session.calls] == ["/api/v1/validator/sync"]
+    batch = await client.get_current_batch("c1", claim=True)
+    assert batch["batch_id"] == "split-abc"
+    method, path, kw = client.session.calls[-1]
+    assert path == "/api/v1/challenges/c1/batch/current" and kw["params"]["claim"] == "true"
+
+
+async def test_claim_keeps_the_assignment_sync_already_shows(make_client):
+    client = make_client({"/api/v1/validator/sync": lambda m, kw: Resp(200, dict(SYNC, batch=ASSIGNED))})
+    assert (await client.get_current_batch("c1", claim=True))["batch_id"] == "split-abc"
+    assert len(client.session.calls) == 1
+
+
+async def test_heartbeat_loop_posts_until_cancelled(make_client):
+    import asyncio
+    client = make_client({"/api/v1/validator/assignments/split-abc/heartbeat": lambda m, kw: Resp(200, {"status": "ok"})})
+    task = asyncio.create_task(client.heartbeat_loop("split-abc", every_seconds=0.01))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    posts = [c for c in client.session.calls if c[0] == "POST"]
+    assert len(posts) >= 2 and all(c[1].endswith("/split-abc/heartbeat") for c in posts)
+
+
+async def test_heartbeat_loop_survives_errors(make_client):
+    import asyncio
+    client = make_client({"/api/v1/validator/assignments/split-abc/heartbeat": lambda m, kw: Resp(404, {})})
+    task = asyncio.create_task(client.heartbeat_loop("split-abc", every_seconds=0.01))
+    await asyncio.sleep(0.05)
+    assert not task.done()
+    task.cancel()
+
+
+async def test_oversized_server_response_is_refused(make_client, monkeypatch):
+    import validator_utils.api_client as ac
+    monkeypatch.setattr(ac, "MAX_RESPONSE_BYTES", 1000)
+    client = make_client({"/api/v1/validator/sync": lambda m, kw: Resp(200, b"x" * 5000)})
+    status, body, _ = await client._signed("GET", "https://cs.example/api/v1/validator/sync")
+    assert status is None and body is None

@@ -369,11 +369,18 @@ class MinerCLI:
             if response.status_code != 200:
                 logger.error(f"Challenge package not available: {response.status_code} {response.text[:200]}")
                 return False
+            if len(response.content) > 200 * 1024 * 1024:
+                logger.error("Challenge package refused: larger than 200 MB")
+                return False
             package = output_dir / f"{challenge_id}.zip"
             package.write_bytes(response.content)
             logger.info(f"Challenge package downloaded to: {package}")
             try:
                 with zipfile.ZipFile(package) as zf:
+                    members = zf.infolist()   # zip bombs: bounded entries and size (zipfile strips '..' paths)
+                    if len(members) > 10000 or sum(m.file_size for m in members) > 1024 * 1024 * 1024:
+                        logger.error("Challenge package refused: too many entries or larger than 1 GB unpacked")
+                        return False
                     zf.extractall(output_dir)
                 logger.info(f"Extracted to: {output_dir}")
             except zipfile.BadZipFile:
