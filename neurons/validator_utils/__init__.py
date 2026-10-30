@@ -3,7 +3,6 @@
 ChipForge Validator Utilities Package
 """
 
-from .emission_manager import EmissionManager
 from .validator_state import ValidatorState
 from .batch_processor import BatchProcessor
 from .weight_manager import WeightManager
@@ -13,7 +12,6 @@ from .logging_config import setup_validator_logging
 from .banned_coldkeys import BannedColdkeysManager
 
 __all__ = [
-    'EmissionManager',
     'ValidatorState',
     'BatchProcessor',
     'WeightManager',

@@ -130,6 +130,19 @@ class SolutionSubmitter:
             logger.error(f"Error getting active challenge: {e}")
             return None
     
+    @staticmethod
+    def _paused_message(response) -> Optional[str]:
+        """The subnet's message when submissions are paused (HTTP 503 with detail.paused), else None."""
+        if response.status_code != 503:
+            return None
+        try:
+            detail = response.json().get('detail')
+        except ValueError:
+            return None
+        if isinstance(detail, dict) and detail.get('paused'):
+            return str(detail.get('reason') or detail.get('message') or 'no reason given')
+        return None
+
     def generate_submission_id(self, challenge_id: str) -> Optional[Dict]:
         """Generate submission ID for the challenge"""
         try:
@@ -145,9 +158,12 @@ class SolutionSubmitter:
                 result = response.json()
                 logger.info(f"Generated submission ID: {result['submission_id']}")
                 return result
+            paused = self._paused_message(response)
+            if paused:
+                logger.error(f"Submissions are paused by the subnet: {paused}. Try again later.")
             else:
                 logger.error(f"Failed to generate submission ID: {response.status_code} - {response.text}")
-                return None
+            return None
                 
         except Exception as e:
             logger.error(f"Error generating submission ID: {e}")
@@ -220,10 +236,13 @@ class SolutionSubmitter:
                 logger.info(f"Submission ID: {result.get('submission_id')}")
                 logger.info(f"Status: {result.get('status')}")
                 return True
-            else:
-                logger.error(f"Failed to submit solution: {response.status_code}")
-                logger.error(f"Error: {response.text}")
+            paused = self._paused_message(response)
+            if paused:
+                logger.error(f"Submissions are paused by the subnet: {paused}. Try again later.")
                 return False
+            logger.error(f"Failed to submit solution: {response.status_code}")
+            logger.error(f"Error: {response.text}")
+            return False
                 
         except Exception as e:
             logger.error(f"Error submitting solution: {e}")

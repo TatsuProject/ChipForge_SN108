@@ -200,17 +200,6 @@ def test_secret_and_url_come_from_env(monkeypatch, tmp_path):
     assert config.challenge_api_url == "https://api.chipforge.io"
 
 
-def test_absurd_winner_reward_hours_from_server_ignored(tmp_path, monkeypatch):
-    monkeypatch.setenv("CHIPFORGE_DATA_DIR", str(tmp_path))
-    from validator_utils.emission_manager import EmissionManager
-
-    em = EmissionManager()
-    em.update_winner_reward_hours_from_server(48)
-    assert em.total_hours_for_winner_reward == 48
-    em.update_winner_reward_hours_from_server(10 ** 6)
-    assert em.total_hours_for_winner_reward == em.local_winner_reward_hours
-
-
 # --- split evaluation mode ---------------------------------------------------------------
 
 ASSIGNED = {"batch_id": "split-abc", "status": "exposed", "evaluation_mode": "split",

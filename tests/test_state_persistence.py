@@ -32,19 +32,14 @@ def test_corrupt_file_is_moved_aside_not_overwritten(data_dir):
 
 
 def test_state_files_live_in_data_dir(data_dir):
-    from validator_utils.emission_manager import EmissionManager
     from validator_utils.validator_state import ValidatorState
 
     state = ValidatorState()
     state.last_challenge_id = "ch1"
     state.save_state()
-    em = EmissionManager(miner_emission_percentage=10)
-    em.update_winner("hk_w", 42.0, 10.0)
 
     assert (data_dir / "validator_state.json").exists()
-    assert (data_dir / "emission_state.json").exists()
     assert ValidatorState().last_challenge_id == "ch1"
-    assert EmissionManager().current_winner == "hk_w"
 
 
 def test_evaluated_batches_keep_the_most_recent(data_dir):

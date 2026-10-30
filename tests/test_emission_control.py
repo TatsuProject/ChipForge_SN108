@@ -23,7 +23,6 @@ def make_validator(local=10.0):
     v = ChipForgeValidator.__new__(ChipForgeValidator)
     v.config = SimpleNamespace(miner_emission_percentage=local, netuid=108)
     v.weight_manager = WeightManager(wallet, subtensor, metagraph, v.config, miner_emission_percentage=local)
-    v.emission_manager = SimpleNamespace(miner_emission_percentage=local)
     return v, subtensor
 
 
@@ -32,7 +31,6 @@ def test_server_value_is_authoritative_and_changes_weights():
     assert v.weight_manager.build(WeightTarget.winner("hk_winner"))[1] == [0.9, 0.1]
     assert v.apply_emission_percentage(True, 30) == 30.0
     assert v.weight_manager.build(WeightTarget.winner("hk_winner"))[1] == [0.7, 0.3]
-    assert v.emission_manager.miner_emission_percentage == 30.0
 
 
 def test_unset_or_missing_on_server_falls_back_to_local():

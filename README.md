@@ -330,13 +330,11 @@ schedule is kept on disk (`reward_ladder.json` in `CHIPFORGE_DATA_DIR`) and surv
   goes to the other places; with no payable place, or while every record is in probation, everything is
   burned. The challenge server's `ban_emissions` burns everything.
 
-Against a challenge server without the ladder (older version), the validator falls back to picking
-its winner from its own evaluations. The miners' share of the weight
+Against a challenge server without the ladder (older version), the validator burns. The miners' share of the weight
 (`MINER_EMISSION_PERCENTAGE`) is the validator's own setting unless the challenge server sets one,
-in which case the server's value is used (the validator logs when it overrides the local value). The
-minimum improvement margin works the same way: the challenge server sends the margin in force (0 until
-a challenge has its first winner, then its `MIN_IMPROVEMENT_PERCENT`), and the validator uses it. The
-`MIN_IMPROVEMENT_PERCENT` in the validator's `.env` is only a fallback for servers that don't send one.
+in which case the server's value is used (the validator logs when it overrides the local value). Which
+designs are records, and the score to beat, are decided by the challenge server from every validator's
+results; the validator follows its record ladder.
 
 #### Running with nohup (background process)
 

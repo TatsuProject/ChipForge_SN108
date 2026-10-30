@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from .storage import data_path
+from .logutil import info_on_change
 
 logger = logging.getLogger(__name__)
 
@@ -171,7 +172,7 @@ class APIClient:
         """Sign with the validator hotkey (Bittensor native, sr25519), hex encoded."""
         return self.wallet.hotkey.sign(data=message).hex()
 
-    def _auth(self, method: str, url: str, form: Optional[Dict] = None) -> tuple:
+    def _auth(self, method: str, url: str, form: Optional[Dict] = None, raw_body: Optional[bytes] = None) -> tuple:
         """Query params + headers authenticating one request.
 
         SIGNATURE_MODE=both (default) sends the legacy v1 signature (query params, over
@@ -188,8 +189,11 @@ class APIClient:
         if self.signature_mode in ('both', 'v2'):
             ts = str(int(time.time()))
             nonce = secrets.token_hex(16)
-            canonical = "&".join(f"{k}={v}" for k, v in sorted((form or {}).items()))
-            digest = hashlib.sha256(canonical.encode()).hexdigest()
+            if raw_body is not None:                    # JSON body: the server hashes the raw bytes
+                digest = hashlib.sha256(raw_body).hexdigest()
+            else:
+                canonical = "&".join(f"{k}={v}" for k, v in sorted((form or {}).items()))
+                digest = hashlib.sha256(canonical.encode()).hexdigest()
             path = urlparse(url).path
             message = f"chipforge-sn108:v2:{method.upper()}:{path}:{self.validator_hotkey}:{ts}:{nonce}:{digest}"
             headers.update({
@@ -202,15 +206,20 @@ class APIClient:
 
     async def _signed(self, method: str, url: str, *, form: Optional[Dict] = None, timeout: float = 30,
                       attempts: int = 1, read: str = "text", extra_headers: Optional[Dict] = None,
-                      extra_params: Optional[Dict] = None, files: Optional[Dict[str, tuple]] = None):
+                      extra_params: Optional[Dict] = None, files: Optional[Dict[str, tuple]] = None,
+                      json_body: Optional[Dict] = None):
         """Signed request with retries on network errors and 5xx (fresh signature and nonce
         per attempt). Returns (status, body, headers); status None = unreachable.
         files: {field: (filename, bytes, content type)} sent as multipart parts; the signature covers
         their filenames (as the server canonicalises file parts), so callers sign a hash of the content."""
+        raw = json.dumps(json_body, separators=(",", ":")).encode() if json_body is not None else None
         for attempt in range(attempts):
             signed_form = dict(form or {}, **{k: v[0] for k, v in (files or {}).items()}) if files else form
-            params, headers = self._auth(method, url, signed_form)
+            params, headers = self._auth(method, url, signed_form, raw_body=raw)
             body = form
+            if raw is not None:
+                body = raw
+                headers['Content-Type'] = 'application/json'
             if files:
                 body = aiohttp.FormData()
                 for k, v in (form or {}).items():
@@ -392,12 +401,14 @@ class APIClient:
             result['download_new_testcases'] = True
         return result
 
-    async def get_current_batch(self, challenge_id: str, claim: bool = False) -> Optional[Dict]:
+    async def get_current_batch(self, challenge_id: str, claim: bool = False,
+                                evaluator_sha256: Optional[str] = None) -> Optional[Dict]:
         """The batch currently exposed for evaluation (as this validator sees it), or None.
 
         Split evaluation mode: the challenge server hands each validator its own design (a batch of one).
         claim=True means this validator is idle and its EDA server is ready: when nothing is waiting for
-        it, ask the server for work (an older server ignores the parameter)."""
+        it, ask the server for work (an older server ignores the parameter). evaluator_sha256: the evaluator
+        its EDA server has ready (the server gives work only with the evaluator in use ready)."""
         state = await self._sync()
         if state is not None and (state.get('challenge') or {}).get('challenge_id') == challenge_id:
             batch = state.get('batch')
@@ -408,14 +419,15 @@ class APIClient:
 
         status, body, _ = await self._signed(
             "GET", f"{self.api_url}/api/v1/challenges/{challenge_id}/batch/current", timeout=15,
-            extra_params={'claim': 'true'} if claim else None)
+            extra_params=({'claim': 'true', **({'evaluator_sha256': evaluator_sha256} if evaluator_sha256 else {})}
+                          if claim else None))
         if status != 200:
             if status is not None:
                 logger.debug(f"No current batch: HTTP {status}")
             return None
         batch = json.loads(body)
         if batch.get('batch_id'):
-            logger.info(f"Found current batch: {batch['batch_id']} with {batch.get('available_submissions', 0)} submissions")
+            logger.debug(f"Found current batch: {batch['batch_id']} with {batch.get('available_submissions', 0)} submissions")
             return batch
         return None
 
@@ -437,6 +449,113 @@ class APIClient:
                 logger.warning(f"Heartbeat for {batch_id} failed: {e}")
             await asyncio.sleep(every)
 
+    async def report_status(self, payload: Dict) -> Optional[int]:
+        """POST /validator/status (see StatusReporter). Returns the HTTP status (None: unreachable)."""
+        status, body, _ = await self._signed("POST", f"{self.api_url}/api/v1/validator/status", timeout=15,
+                                             json_body=payload)
+        if status not in (200, 404, None):
+            logger.debug(f"/validator/status: HTTP {status} {str(body)[:200]}")
+        return status
+
+    # ------------------------------------------------------------------
+    # Evaluator distribution (see EvaluatorManager)
+    # ------------------------------------------------------------------
+
+    async def download_evaluator(self, url_path: str, dest: Path, sha256: str, size: Optional[int] = None) -> bool:
+        """Stream the signed evaluator zip to `dest` and check its sha256 (a cached file with the right hash
+        is reused)."""
+        if dest.exists() and hashlib.sha256(dest.read_bytes()).hexdigest() == sha256:
+            return True
+        limit = int(os.getenv("MAX_EVALUATOR_MB", "300")) * 1024 * 1024
+        url = f"{self.api_url}{url_path}"
+        tmp = dest.with_suffix(".part")
+        for attempt in range(3):
+            params, headers = self._auth("GET", url)
+            digest, got = hashlib.sha256(), 0
+            try:
+                async with self.session.get(url, params=params, headers=headers,
+                                            timeout=aiohttp.ClientTimeout(total=3600, sock_read=120)) as response:
+                    if response.status != 200:
+                        logger.error(f"Evaluator download: HTTP {response.status}")
+                        if response.status < 500:
+                            return False
+                        raise aiohttp.ClientError(f"HTTP {response.status}")
+                    async with aiofiles.open(tmp, 'wb') as f:
+                        async for chunk in response.content.iter_chunked(1024 * 1024):
+                            got += len(chunk)
+                            if got > limit:
+                                logger.error("Evaluator download larger than MAX_EVALUATOR_MB - refused")
+                                tmp.unlink(missing_ok=True)
+                                return False
+                            digest.update(chunk)
+                            await f.write(chunk)
+            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                logger.warning(f"Evaluator download failed (attempt {attempt + 1}/3): {e!r}")
+                await asyncio.sleep(5 * (attempt + 1))
+                continue
+            if digest.hexdigest() != sha256:
+                logger.error(f"Downloaded evaluator has sha256 {digest.hexdigest()[:16]}, expected {sha256[:16]} - discarded")
+                tmp.unlink(missing_ok=True)
+                return False
+            os.replace(tmp, dest)
+            logger.info(f"Downloaded evaluator {sha256[:12]} ({got / 1e6:.1f} MB)")
+            return True
+        return False
+
+    async def download_evaluator_signature(self, url_path: str) -> Optional[bytes]:
+        status, body, _ = await self._signed("GET", f"{self.api_url}{url_path}", timeout=30, attempts=3, read="bytes")
+        if status != 200 or not body:
+            logger.error(f"Evaluator signature download: HTTP {status}")
+            return None
+        return body
+
+    async def eda_health(self) -> Optional[Dict]:
+        """GET /v2/health of the EDA server: its JSON (also while it is not ready), or None when unreachable."""
+        try:
+            async with self.session.get(f"{self.eda_server_url}/v2/health",
+                                        timeout=aiohttp.ClientTimeout(total=15)) as response:
+                body = await json_capped(response)
+                return body if isinstance(body, dict) else {}
+        except Exception as e:
+            info_on_change(logger, "eda_health", f"EDA server {self.eda_server_url} unreachable: {e!r}")
+            return None
+
+    async def eda_evaluator_state(self, sha256: str) -> Optional[Dict]:
+        """GET /v2/evaluator/<sha>: {phase, error, ...}; {} when the EDA server never saw it; None unreachable."""
+        try:
+            async with self.session.get(f"{self.eda_server_url}/v2/evaluator/{sha256}",
+                                        timeout=aiohttp.ClientTimeout(total=15)) as response:
+                if response.status == 404:
+                    return {}
+                body = await json_capped(response)
+                return body if isinstance(body, dict) else {}
+        except Exception as e:
+            logger.debug(f"EDA evaluator state unavailable: {e!r}")
+            return None
+
+    async def eda_install_evaluator(self, zip_path: Path, signature: bytes, sha256: str) -> tuple:
+        """POST /v2/evaluator (the EDA server verifies the signature, then installs). (accepted, error code)."""
+        form = aiohttp.FormData()
+        form.add_field('evaluator_zip', zip_path.read_bytes(), filename=zip_path.name, content_type='application/zip')
+        form.add_field('evaluator_sig', signature, filename=zip_path.name + '.sshsig', content_type='text/plain')
+        form.add_field('evaluator_sha256', sha256)
+        headers = {}
+        token = os.getenv("EDA_ADMIN_TOKEN", "").strip()
+        if token:
+            headers['Authorization'] = f"Bearer {token}"
+        try:
+            async with self.session.post(f"{self.eda_server_url}/v2/evaluator", data=form, headers=headers,
+                                         timeout=aiohttp.ClientTimeout(total=600)) as response:
+                body = await json_capped(response)
+                if response.status in (200, 201, 202):
+                    return True, None
+                code = (body.get('error') or {}).get('code') if isinstance(body, dict) else None
+                logger.error(f"EDA server refused the evaluator: HTTP {response.status} {str(body)[:300]}")
+                return False, code or f"EDA_HTTP_{response.status}"
+        except Exception as e:
+            logger.error(f"Sending the evaluator to the EDA server failed: {e!r}")
+            return False, "EDA_UNREACHABLE"
+
     async def get_banned_coldkeys(self, challenge_id: str) -> Optional[Dict]:
         """Permanent + this challenge's bans ({"count", "bans": [...]}), or None on failure
         (the caller keeps its cached list)."""
@@ -451,7 +570,7 @@ class APIClient:
             logger.error(f"Failed to fetch banned coldkeys: HTTP {status} {str(body)[:200]}")
             return None
         data = json.loads(body)
-        logger.info(f"Fetched {data.get('count', len(data.get('bans', [])))} banned coldkeys for {challenge_id}")
+        logger.debug(f"Fetched {data.get('count', len(data.get('bans', [])))} banned coldkeys for {challenge_id}")
         return data
 
     # ------------------------------------------------------------------
@@ -478,7 +597,7 @@ class APIClient:
             filename = disposition.split('filename=', 1)[1].split(';')[0].strip().strip('"')
         if not content.startswith(b'PK'):
             logger.warning(f"Downloaded {submission_id} does not look like a ZIP file")
-        logger.info(f"Downloaded {submission_id}: {len(content)} bytes")
+        logger.debug(f"Downloaded {submission_id}: {len(content)} bytes")
         return {'content': content, 'filename': filename or f"{submission_id}.zip", 'submission_id': submission_id,
                 'chain_commit': headers.get('X-Chain-Commit')}
 
@@ -502,7 +621,7 @@ class APIClient:
             'evaluation_details': details,
         }
         # v2 evaluator: result status and projection hash, compared across validators by the server
-        for key in ('eval_status', 'projection_hash'):
+        for key in ('eval_status', 'projection_hash', 'evaluator_sha256'):
             if evaluation.get(key):
                 form_data[key] = str(evaluation[key])
         files = None
@@ -515,7 +634,7 @@ class APIClient:
         url = f"{self.api_url}/api/v1/challenges/{challenge_id}/submissions/{submission_id}/submit_score"
         status, body, _ = await self._signed("POST", url, form=form_data, timeout=60, attempts=3, files=files)
         if status == 200:
-            logger.info(f"Submitted evaluation for {submission_id}: score {evaluation['overall_score']}")
+            logger.debug(f"Submitted evaluation for {submission_id}: score {evaluation['overall_score']}")
             return True
         logger.error(f"Failed to submit evaluation for {submission_id}: HTTP {status} {str(body)[:300]}")
         return False
@@ -546,7 +665,7 @@ class APIClient:
         if not submissions:
             return {}
         
-        logger.info(f"Downloading {len(submissions)} submissions in parallel")
+        logger.debug(f"Downloading {len(submissions)} submissions in parallel")
         
         # Hash the miner signed, when the server provides it (challenge server >= 2026-09)
         expected_hash = {s['submission_id']: s.get('file_hash') for s in submissions}
@@ -585,7 +704,7 @@ class APIClient:
                     self.chain_commits[submission_id] = commit
                 downloaded[submission_id] = content
                 
-                logger.info(f"Successfully downloaded {submission_id}: {len(content)} bytes")
+                logger.debug(f"Successfully downloaded {submission_id}: {len(content)} bytes")
                 
                 # Save to local file using server-provided filename
                 batch_dir = self.submissions_dir / path_component(batch['batch_id'], 'batch')
@@ -594,11 +713,11 @@ class APIClient:
                 file_path = batch_dir / filename
                 async with aiofiles.open(file_path, 'wb') as f:
                     await f.write(content)
-                logger.info(f"Saved {submission_id} as: {filename}")
+                logger.debug(f"Saved {submission_id} as: {filename}")
             else:
                 logger.warning(f"Invalid or empty result for {submission_id}")
         
-        logger.info(f"Successfully downloaded {len(downloaded)} submissions")
+        logger.debug(f"Successfully downloaded {len(downloaded)} submissions")
         return downloaded
     
     async def eda_server_ready(self) -> bool:
@@ -638,17 +757,18 @@ class APIClient:
 
     async def evaluate_submissions_with_eda_server(self, challenge_id: str, submissions: Dict[str, bytes],
                                                    deadline: Optional[datetime] = None,
-                                                   window_start: Optional[datetime] = None) -> Dict[str, Dict]:
+                                                   window_start: Optional[datetime] = None,
+                                                   evaluator_sha256: Optional[str] = None) -> Dict[str, Dict]:
         """Evaluate submissions on the EDA server, at most EDA_MAX_CONCURRENCY at a time, each
         within the time left before the server's evaluation deadline. The EDA server is told that time
         (time_limit_s) and the time every submission of the batch is entitled to (fair_limit_s), so it
         stops a run on the batch's clock and says whose fault a timeout is."""
-        logger.info(f"Evaluating {len(submissions)} submissions with EDA server using test cases")
+        logger.debug(f"Evaluating {len(submissions)} submissions with EDA server using test cases")
 
         if self.use_dummy_evaluation:
             return await self._dummy_evaluate_submissions(submissions)
         if self.eda_api == "v2":
-            return await self._evaluate_v2(submissions, deadline)
+            return await self._evaluate_v2(submissions, deadline, evaluator_sha256)
 
         evaluator_zip_path = self.get_testcase_files(challenge_id)
         if not evaluator_zip_path.exists():
@@ -732,7 +852,7 @@ class APIClient:
             submission_id, evaluation_result = result
             evaluations[submission_id] = evaluation_result
 
-        logger.info(f"EDA server evaluation completed for {len(evaluations)} submissions")
+        logger.debug(f"EDA server evaluation completed for {len(evaluations)} submissions")
         return evaluations
 
     @property
@@ -764,12 +884,13 @@ class APIClient:
         self._v2_evaluator = (sha, time.monotonic())
         return sha
 
-    async def _evaluate_v2(self, submissions: Dict[str, bytes], deadline: Optional[datetime]) -> Dict[str, Dict]:
+    async def _evaluate_v2(self, submissions: Dict[str, bytes], deadline: Optional[datetime],
+                           evaluator_sha256: Optional[str] = None) -> Dict[str, Dict]:
         semaphore = asyncio.Semaphore(self.eda_max_concurrency)
 
         async def one(submission_id: str, data: bytes) -> tuple:
             async with semaphore:
-                return submission_id, await self._evaluate_v2_one(submission_id, data, deadline)
+                return submission_id, await self._evaluate_v2_one(submission_id, data, deadline, evaluator_sha256)
 
         evaluations = {}
         for result in await asyncio.gather(*[one(s, d) for s, d in submissions.items()], return_exceptions=True):
@@ -777,7 +898,6 @@ class APIClient:
                 logger.error(f"Evaluation task failed: {result}")
                 continue
             evaluations[result[0]] = result[1]
-        logger.info(f"EDA server evaluation completed for {len(evaluations)} submissions")
         return evaluations
 
     def _v2_failure(self, submission_id: str, code: str, message: str, **extra) -> Dict:
@@ -785,7 +905,8 @@ class APIClient:
             'status': 'eda_system_error', 'code': code, 'where': extra.pop('where', 'validator'),
             'message': message, **extra})
 
-    async def _evaluate_v2_one(self, submission_id: str, data: bytes, deadline: Optional[datetime]) -> Dict:
+    async def _evaluate_v2_one(self, submission_id: str, data: bytes, deadline: Optional[datetime],
+                               evaluator_sha256: Optional[str] = None) -> Dict:
         budget = self._eda_time_budget(deadline)
         if budget - self.eda_answer_margin < self.eda_min_limit:
             return self._generate_fallback_evaluation(submission_id, evaluation_details=self._timeout_details(
@@ -796,7 +917,7 @@ class APIClient:
             return self._v2_failure(submission_id, 'VALIDATOR_NO_CHAIN_COMMIT',
                                     "The challenge server sent no chain_commit for this design, so it cannot be "
                                     "evaluated in T1/T2. Not a property of the submission.")
-        sha = await self._v2_active_evaluator()
+        sha = evaluator_sha256 or await self._v2_active_evaluator()
         if sha is None:
             return self._v2_failure(submission_id, 'VALIDATOR_EDA_NOT_READY', "The validator's EDA server is not ready.")
         submitter = json.loads(chain_commit).get('hotkey') if chain_commit else None
@@ -811,8 +932,8 @@ class APIClient:
         if chain_commit:
             form.add_field('chain_commit', chain_commit)
         started = time.monotonic()
-        logger.info(f"Sending {submission_id} to the EDA server ({len(data)} bytes, {self.eda_mode}, request {rid}, "
-                    f"up to {budget:.0f}s)")
+        logger.debug(f"Sending {submission_id} to the EDA server ({len(data)} bytes, {self.eda_mode}, request {rid}, "
+                     f"evaluator {sha[:12]}, up to {budget:.0f}s)")
         try:
             async with self.session.post(f"{self.eda_server_url}/v2/evaluate", data=form,
                                          timeout=aiohttp.ClientTimeout(total=min(900, max(60, budget)))) as response:
@@ -827,7 +948,8 @@ class APIClient:
                 async with self.session.get(f"{self.eda_server_url}/v2/status/{rid}",
                                             timeout=aiohttp.ClientTimeout(total=60)) as response:
                     if response.status == 200:
-                        return self._transform_v2(await json_capped(response), submission_id)
+                        return {**self._transform_v2(await json_capped(response), submission_id),
+                                'evaluator_sha256': sha}
                     if response.status != 202:
                         return self._v2_failure(submission_id, 'VALIDATOR_EDA_HTTP_ERROR',
                                                 f"The EDA server answered HTTP {response.status} for the status. Not a "
@@ -878,7 +1000,6 @@ class APIClient:
                   'projection_hash': result.get('projection_sha256') or None, 'public_report_gz': report_gz}
         s = self._v2_score(result)
         if status == 'PASSED' and s is not None:
-            logger.info(f"{submission_id}: PASSED ({result.get('tier_reached')}), S={s:.6f}")
             return {'overall_score': s, 'functionality_score': 100.0, 'area_score': 0.0, 'delay_score': 0.0,
                     'power_score': 0.0, 'passed_testbench': True, 'functional_gate': True, 'overall_gate': True,
                     'timeout_occurred': False, 'evaluation_details': json.dumps(details),
@@ -886,13 +1007,11 @@ class APIClient:
         if status == 'REJECTED':
             code = next((p.get('code') for p in problems if p.get('code')), None) or \
                 ((report or {}).get('verdict') or {}).get('failure_code')
-            logger.info(f"{submission_id}: REJECTED ({code})")
             return {'overall_score': 0.0, 'functionality_score': 0.0, 'area_score': 0.0, 'delay_score': 0.0,
                     'power_score': 0.0, 'passed_testbench': False, 'functional_gate': False, 'overall_gate': False,
                     'timeout_occurred': False, 'evaluation_details': json.dumps(details),
                     'evaluation_notes': f"EDA v2 evaluation for {submission_id}: REJECTED ({code})", **common}
         code = next((p.get('code') for p in problems if p.get('code')), None) or f"EDA_{status or 'UNKNOWN'}"
-        logger.error(f"{submission_id}: EDA {status or 'unknown result'} ({code}) - not the design's score")
         failed = self._generate_fallback_evaluation(submission_id, evaluation_details={
             'status': 'eda_system_error', 'code': code, 'where': 'eda_server',
             'message': f"The evaluator ended {status or 'without a result'}; not a property of the submission.",
@@ -1069,7 +1188,7 @@ class APIClient:
     
     async def submit_all_evaluations(self, challenge_id: str, evaluations: Dict[str, Dict]) -> Dict[str, bool]:
         """Submit all evaluations in parallel"""
-        logger.info(f"Submitting {len(evaluations)} evaluations")
+        logger.debug(f"Submitting {len(evaluations)} evaluations")
         
         tasks = []
         for submission_id, evaluation in evaluations.items():
@@ -1087,7 +1206,7 @@ class APIClient:
                 results[submission_id] = result
         
         successful = sum(1 for success in results.values() if success)
-        logger.info(f"Successfully submitted {successful}/{len(evaluations)} evaluations")
+        logger.debug(f"Successfully submitted {successful}/{len(evaluations)} evaluations")
         
         return results
     
