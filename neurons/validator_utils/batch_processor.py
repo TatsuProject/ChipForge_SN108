@@ -80,6 +80,11 @@ class BatchProcessor:
                 logger.error(f"Batch {batch_id}: the EDA server returned no evaluation")
                 return False
 
+            # Every result names the evaluator it belongs to, also those the validator made itself (no time
+            # left, EDA server unreachable ...): the server refuses a result without it
+            for ev in evaluations.values():
+                if evaluator_sha256 and not ev.get('evaluator_sha256'):
+                    ev['evaluator_sha256'] = evaluator_sha256
             self._status("submitting_result", None, one)
             submitted = await self.api_client.submit_all_evaluations(challenge_id, evaluations)
             uids = {s['submission_id']: s.get('miner_uid') for s in listed}
@@ -88,7 +93,15 @@ class BatchProcessor:
                 logger.info(f"Evaluated {sid} (UID {uid if uid is not None else '?'}): {result_line(ev)}"
                             + ("" if submitted.get(sid) else " - NOT accepted by the challenge server"))
             if not any(submitted.values()):
-                logger.error(f"Batch {batch_id}: no result was accepted by the challenge server")
+                codes = {self.api_client.last_submit_status.get(sid) for sid in evaluations}
+                if all(c is not None and 400 <= c < 500 and c != 429 for c in codes):
+                    # refused for good (not a network problem): sending the same results again cannot help, so the
+                    # batch is not retried every cycle; the server re-assigns the design when its assignment ends
+                    logger.error(f"Batch {batch_id}: the challenge server refused every result (HTTP "
+                                 f"{', '.join(str(c) for c in sorted(codes))}); not retrying it")
+                    self.state.mark_batch_evaluated(batch_id)
+                else:
+                    logger.error(f"Batch {batch_id}: no result was accepted by the challenge server")
                 return False
 
             self.state.mark_batch_evaluated(batch_id)

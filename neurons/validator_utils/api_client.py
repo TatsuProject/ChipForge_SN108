@@ -142,6 +142,8 @@ class APIClient:
         self._sync_state: Optional[Dict] = None
         # Submissions the server says this validator already evaluated (HTTP 409 on download)
         self.already_evaluated: set = set()
+        # submission_id -> HTTP status of its last result submission (None: server unreachable)
+        self.last_submit_status: Dict[str, Optional[int]] = {}
         # submission_id -> cf-chain-commit/1 JSON text from the challenge server, passed to the v2
         # EDA server verbatim (every validator must send the identical object)
         self.chain_commits: Dict[str, str] = {}
@@ -663,6 +665,7 @@ class APIClient:
                      f"gates={form_data['functional_gate']}/{form_data['overall_gate']}")
         url = f"{self.api_url}/api/v1/challenges/{challenge_id}/submissions/{submission_id}/submit_score"
         status, body, _ = await self._signed("POST", url, form=form_data, timeout=60, attempts=3, files=files)
+        self.last_submit_status[submission_id] = status
         if status == 200:
             logger.debug(f"Submitted evaluation for {submission_id}: score {evaluation['overall_score']}")
             return True

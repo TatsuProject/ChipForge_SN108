@@ -322,3 +322,24 @@ def test_status_details_are_cut_to_what_the_server_accepts():
     r = StatusReporter(SimpleNamespace())
     r.set("install_failed", "EDA code: weird/stuff <x>\n" + "z" * 200)
     assert len(r.detail) <= 80 and all(c.isalnum() or c in " _.()'-" for c in r.detail)
+
+
+async def test_results_the_validator_makes_itself_name_the_batchs_evaluator(processor):
+    """No time left / EDA unreachable: the validator builds the result; it must still carry the evaluator."""
+    bp, api, _ = processor
+    api.evaluate_submissions_with_eda_server = AsyncMock(return_value={"s1": {
+        "overall_score": 0.0, "timeout_occurred": True, "evaluation_details": json.dumps({"code": "VALIDATOR_NO_TIME_TO_START"})}})
+    await bp.process_batch("c1", {"batch_id": "split-9", "submissions": [{"submission_id": "s1"}]}, SHA)
+    sent = api.submit_all_evaluations.await_args.args[1]
+    assert sent["s1"]["evaluator_sha256"] == SHA
+
+
+async def test_a_batch_whose_results_are_refused_is_not_retried_every_cycle(processor):
+    bp, api, _ = processor
+    api.submit_all_evaluations = AsyncMock(return_value={"s1": False})
+    api.last_submit_status = {"s1": 409}
+    assert not await bp.process_batch("c1", {"batch_id": "split-r", "submissions": [{"submission_id": "s1"}]}, SHA)
+    assert "split-r" in bp.state.evaluated_batches
+    api.last_submit_status = {"s1": None}                                 # server unreachable: retried next cycle
+    assert not await bp.process_batch("c1", {"batch_id": "split-n", "submissions": [{"submission_id": "s1"}]}, SHA)
+    assert "split-n" not in bp.state.evaluated_batches
