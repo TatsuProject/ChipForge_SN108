@@ -61,6 +61,7 @@ class FakeSession:
 def client_factory(tmp_path, monkeypatch):
     monkeypatch.setenv("CHIPFORGE_DATA_DIR", str(tmp_path))
     monkeypatch.delenv("USE_DUMMY_EVALUATION", raising=False)
+    monkeypatch.setenv("EDA_API", "v1")          # these tests drive the npu-v1 /evaluate route
 
     def make(handler, concurrency=4, with_testcases=True):
         monkeypatch.setenv("EDA_MAX_CONCURRENCY", str(concurrency))
@@ -337,3 +338,117 @@ def test_challenge_id_never_escapes_the_testcases_dir(client_factory):
     client = client_factory(lambda kw: FakeResponse(), with_testcases=False)
     for cid in ("../../x", "/etc/passwd", "a/b"):
         assert client.get_testcase_files(cid).parent == client.base_dir / "testcases"
+
+
+# --- npu-v2 evaluator --------------------------------------------------------------------------------
+
+V2_SHA = "ab" * 32
+
+
+def _v2_result(status="PASSED", s=4.06, projection="7a" * 32, problems=()):
+    return {"schema": "cf-response/1", "status": status, "tier_reached": "T2" if status == "PASSED" else "T0",
+            "problems": list(problems), "projection_sha256": projection, "evaluator_sha256": V2_SHA,
+            "public_report": {"schema": "cf-public-report/1", "verdict": {"status": status, "score_S": s},
+                              "score": {"S": {"value": s}}}}
+
+
+class V2Server:
+    """Fake v2 EDA server: health, evaluate (202), status (202 `polls` times, then the result)."""
+    def __init__(self, result, polls=1, health=None, evaluate_status=202):
+        self.result, self.polls, self.forms = result, polls, []
+        self.health = health or {"ready": True, "active_evaluator": V2_SHA}
+        self.evaluate_status = evaluate_status
+
+    def __call__(self, kw):
+        url = kw.get("url", "")
+        if url.endswith("/v2/health"):
+            return FakeResponse(json_data=self.health)
+        if "data" in kw:                                    # POST /v2/evaluate
+            fields = {f[0]["name"]: f[2] for f in kw["data"]._fields}
+            self.forms.append(fields)
+            return FakeResponse(status=self.evaluate_status, json_data={"request_id": fields["request_id"], "phase": "running"}
+                                if self.evaluate_status == 202 else {"error": {"code": "INVALID_CHAIN_COMMIT"}})
+        if self.polls > 0:
+            self.polls -= 1
+            return FakeResponse(status=202, json_data={"phase": "running"})
+        return FakeResponse(json_data=self.result)
+
+
+@pytest.fixture()
+def v2_client(client_factory, monkeypatch):
+    def make(server):
+        monkeypatch.setenv("EDA_API", "v2")
+        monkeypatch.setenv("EDA_POLL_SECONDS", "1")
+        client = client_factory(server, with_testcases=False)
+        client.eda_poll_seconds = 0.01
+        return client
+    return make
+
+
+async def test_v2_passed_sends_chain_commit_and_maps_s(v2_client):
+    server = V2Server(_v2_result())
+    client = v2_client(server)
+    content = b"PK-design"
+    client.chain_commits["s1"] = _commit(content)
+    ev = (await client.evaluate_submissions_with_eda_server("c1", {"s1": content}))["s1"]
+    assert ev["overall_score"] == 4.06 and ev["functional_gate"] and ev["overall_gate"] and ev["passed_testbench"]
+    assert ev["eval_status"] == "PASSED" and ev["projection_hash"] == "7a" * 32
+    import gzip
+    assert json.loads(gzip.decompress(ev["public_report_gz"]))["score"]["S"]["value"] == 4.06
+    form = server.forms[0]
+    assert form["mode"] == "T2" and form["evaluator_sha256"] == V2_SHA and form["chain_commit"] == _commit(content)
+    assert form["submitter"] == "5Miner"
+
+
+async def test_v2_rejected_is_a_real_zero(v2_client):
+    client = v2_client(V2Server(_v2_result("REJECTED", None, problems=[{"code": "NPU_PORT_MISMATCH", "fault": "miner"}])))
+    client.chain_commits["s1"] = _commit(b"PK")
+    ev = (await client.evaluate_submissions_with_eda_server("c1", {"s1": b"PK"}))["s1"]
+    assert ev["overall_score"] == 0 and not ev["functional_gate"] and ev["eval_status"] == "REJECTED"
+    assert "NPU_PORT_MISMATCH" in ev["evaluation_notes"] and "FAILED" not in ev["evaluation_notes"].upper()
+
+
+@pytest.mark.parametrize("status", ["INCOMPLETE", "ERROR"])
+async def test_v2_system_fault_is_never_the_miners_score(v2_client, status):
+    client = v2_client(V2Server(_v2_result(status, None, problems=[{"code": "EVALUATION_RANDOMNESS_UNAVAILABLE"}])))
+    client.chain_commits["s1"] = _commit(b"PK")
+    ev = (await client.evaluate_submissions_with_eda_server("c1", {"s1": b"PK"}))["s1"]
+    # challenge server: score 0 + not passed + FAILED in notes = a failed (retryable) evaluation; status = system
+    assert ev["overall_score"] == 0 and "FAILED" in ev["evaluation_notes"].upper() and ev["eval_status"] == status
+
+
+async def test_v2_without_chain_commit_is_not_sent(v2_client):
+    server = V2Server(_v2_result())
+    client = v2_client(server)
+    ev = (await client.evaluate_submissions_with_eda_server("c1", {"s1": b"PK"}))["s1"]
+    assert server.forms == [] and "VALIDATOR_NO_CHAIN_COMMIT" in ev["evaluation_details"]
+
+
+async def test_v2_refused_request_is_a_system_fault(v2_client):
+    client = v2_client(V2Server(_v2_result(), evaluate_status=400))
+    client.chain_commits["s1"] = _commit(b"PK")
+    ev = (await client.evaluate_submissions_with_eda_server("c1", {"s1": b"PK"}))["s1"]
+    assert "INVALID_CHAIN_COMMIT" in ev["evaluation_details"] and "FAILED" in ev["evaluation_notes"].upper()
+
+
+async def test_v2_not_ready_server(v2_client):
+    client = v2_client(V2Server(_v2_result(), health={"ready": False}))
+    assert not await client.eda_server_ready()
+    assert not client.needs_testcases
+
+
+async def test_v2_report_is_sent_with_its_signed_sha(client_factory, monkeypatch):
+    monkeypatch.setenv("EDA_API", "v2")
+    client = client_factory(lambda kw: FakeResponse())
+    sent = {}
+
+    async def fake_signed(method, url, form=None, files=None, **kw):
+        sent.update(form=form, files=files)
+        return 200, "{}", {}
+    client._signed = fake_signed
+    gz = b"\x1f\x8bfake"
+    ev = {"overall_score": 4.06, "functionality_score": 0, "area_score": 0, "delay_score": 0, "power_score": 0,
+          "passed_testbench": True, "public_report_gz": gz}
+    assert await client.submit_evaluation("c1", "s1", ev)
+    assert sent["files"]["public_report"][1] == gz
+    assert sent["form"]["public_report_sha256"] == hashlib.sha256(gz).hexdigest()

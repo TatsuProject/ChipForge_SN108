@@ -123,6 +123,12 @@ class APIClient:
         
         # EDA Server configuration
         self.eda_server_url = os.getenv("EDA_SERVER_URL", "http://localhost:8080")
+        # v2 = the npu-v2 evaluator (POST /v2/evaluate + /v2/status, chain_commit, score S); v1 = the retired
+        # /evaluate of the npu-v1 EDA server (main branch), kept for older test setups
+        self.eda_api = os.getenv("EDA_API", "v2").strip().lower()
+        self.eda_mode = os.getenv("EDA_MODE", "T2").strip().upper()
+        self.eda_poll_seconds = max(1.0, float(os.getenv("EDA_POLL_SECONDS", "30")))
+        self._v2_evaluator: Optional[tuple] = None          # (sha256, fetched_at)
         self.use_dummy_evaluation = os.getenv("USE_DUMMY_EVALUATION", "false").lower() == "true"
         
         # Validator authentication
@@ -196,17 +202,27 @@ class APIClient:
 
     async def _signed(self, method: str, url: str, *, form: Optional[Dict] = None, timeout: float = 30,
                       attempts: int = 1, read: str = "text", extra_headers: Optional[Dict] = None,
-                      extra_params: Optional[Dict] = None):
+                      extra_params: Optional[Dict] = None, files: Optional[Dict[str, tuple]] = None):
         """Signed request with retries on network errors and 5xx (fresh signature and nonce
-        per attempt). Returns (status, body, headers); status None = unreachable."""
+        per attempt). Returns (status, body, headers); status None = unreachable.
+        files: {field: (filename, bytes, content type)} sent as multipart parts; the signature covers
+        their filenames (as the server canonicalises file parts), so callers sign a hash of the content."""
         for attempt in range(attempts):
-            params, headers = self._auth(method, url, form)
+            signed_form = dict(form or {}, **{k: v[0] for k, v in (files or {}).items()}) if files else form
+            params, headers = self._auth(method, url, signed_form)
+            body = form
+            if files:
+                body = aiohttp.FormData()
+                for k, v in (form or {}).items():
+                    body.add_field(k, str(v))
+                for k, (filename, content, ctype) in files.items():
+                    body.add_field(k, content, filename=filename, content_type=ctype)
             if extra_params:
                 params.update(extra_params)
             if extra_headers:
                 headers.update(extra_headers)
             try:
-                async with self.session.request(method, url, params=params, headers=headers, data=form,
+                async with self.session.request(method, url, params=params, headers=headers, data=body,
                                                 timeout=aiohttp.ClientTimeout(total=timeout)) as response:
                     raw = await read_capped(response)
                     body = raw if read == "bytes" else raw.decode("utf-8", errors="replace")
@@ -489,10 +505,15 @@ class APIClient:
         for key in ('eval_status', 'projection_hash'):
             if evaluation.get(key):
                 form_data[key] = str(evaluation[key])
+        files = None
+        report_gz = evaluation.get('public_report_gz')
+        if report_gz:                       # v2: the EDA server's public report, gzipped, its sha256 signed
+            form_data['public_report_sha256'] = hashlib.sha256(report_gz).hexdigest()
+            files = {'public_report': ('public_report.json.gz', report_gz, 'application/gzip')}
         logger.debug(f"Submitting evaluation for {submission_id}: score={form_data['overall_score']}, "
                      f"gates={form_data['functional_gate']}/{form_data['overall_gate']}")
         url = f"{self.api_url}/api/v1/challenges/{challenge_id}/submissions/{submission_id}/submit_score"
-        status, body, _ = await self._signed("POST", url, form=form_data, timeout=60, attempts=3)
+        status, body, _ = await self._signed("POST", url, form=form_data, timeout=60, attempts=3, files=files)
         if status == 200:
             logger.info(f"Submitted evaluation for {submission_id}: score {evaluation['overall_score']}")
             return True
@@ -585,6 +606,8 @@ class APIClient:
         have no /health and answer 404); only a connection failure means unreachable."""
         if self.use_dummy_evaluation:
             return True
+        if self.eda_api == "v2":
+            return await self._v2_active_evaluator(fresh=True) is not None
         try:
             async with self.session.get(f"{self.eda_server_url}/health",
                                         timeout=aiohttp.ClientTimeout(total=10)) as response:
@@ -624,6 +647,8 @@ class APIClient:
 
         if self.use_dummy_evaluation:
             return await self._dummy_evaluate_submissions(submissions)
+        if self.eda_api == "v2":
+            return await self._evaluate_v2(submissions, deadline)
 
         evaluator_zip_path = self.get_testcase_files(challenge_id)
         if not evaluator_zip_path.exists():
@@ -709,6 +734,170 @@ class APIClient:
 
         logger.info(f"EDA server evaluation completed for {len(evaluations)} submissions")
         return evaluations
+
+    @property
+    def needs_testcases(self) -> bool:
+        """v1 sends the challenge's test-case zip with every design; the v2 evaluator brings its own."""
+        return not self.use_dummy_evaluation and self.eda_api != "v2"
+
+    # ------------------------------------------------------------------
+    # npu-v2 evaluator: POST /v2/evaluate, poll /v2/status
+    # ------------------------------------------------------------------
+
+    async def _v2_active_evaluator(self, fresh: bool = False) -> Optional[str]:
+        """sha256 of the evaluator the EDA server runs (GET /v2/health), or None when it is not ready."""
+        if not fresh and self._v2_evaluator and time.monotonic() - self._v2_evaluator[1] < 300:
+            return self._v2_evaluator[0]
+        try:
+            async with self.session.get(f"{self.eda_server_url}/v2/health",
+                                        timeout=aiohttp.ClientTimeout(total=15)) as response:
+                health = await json_capped(response)
+        except Exception as e:
+            logger.error(f"EDA server {self.eda_server_url} unreachable: {e}")
+            return None
+        sha = health.get('active_evaluator') if isinstance(health, dict) else None
+        if not (isinstance(health, dict) and health.get('ready') and isinstance(sha, str) and len(sha) == 64):
+            logger.error(f"EDA server not ready: {str(health)[:300]}")
+            return None
+        if self._v2_evaluator is None or self._v2_evaluator[0] != sha:
+            logger.info(f"EDA evaluator {sha[:16]}...{' (MOCK MODE)' if health.get('mock') else ''}")
+        self._v2_evaluator = (sha, time.monotonic())
+        return sha
+
+    async def _evaluate_v2(self, submissions: Dict[str, bytes], deadline: Optional[datetime]) -> Dict[str, Dict]:
+        semaphore = asyncio.Semaphore(self.eda_max_concurrency)
+
+        async def one(submission_id: str, data: bytes) -> tuple:
+            async with semaphore:
+                return submission_id, await self._evaluate_v2_one(submission_id, data, deadline)
+
+        evaluations = {}
+        for result in await asyncio.gather(*[one(s, d) for s, d in submissions.items()], return_exceptions=True):
+            if isinstance(result, Exception):
+                logger.error(f"Evaluation task failed: {result}")
+                continue
+            evaluations[result[0]] = result[1]
+        logger.info(f"EDA server evaluation completed for {len(evaluations)} submissions")
+        return evaluations
+
+    def _v2_failure(self, submission_id: str, code: str, message: str, **extra) -> Dict:
+        return self._generate_fallback_evaluation(submission_id, evaluation_details={
+            'status': 'eda_system_error', 'code': code, 'where': extra.pop('where', 'validator'),
+            'message': message, **extra})
+
+    async def _evaluate_v2_one(self, submission_id: str, data: bytes, deadline: Optional[datetime]) -> Dict:
+        budget = self._eda_time_budget(deadline)
+        if budget - self.eda_answer_margin < self.eda_min_limit:
+            return self._generate_fallback_evaluation(submission_id, evaluation_details=self._timeout_details(
+                'VALIDATOR_NO_TIME_TO_START', f"Not sent to the EDA server: only {max(0, budget):.0f}s of the "
+                "evaluation time was left. Not a property of the submission.", budget=budget), timeout_occurred=True)
+        chain_commit = self.chain_commits.get(submission_id)
+        if not chain_commit and self.eda_mode in ("T1", "T2"):
+            return self._v2_failure(submission_id, 'VALIDATOR_NO_CHAIN_COMMIT',
+                                    "The challenge server sent no chain_commit for this design, so it cannot be "
+                                    "evaluated in T1/T2. Not a property of the submission.")
+        sha = await self._v2_active_evaluator()
+        if sha is None:
+            return self._v2_failure(submission_id, 'VALIDATOR_EDA_NOT_READY', "The validator's EDA server is not ready.")
+        submitter = json.loads(chain_commit).get('hotkey') if chain_commit else None
+        rid = re.sub(r"[^A-Za-z0-9._-]", "", f"{submission_id}-{self.validator_hotkey[:10]}")[:128]
+        form = aiohttp.FormData()
+        form.add_field('design_zip', data, filename=f'{submission_id}.zip', content_type='application/zip')
+        form.add_field('mode', self.eda_mode)
+        form.add_field('request_id', rid)
+        form.add_field('evaluator_sha256', sha)
+        if submitter:
+            form.add_field('submitter', re.sub(r"[^A-Za-z0-9._-]", "", submitter)[:128])
+        if chain_commit:
+            form.add_field('chain_commit', chain_commit)
+        started = time.monotonic()
+        logger.info(f"Sending {submission_id} to the EDA server ({len(data)} bytes, {self.eda_mode}, request {rid}, "
+                    f"up to {budget:.0f}s)")
+        try:
+            async with self.session.post(f"{self.eda_server_url}/v2/evaluate", data=form,
+                                         timeout=aiohttp.ClientTimeout(total=min(900, max(60, budget)))) as response:
+                body = await json_capped(response)
+                if response.status not in (200, 202):
+                    code = (body.get('error') or {}).get('code') if isinstance(body, dict) else None
+                    return self._v2_failure(submission_id, code or 'VALIDATOR_EDA_HTTP_ERROR',
+                                            f"The EDA server refused the evaluation (HTTP {response.status}). Not a "
+                                            "property of the submission.", http_status=response.status,
+                                            where='eda_server')
+            while True:
+                async with self.session.get(f"{self.eda_server_url}/v2/status/{rid}",
+                                            timeout=aiohttp.ClientTimeout(total=60)) as response:
+                    if response.status == 200:
+                        return self._transform_v2(await json_capped(response), submission_id)
+                    if response.status != 202:
+                        return self._v2_failure(submission_id, 'VALIDATOR_EDA_HTTP_ERROR',
+                                                f"The EDA server answered HTTP {response.status} for the status. Not a "
+                                                "property of the submission.", http_status=response.status)
+                if time.monotonic() - started + self.eda_poll_seconds > budget:
+                    logger.error(f"{submission_id}: no EDA result within {budget:.0f}s")
+                    return self._generate_fallback_evaluation(submission_id, evaluation_details=self._timeout_details(
+                        'VALIDATOR_EDA_NO_RESULT', f"The evaluation did not finish within the {budget:.0f}s the "
+                        "validator had for it.", budget=budget), timeout_occurred=True)
+                await asyncio.sleep(self.eda_poll_seconds)
+        except (ResponseTooLarge, ValueError) as e:
+            return self._v2_failure(submission_id, 'VALIDATOR_EDA_BAD_RESPONSE', f"Unreadable EDA response: {e}")
+        except asyncio.TimeoutError:
+            return self._v2_failure(submission_id, 'VALIDATOR_EDA_NO_RESPONSE', "The EDA server did not answer in time.")
+        except Exception as e:
+            logger.error(f"Exception during EDA evaluation for {submission_id}: {e}")
+            return self._v2_failure(submission_id, 'VALIDATOR_EDA_UNREACHABLE',
+                                    "The validator could not reach its EDA server. Not a property of the submission.",
+                                    error=str(e)[:300])
+
+    @staticmethod
+    def _v2_score(result: Dict) -> Optional[float]:
+        report = result.get('public_report') or {}
+        s = ((report.get('score') or {}).get('S') or {}).get('value')
+        if s is None:
+            s = (report.get('verdict') or {}).get('score_S')
+        try:
+            return float(s) if s is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _transform_v2(self, result: Dict, submission_id: str) -> Dict:
+        """cf-response/1 -> the evaluation the challenge server takes. PASSED: the score is S, gates passed.
+        REJECTED: a real 0 (the miner's fault), with the reason. INCOMPLETE / ERROR: a system fault (never
+        the miner's score; the server hands the design to another validator)."""
+        status = str(result.get('status') or '').upper()
+        problems = [p for p in (result.get('problems') or []) if isinstance(p, dict)]
+        report = result.get('public_report')
+        report_gz = None
+        if isinstance(report, dict):
+            import gzip
+            report_gz = gzip.compress(json.dumps(report, separators=(",", ":")).encode())
+        details = {'status': status, 'tier_reached': result.get('tier_reached'), 'summary': result.get('summary'),
+                   'problems': [{k: p.get(k) for k in ('code', 'fault', 'stage', 'public_reason') if p.get(k)}
+                                for p in problems[:20]],
+                   'evaluator_sha256': result.get('evaluator_sha256'), 'mock': bool(result.get('mock'))}
+        common = {'eval_status': status if status in ('PASSED', 'REJECTED', 'INCOMPLETE', 'ERROR') else None,
+                  'projection_hash': result.get('projection_sha256') or None, 'public_report_gz': report_gz}
+        s = self._v2_score(result)
+        if status == 'PASSED' and s is not None:
+            logger.info(f"{submission_id}: PASSED ({result.get('tier_reached')}), S={s:.6f}")
+            return {'overall_score': s, 'functionality_score': 100.0, 'area_score': 0.0, 'delay_score': 0.0,
+                    'power_score': 0.0, 'passed_testbench': True, 'functional_gate': True, 'overall_gate': True,
+                    'timeout_occurred': False, 'evaluation_details': json.dumps(details),
+                    'evaluation_notes': f"EDA v2 evaluation for {submission_id}: PASSED, S={s:.6f}", **common}
+        if status == 'REJECTED':
+            code = next((p.get('code') for p in problems if p.get('code')), None) or \
+                ((report or {}).get('verdict') or {}).get('failure_code')
+            logger.info(f"{submission_id}: REJECTED ({code})")
+            return {'overall_score': 0.0, 'functionality_score': 0.0, 'area_score': 0.0, 'delay_score': 0.0,
+                    'power_score': 0.0, 'passed_testbench': False, 'functional_gate': False, 'overall_gate': False,
+                    'timeout_occurred': False, 'evaluation_details': json.dumps(details),
+                    'evaluation_notes': f"EDA v2 evaluation for {submission_id}: REJECTED ({code})", **common}
+        code = next((p.get('code') for p in problems if p.get('code')), None) or f"EDA_{status or 'UNKNOWN'}"
+        logger.error(f"{submission_id}: EDA {status or 'unknown result'} ({code}) - not the design's score")
+        failed = self._generate_fallback_evaluation(submission_id, evaluation_details={
+            'status': 'eda_system_error', 'code': code, 'where': 'eda_server',
+            'message': f"The evaluator ended {status or 'without a result'}; not a property of the submission.",
+            **details})
+        return {**failed, **common, 'eval_status': status if status in ('INCOMPLETE', 'ERROR') else 'ERROR'}
 
     def _transform_eda_response(self, eda_result: Dict, submission_id: str) -> Dict:
         """Transform EDA server response to expected format.

@@ -816,7 +816,7 @@ class ChipForgeValidator:
                 self.state.save_state()
 
             # Check if test cases exist before processing batch
-            if not self.api_client.check_testcase_files_exist(challenge_id):
+            if self.api_client.needs_testcases and not self.api_client.check_testcase_files_exist(challenge_id):
                 logger.info(f"Test case files missing for challenge {challenge_id}, downloading...")
                 try:
                     test_cases_success = await self.api_client.download_test_cases(challenge_id)
@@ -858,7 +858,7 @@ class ChipForgeValidator:
                 logger.error(f"EDA server not reachable - skipping batch {batch_id}")
                 self._target_current_challenge_reward()
                 return
-            if not self.api_client.check_testcase_files_exist(challenge_id):
+            if self.api_client.needs_testcases and not self.api_client.check_testcase_files_exist(challenge_id):
                 logger.error(f"Test cases for {challenge_id} unavailable - skipping batch {batch_id}")
                 self._target_current_challenge_reward()
                 return
