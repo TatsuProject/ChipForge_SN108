@@ -12,8 +12,9 @@ from validator_utils.api_client import APIClient, safe_filename
 
 
 class FakeResponse:
-    def __init__(self, status=200, json_data=None, text=""):
+    def __init__(self, status=200, json_data=None, text="", headers=None):
         self.status, self._json, self._text = status, json_data, text
+        self.headers = headers or {}
 
     async def json(self):
         return self._json
@@ -371,7 +372,8 @@ class V2Server:
         if self.polls > 0:
             self.polls -= 1
             return FakeResponse(status=202, json_data={"phase": "running"})
-        return FakeResponse(json_data=self.result)
+        # the loader names the evaluator it ran
+        return FakeResponse(json_data=self.result, headers={"X-CF-Evaluator-Sha256": V2_SHA})
 
 
 @pytest.fixture()

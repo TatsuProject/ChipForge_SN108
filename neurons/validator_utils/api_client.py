@@ -28,6 +28,7 @@ from .logutil import info_on_change
 logger = logging.getLogger(__name__)
 
 _SAFE_FILENAME = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
+_EVALUATOR_PATH = re.compile(r"^/api/v1/challenges/[A-Za-z0-9_-]{1,128}/evaluator/[0-9a-f]{64}/(zip|sshsig)$")
 
 
 def safe_filename(name: Optional[str], fallback: str) -> str:
@@ -151,6 +152,8 @@ class APIClient:
         self._pending_testcases_version: Dict[str, Optional[str]] = {}
         
         self.eda_max_concurrency = max(1, int(os.getenv("EDA_MAX_CONCURRENCY", "4")))
+        # Requests to the challenge server in progress at once (it refuses more than VALIDATOR_MAX_IN_FLIGHT)
+        self._server_slots = asyncio.Semaphore(max(1, int(os.getenv("SERVER_MAX_PARALLEL", "4"))))
         # Seconds kept free before the server's evaluation deadline for submitting scores
         self.eda_deadline_buffer = int(os.getenv("EDA_DEADLINE_BUFFER_SECONDS", "90"))
         # Of an EDA request's budget, the EDA server gets all but this: a run stopped at its limit
@@ -213,6 +216,13 @@ class APIClient:
         files: {field: (filename, bytes, content type)} sent as multipart parts; the signature covers
         their filenames (as the server canonicalises file parts), so callers sign a hash of the content."""
         raw = json.dumps(json_body, separators=(",", ":")).encode() if json_body is not None else None
+        async with self._server_slots:     # the server allows a few requests in progress per validator
+            return await self._signed_attempts(method, url, form=form, timeout=timeout, attempts=attempts, read=read,
+                                               extra_headers=extra_headers, extra_params=extra_params, files=files,
+                                               raw=raw)
+
+    async def _signed_attempts(self, method: str, url: str, *, form, timeout, attempts, read, extra_headers,
+                               extra_params, files, raw):
         for attempt in range(attempts):
             signed_form = dict(form or {}, **{k: v[0] for k, v in (files or {}).items()}) if files else form
             params, headers = self._auth(method, url, signed_form, raw_body=raw)
@@ -233,8 +243,16 @@ class APIClient:
             try:
                 async with self.session.request(method, url, params=params, headers=headers, data=body,
                                                 timeout=aiohttp.ClientTimeout(total=timeout)) as response:
-                    raw = await read_capped(response)
-                    body = raw if read == "bytes" else raw.decode("utf-8", errors="replace")
+                    payload = await read_capped(response)
+                    body = payload if read == "bytes" else payload.decode("utf-8", errors="replace")
+                    if response.status == 429 and attempt < attempts - 1:
+                        # busy: too many requests in progress, or a rate limit; wait as told and retry
+                        try:
+                            wait = min(10.0, float(response.headers.get('Retry-After') or 1))
+                        except ValueError:
+                            wait = 1.0
+                        await asyncio.sleep(wait + attempt)
+                        continue
                     if response.status >= 500 and attempt < attempts - 1:
                         logger.warning(f"{method} {urlparse(url).path}: HTTP {response.status}, retrying")
                         await asyncio.sleep(2 ** attempt)
@@ -461,9 +479,18 @@ class APIClient:
     # Evaluator distribution (see EvaluatorManager)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def evaluator_path_ok(url_path: str, kind: str) -> bool:
+        """Only this server's own evaluator download paths are followed (a path such as "@host/..." appended to
+        the server URL would send the signed request, API key included, to another host)."""
+        return bool(_EVALUATOR_PATH.match(url_path or "")) and url_path.endswith("/" + kind)
+
     async def download_evaluator(self, url_path: str, dest: Path, sha256: str, size: Optional[int] = None) -> bool:
         """Stream the signed evaluator zip to `dest` and check its sha256 (a cached file with the right hash
         is reused)."""
+        if not self.evaluator_path_ok(url_path, "zip") or f"/{sha256}/" not in url_path:
+            logger.error(f"Refusing evaluator download path {url_path!r}")
+            return False
         if dest.exists() and hashlib.sha256(dest.read_bytes()).hexdigest() == sha256:
             return True
         limit = int(os.getenv("MAX_EVALUATOR_MB", "300")) * 1024 * 1024
@@ -503,6 +530,9 @@ class APIClient:
         return False
 
     async def download_evaluator_signature(self, url_path: str) -> Optional[bytes]:
+        if not self.evaluator_path_ok(url_path, "sshsig"):
+            logger.error(f"Refusing evaluator signature path {url_path!r}")
+            return None
         status, body, _ = await self._signed("GET", f"{self.api_url}{url_path}", timeout=30, attempts=3, read="bytes")
         if status != 200 or not body:
             logger.error(f"Evaluator signature download: HTTP {status}")
@@ -948,8 +978,15 @@ class APIClient:
                 async with self.session.get(f"{self.eda_server_url}/v2/status/{rid}",
                                             timeout=aiohttp.ClientTimeout(total=60)) as response:
                     if response.status == 200:
-                        return {**self._transform_v2(await json_capped(response), submission_id),
-                                'evaluator_sha256': sha}
+                        result = await json_capped(response)
+                        # the loader names the evaluator it ran in X-CF-Evaluator-Sha256 (the mock too)
+                        ran = (response.headers.get('X-CF-Evaluator-Sha256') or '').strip().lower() or None
+                        if ran and ran != sha:
+                            # never report a result under an evaluator it was not produced with
+                            return self._v2_failure(submission_id, 'VALIDATOR_EDA_WRONG_EVALUATOR',
+                                                    f"The EDA server ran evaluator {str(ran)[:16]} instead of "
+                                                    f"{sha[:16]}. Not a property of the submission.")
+                        return {**self._transform_v2(result, submission_id), 'evaluator_sha256': ran or sha}
                     if response.status != 202:
                         return self._v2_failure(submission_id, 'VALIDATOR_EDA_HTTP_ERROR',
                                                 f"The EDA server answered HTTP {response.status} for the status. Not a "

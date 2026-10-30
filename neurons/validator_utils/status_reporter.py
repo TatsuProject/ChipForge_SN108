@@ -10,6 +10,7 @@ install_failed, downloading_submission, evaluating, submitting_result."""
 import asyncio
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -41,7 +42,9 @@ class StatusReporter:
     def set(self, state: str, detail: Optional[str] = None, submission_id: Optional[str] = None,
             started_at: Optional[datetime] = None) -> None:
         """Change the state (logged once per change). started_at: when the evaluation or install began
-        (kept while the state stays the same)."""
+        (kept while the state stays the same). detail is cut to what the server accepts (80 plain characters)."""
+        if detail:
+            detail = re.sub(r"[^A-Za-z0-9 _.()'-]", "_", str(detail))[:80] or None
         if (state, detail, submission_id) == (self.state, self.detail, self.submission_id):
             return
         if state != self.state or submission_id != self.submission_id:
@@ -61,7 +64,7 @@ class StatusReporter:
             self._dirty = True
 
     def payload(self) -> dict:
-        return {"state": self.state, "detail": (self.detail or None) and str(self.detail)[:200],
+        return {"state": self.state, "detail": self.detail,
                 "evaluator_sha256": self.evaluator_sha256, "evaluator_ready": self.evaluator_ready,
                 "target_sha256": self.target_sha256, "eda_ready": self.eda_ready, "eda_mock": self.eda_mock,
                 "submission_id": self.submission_id,

@@ -269,11 +269,56 @@ async def test_evaluator_download_checks_the_hash_and_streams(make_client, tmp_p
             for i in range(0, len(self._body), 1000):
                 yield self._body[i:i + 1000]
 
-    client = make_client({"/api/v1/challenges/c1/evaluator/x/zip": lambda m, kw: Stream(content)})
+    sha = hashlib.sha256(content).hexdigest()
+    path = f"/api/v1/challenges/c1/evaluator/{sha}/zip"
+    client = make_client({path: lambda m, kw: Stream(content)})
     dest = tmp_path / "e.zip"
-    assert await client.download_evaluator("/api/v1/challenges/c1/evaluator/x/zip", dest,
-                                           hashlib.sha256(content).hexdigest())
+    assert await client.download_evaluator(path, dest, sha)
     assert dest.read_bytes() == content
     bad = tmp_path / "f.zip"
-    assert not await client.download_evaluator("/api/v1/challenges/c1/evaluator/x/zip", bad, "0" * 64)
+    client.session.routes[f"/api/v1/challenges/c1/evaluator/{'0' * 64}/zip"] = lambda m, kw: Stream(content)
+    assert not await client.download_evaluator(f"/api/v1/challenges/c1/evaluator/{'0' * 64}/zip", bad, "0" * 64)
     assert not bad.exists()
+
+
+# --- pentest fixes (2026-10-30) -----------------------------------------------------------------
+
+@pytest.mark.parametrize("path", ["@evil.example/steal", ":9999@evil.example/x", ".evil.example/x",
+                                  "/api/v1/challenges/c1/evaluator/" + "a" * 64 + "/zip?x=@evil",
+                                  "https://evil.example/api/v1/challenges/c1/evaluator/" + "a" * 64 + "/zip"])
+async def test_evaluator_paths_other_than_the_servers_own_are_refused(make_client, tmp_path, path):
+    from test_server_client import Resp
+    client = make_client({})                                  # any request would fail the test (no route)
+    assert not await client.download_evaluator(path, tmp_path / "e.zip", "a" * 64)
+    assert await client.download_evaluator_signature(path.replace("/zip", "/sshsig")) is None
+    assert client.session.calls == []
+
+
+async def test_a_result_from_another_evaluator_than_requested_is_a_system_fault(make_client, monkeypatch):
+    from test_server_client import Resp
+
+    class Session:
+        def __init__(self):
+            self.calls = []
+
+        def post(self, url, **kw):
+            return Resp(202, {"request_id": "r"})
+
+        def get(self, url, **kw):
+            return Resp(200, {"status": "PASSED", "public_report": {"score": {"S": {"value": 5.0}}}},
+                        {"X-CF-Evaluator-Sha256": "b" * 64})
+    client = make_client({})
+    client.session = Session()
+    client.chain_commits["s1"] = json.dumps({"hotkey": "5M"})
+    ev = await client._evaluate_v2_one("s1", b"zip", None, evaluator_sha256="a" * 64)
+    assert "VALIDATOR_EDA_WRONG_EVALUATOR" in ev["evaluation_details"] and ev["overall_score"] == 0
+    Session.get = lambda self, url, **kw: Resp(200, {"status": "PASSED", "public_report": {"score": {"S": {"value": 5.0}}}},
+                                               {"X-CF-Evaluator-Sha256": "a" * 64})
+    ev = await client._evaluate_v2_one("s1", b"zip", None, evaluator_sha256="a" * 64)
+    assert ev["overall_score"] == 5.0 and ev["evaluator_sha256"] == "a" * 64
+
+
+def test_status_details_are_cut_to_what_the_server_accepts():
+    r = StatusReporter(SimpleNamespace())
+    r.set("install_failed", "EDA code: weird/stuff <x>\n" + "z" * 200)
+    assert len(r.detail) <= 80 and all(c.isalnum() or c in " _.()'-" for c in r.detail)
