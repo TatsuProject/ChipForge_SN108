@@ -277,7 +277,9 @@ class ChipForgeValidator:
                 self.state.last_challenge_id = None
                 self.state.current_challenge_expires_at = None
                 self.state.save_state()
-            self.status.set("idle", "no active quest")
+            # Check the EDA server anyway, so the status (and the website) says whether it is up between quests
+            eda_up, _ = await self.evaluators.ready_sha(None)
+            self.status.set("idle" if eda_up else "eda_offline", "no active quest")
             return
         challenge_id = challenge['challenge_id']
         if self.state.last_challenge_id != challenge_id:

@@ -343,3 +343,22 @@ async def test_a_batch_whose_results_are_refused_is_not_retried_every_cycle(proc
     api.last_submit_status = {"s1": None}                                 # server unreachable: retried next cycle
     assert not await bp.process_batch("c1", {"batch_id": "split-n", "submissions": [{"submission_id": "s1"}]}, SHA)
     assert "split-n" not in bp.state.evaluated_batches
+
+
+@pytest.mark.parametrize("health, state, eda_ready", [
+    ({"ready": True, "active_evaluator": "a" * 64}, "idle", True),
+    (None, "eda_offline", False),
+])
+async def test_without_a_quest_the_status_still_says_whether_the_eda_server_is_up(health, state, eda_ready):
+    from neurons.validator import ChipForgeValidator
+    v = ChipForgeValidator.__new__(ChipForgeValidator)
+    v.maybe_sync_metagraph = AsyncMock()
+    v.apply_emission_percentage = lambda *a: None
+    v.state = SimpleNamespace(last_challenge_id=None)
+    v.status = StatusReporter(SimpleNamespace())
+    v.api_client = SimpleNamespace(get_active_challenge=AsyncMock(return_value={}),
+                                   server_miner_emission_percentage=lambda c: (False, None),
+                                   eda_health=AsyncMock(return_value=health))
+    v.evaluators = EvaluatorManager(v.api_client, v.status)
+    await v.run_evaluation_cycle()
+    assert (v.status.state, v.status.detail, v.status.eda_ready) == (state, "no active quest", eda_ready)
