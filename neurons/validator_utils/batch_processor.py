@@ -1,293 +1,117 @@
 #!/usr/bin/env python3
 # neurons/validator_utils/batch_processor.py
 """
-Batch Processor for ChipForge Validator
-Handles batch evaluation and processing logic
+Batch Processor for ChipForge Validator: download a batch's designs, evaluate them on the EDA server with
+the evaluator the batch names, and submit the results. The challenge server decides records from every
+validator's results; the weights come from its record ladder (see reward_ladder.py).
 """
 
+import json
 import logging
-import os
 import traceback
 from typing import Dict, Optional
-from dotenv import load_dotenv
-load_dotenv()
+
 from .api_client import parse_server_time
 from .storage import data_path
-from .logutil import RewardLog
-from .weight_manager import WeightTarget
-
-
-def _margin(margin: Optional[float] = None) -> float:
-    """The minimum improvement in percent: the challenge server's value when it sends one
-    (it is 0 until the challenge has its first winner), else this validator's
-    MIN_IMPROVEMENT_PERCENT (older servers)."""
-    if margin is not None:
-        try:
-            return max(0.0, float(margin))
-        except (TypeError, ValueError):
-            pass
-    try:
-        return max(0.0, float(os.getenv("MIN_IMPROVEMENT_PERCENT", "0") or 0))
-    except ValueError:
-        return 0.0
-
-
-def beats(score: float, target: float, margin: Optional[float] = None) -> bool:
-    """score beats target by more than the minimum improvement (0 = any higher score)."""
-    return score > target + abs(target) * _margin(margin) / 100.0
-
-
-def explain(score: float, target: float, what: str = "score to beat", margin: Optional[float] = None) -> str:
-    """One log line: how score compares with target, including the minimum improvement,
-    e.g. why 32.30 does not replace 32.23 when 0.5% is required."""
-    margin = _margin(margin)
-    required = target + abs(target) * margin / 100.0
-    gain = f"{(score - target) / abs(target) * 100:+.2f}%" if target else "n/a"
-    head = f"score {score:.4f} vs {what} {target:.4f} ({gain})"
-    if score > required:
-        return f"{head}: beats it" + (f" by more than the required {margin:g}% (> {required:.4f})" if margin else "")
-    if margin and score > target:
-        return (f"{head}: higher, but MIN_IMPROVEMENT_PERCENT requires more than {margin:g}% "
-                f"(> {required:.4f}), so it is not a new winner")
-    return f"{head}: does not beat it"
 
 logger = logging.getLogger(__name__)
-reward_log = RewardLog(logger)   # this validator's own winner tracking: DEBUG while the record ladder decides
+
+
+def result_line(ev: Dict) -> str:
+    """'PASSED S=6.0123', 'REJECTED (NPU_PORT_MISMATCH)', 'timeout', 'not scored (EDA_INCOMPLETE)'..."""
+    status = ev.get('eval_status')
+    if ev.get('timeout_occurred'):
+        return "timeout"
+    if status == 'PASSED' or (status is None and ev.get('functional_gate') and ev.get('overall_gate')):
+        return f"PASSED S={float(ev.get('overall_score') or 0):.4f}"
+    code = None
+    try:
+        details = json.loads(ev.get('evaluation_details') or '{}')
+        code = details.get('code') or next((p.get('code') for p in details.get('problems') or [] if p.get('code')), None)
+    except (ValueError, AttributeError):
+        pass
+    if status == 'REJECTED':
+        return f"REJECTED ({code})" if code else "REJECTED"
+    return f"not scored ({code or status or 'system fault'})"
 
 
 class BatchProcessor:
     """Handles batch processing logic for the validator"""
 
-    @staticmethod
-    def _log_results(batch: Dict, results: Dict, hotkeys: Dict, score_to_beat: float, margin: float) -> None:
-        """One line per result of this batch, against the server's score to beat. With the record
-        ladder the server decides records when the batch closes, from every validator's results."""
-        uids = {s['submission_id']: s.get('miner_uid') for s in batch.get('submissions', [])}
-        for sid, ev in results.items():
-            hk = hotkeys.get(sid) or ""
-            who = f"{sid[:8]} (UID {uids.get(sid) if uids.get(sid) is not None else '?'}, {hk[:8]}...)"
-            score = float(ev.get('overall_score') or 0)
-            if not (ev.get('functional_gate') and ev.get('overall_gate')):
-                logger.info(f"Result {who}: score {score:.4f}, EDA gates failed (functional={bool(ev.get('functional_gate'))}, "
-                            f"overall={bool(ev.get('overall_gate'))}) - cannot set a record")
-            elif beats(score, score_to_beat, margin):
-                logger.info(f"Result {who}: {explain(score, score_to_beat, margin=margin)} - "
-                            f"candidate record; the server decides when the batch closes")
-            else:
-                logger.info(f"Result {who}: {explain(score, score_to_beat, margin=margin)} - not a record")
-    
-    def __init__(self, api_client, state, emission_manager, set_weight_target):
+    def __init__(self, api_client, state, status=None):
         self.api_client = api_client
         self.state = state
-        self.emission_manager = emission_manager
-        # Callable(WeightTarget): the validator applies it to the chain right after the batch
-        self.set_weight_target = set_weight_target
-        
-        # Directories
+        self.status = status                     # StatusReporter (optional in tests)
         self.base_dir = data_path('validator_data')
         self.submissions_dir = self.base_dir / 'submissions'
         self.submissions_dir.mkdir(parents=True, exist_ok=True)
-    
-    def extract_hotkeys_from_filenames(self, batch_id: str, successful_submissions: dict) -> dict:
-        """Extract hotkeys from downloaded filenames"""
-        submission_hotkeys = {}
-        batch_dir = self.submissions_dir / batch_id
-        
-        try:
-            # Look for files in the batch directory
-            if batch_dir.exists():
-                for file_path in batch_dir.glob("*.zip"):
-                    filename = file_path.name
-                    # Parse filename: challenge_id__hotkey__submission_id__attempt__processing.zip
-                    parts = filename.replace('.zip', '').split('__')
-                    if len(parts) >= 3:
-                        hotkey = parts[1]
-                        submission_id = parts[2]
-                        
-                        if submission_id in successful_submissions:
-                            submission_hotkeys[submission_id] = hotkey
-                            logger.info(f"Extracted hotkey from filename: {submission_id} -> {hotkey[:12]}...")
-        
-        except Exception as e:
-            logger.error(f"Error extracting hotkeys from filenames: {e}")
-        
-        return submission_hotkeys
-    
-    async def process_batch(self, challenge_id: str, batch: Dict) -> bool:
-        """Process a complete batch evaluation with challenge-wide best score tracking"""
+
+    def _status(self, state: str, detail: Optional[str] = None, submission_id: Optional[str] = None) -> None:
+        if self.status is not None:
+            self.status.set(state, detail, submission_id)
+
+    async def process_batch(self, challenge_id: str, batch: Dict, evaluator_sha256: Optional[str] = None) -> bool:
+        """Evaluate a batch (split mode: one assignment) and submit the results. True when done."""
         batch_id = batch['batch_id']
-        
+        listed = batch.get('submissions', [])
+        one = listed[0]['submission_id'] if len(listed) == 1 else None
         try:
-            logger.info(f"Starting batch processing for {batch_id}")
             self.state.evaluation_in_progress = True
             self.state.current_batch_id = batch_id
             self.state.save_state()
 
-            # CRITICAL: Fetch FRESH baseline BEFORE evaluation (it may have changed since last check)
-            logger.info(f"Fetching fresh baseline score for challenge {challenge_id} before evaluation")
-            challenge_info = None
-            try:
-                challenge_info = await self.api_client.get_challenge_info(challenge_id, fresh=True)
-                if challenge_info and 'winner_baseline_score' in challenge_info:
-                    fresh_baseline = challenge_info['winner_baseline_score']
-                    if self.state.winner_baseline_score != fresh_baseline:
-                        logger.info(f"Baseline updated before evaluation: {self.state.winner_baseline_score} -> {fresh_baseline}")
-                        self.state.winner_baseline_score = fresh_baseline
-                        self.state.save_state()
-                    else:
-                        logger.info(f"Using baseline score: {fresh_baseline}")
-                else:
-                    logger.warning(f"Could not fetch fresh baseline, using cached: {self.state.winner_baseline_score}")
-
-                # Keep batch windows in sync with the server
-                self.state.update_batch_windows(challenge_info)
-            except Exception as e:
-                logger.error(f"Error fetching fresh baseline: {e}, using cached: {self.state.winner_baseline_score}")
-
-            # Store baseline snapshot for this evaluation (captured BEFORE submitting scores)
-            evaluation_baseline_snapshot = self.state.winner_baseline_score
-            logger.info(f"Baseline snapshot for this evaluation: {evaluation_baseline_snapshot}")
-            # The minimum improvement in force, snapshotted with the baseline: the server's value
-            # (0 until the challenge's first winner), or the local MIN_IMPROVEMENT_PERCENT on older servers
-            server_margin = (challenge_info or {}).get('min_improvement_percent')
-            margin_snapshot = _margin(server_margin)
-            local_margin = _margin()
-            source = "challenge server" if server_margin is not None else "local MIN_IMPROVEMENT_PERCENT"
-            logger.info(f"Minimum improvement for this evaluation: {margin_snapshot:g}% ({source})")
-            if server_margin is not None and local_margin and margin_snapshot != local_margin:
-                logger.info(f"The challenge server sets the minimum improvement to {margin_snapshot:g}%; "
-                            f"this validator's MIN_IMPROVEMENT_PERCENT={local_margin:g} is not used")
-
-            # Download submissions
-            logger.info(f"Downloading submissions for batch {batch_id}")
-            downloaded_submissions = await self.api_client.download_batch_submissions(challenge_id, batch)
-            logger.info(f"Downloaded {len(downloaded_submissions)} submissions")
-
-            if not downloaded_submissions:
-                ids = {s.get('submission_id') for s in batch.get('submissions', [])}
+            self._status("downloading_submission", f"{len(listed)} design(s)" if not one else None, one)
+            downloaded = await self.api_client.download_batch_submissions(challenge_id, batch)
+            if not downloaded:
+                ids = {s.get('submission_id') for s in listed}
                 if ids and ids <= self.api_client.already_evaluated:
-                    # Everything in this batch was already scored by this validator (re-batched
-                    # for another validator): done, not a failure
+                    # Re-batched for other validators; this one already scored them: done, not a failure
                     logger.info(f"Batch {batch_id}: nothing left to evaluate for this validator")
                     self.state.mark_batch_evaluated(batch_id)
                     return True
-                logger.warning(f"No submissions downloaded for batch {batch_id}")
+                logger.warning(f"Batch {batch_id}: no design could be downloaded")
                 return False
 
-            # Evaluate with EDA server, within the server's evaluation deadline for this batch
-            logger.info(f"Evaluating {len(downloaded_submissions)} submissions with EDA server")
+            self._status("evaluating", f"{len(downloaded)} design(s)" if not one else None, one)
             evaluations = await self.api_client.evaluate_submissions_with_eda_server(
-                challenge_id, downloaded_submissions, deadline=parse_server_time(batch.get('evaluation_ends_at')),
-                window_start=parse_server_time(batch.get('expires_at'))
-            )
+                challenge_id, downloaded, deadline=parse_server_time(batch.get('evaluation_ends_at')),
+                window_start=parse_server_time(batch.get('expires_at')), evaluator_sha256=evaluator_sha256)
             if not evaluations:
-                logger.error(f"No evaluations received from EDA server")
+                logger.error(f"Batch {batch_id}: the EDA server returned no evaluation")
                 return False
 
-            logger.info(f"Received {len(evaluations)} evaluations from EDA server")
-
-            # Submit evaluations to challenge server (this may update baseline on server)
-            logger.info(f"Submitting {len(evaluations)} evaluations to challenge server")
-            submission_results = await self.api_client.submit_all_evaluations(challenge_id, evaluations)
-            successful_submissions = {k: v for k, v in evaluations.items() if submission_results.get(k, False)}
-
-            if not successful_submissions:
-                logger.error("No evaluations were successfully submitted")
-                return False
-
-            logger.info(f"Successfully submitted {len(successful_submissions)} evaluations")
-
-            # Miner hotkeys: from the batch entries (challenge server provides them), falling
-            # back to parsing the downloaded filenames for older servers
-            submission_hotkeys = {
-                s['submission_id']: s['hotkey'] for s in batch.get('submissions', [])
-                if s.get('hotkey') and s['submission_id'] in successful_submissions
-            }
-            missing = {k: v for k, v in successful_submissions.items() if k not in submission_hotkeys}
-            if missing:
-                submission_hotkeys.update(self.extract_hotkeys_from_filenames(batch_id, missing))
-
-            current_best_hotkey, current_best_score = self.state.current_challenge_best
-
-            reward_log.info(f"Current challenge best: {current_best_hotkey[:12] if current_best_hotkey else 'None'}... -> {current_best_score}")
-            if RewardLog.ladder_active:
-                self._log_results(batch, successful_submissions, submission_hotkeys,
-                                  evaluation_baseline_snapshot, margin_snapshot)
-
-            # Find if any submission in this batch beats the challenge-wide best AND baseline SNAPSHOT
-            new_champion = None
-            new_best_score = current_best_score
-
-            for submission_id, eval_data in successful_submissions.items():
-                hotkey = submission_hotkeys.get(submission_id)
-                overall_score = eval_data.get('overall_score', 0)
-
-                # GATE CHECK: Both functional_gate and overall_gate must be True to proceed
-                functional_gate = eval_data.get('functional_gate', False)
-                overall_gate = eval_data.get('overall_gate', False)
-
-                if not functional_gate or not overall_gate:
-                    reward_log.info(f"Submission {submission_id} ({hotkey[:12] if hotkey else 'unknown'}...) FAILED gates - functional_gate: {functional_gate}, overall_gate: {overall_gate} - skipping winner comparison")
-                    continue
-
-                # Check if score beats both current best AND baseline snapshot (from BEFORE submission)
-                if hotkey and beats(overall_score, new_best_score, margin_snapshot):
-                    if beats(overall_score, evaluation_baseline_snapshot, margin_snapshot):
-                        new_best_score = overall_score
-                        new_champion = hotkey
-                        reward_log.info(f"New challenge champion found: {hotkey[:12]}... -> {overall_score} (beats previous: {current_best_score} and baseline snapshot: {evaluation_baseline_snapshot})")
-                    else:
-                        reward_log.info(f"Submission {submission_id} ({hotkey[:12]}...) not eligible for reward: "
-                                    f"{explain(overall_score, evaluation_baseline_snapshot, 'baseline snapshot', margin_snapshot)}")
-                elif hotkey:
-                    reward_log.info(f"Submission {submission_id} ({hotkey[:12]}...) not a new winner: "
-                                f"{explain(overall_score, new_best_score, 'challenge best', margin_snapshot)}")
-
-            # Update challenge-wide best if we found a new champion
-            if new_champion:
-                self.state.update_best_miner(challenge_id, new_champion, new_best_score)
-
-                # Update current challenge best (separate tracking)
-                self.state.current_challenge_best = (new_champion, new_best_score)
-
-                # Update emission manager with new winner + baseline snapshot they qualified against
-                self.emission_manager.update_winner(new_champion, new_best_score, evaluation_baseline_snapshot, winner_timestamp=None)
-                
-                # Reward the new champion. Bans, ban_emissions, the emission split and
-                # "not registered" are all handled when the weights are built and submitted.
-                self.set_weight_target(WeightTarget.winner(new_champion, f"new champion, score {new_best_score}"))
-
-            else:
-                # No new champion found - check emission management policy
-                reward_log.info(f"No submissions beat challenge best of {current_best_score}")
-
-                # Get reward hotkey from emission manager (NO baseline check - winner already qualified)
-                reward_hotkey = self.emission_manager.get_reward_hotkey(current_best_hotkey, current_best_score)
-                should_burn = self.emission_manager.should_burn_emissions(current_best_score)
-
-                if reward_hotkey and not should_burn:
-                    reward_log.info(f"Challenge active, winner {reward_hotkey[:12]}... taking reward until next good submission")
-                    self.set_weight_target(WeightTarget.winner(reward_hotkey, "current winner"))
+            # Every result names the evaluator it belongs to, also those the validator made itself (no time
+            # left, EDA server unreachable ...): the server refuses a result without it
+            for ev in evaluations.values():
+                if evaluator_sha256 and not ev.get('evaluator_sha256'):
+                    ev['evaluator_sha256'] = evaluator_sha256
+            self._status("submitting_result", None, one)
+            submitted = await self.api_client.submit_all_evaluations(challenge_id, evaluations)
+            uids = {s['submission_id']: s.get('miner_uid') for s in listed}
+            for sid, ev in evaluations.items():
+                uid = uids.get(sid)
+                logger.info(f"Evaluated {sid} (UID {uid if uid is not None else '?'}): {result_line(ev)}"
+                            + ("" if submitted.get(sid) else " - NOT accepted by the challenge server"))
+            if not any(submitted.values()):
+                codes = {self.api_client.last_submit_status.get(sid) for sid in evaluations}
+                if all(c is not None and 400 <= c < 500 and c != 429 for c in codes):
+                    # refused for good (not a network problem): sending the same results again cannot help, so the
+                    # batch is not retried every cycle; the server re-assigns the design when its assignment ends
+                    logger.error(f"Batch {batch_id}: the challenge server refused every result (HTTP "
+                                 f"{', '.join(str(c) for c in sorted(codes))}); not retrying it")
+                    self.state.mark_batch_evaluated(batch_id)
                 else:
-                    if self.emission_manager.current_winner:
-                        reward_log.info("Challenge active, submissions found but winner reward period expired - burning emissions")
-                    else:
-                        reward_log.info("Challenge active, submissions checking but no qualified winner - burning emissions")
-                    self.set_weight_target(WeightTarget.burn("no qualified winner"))
+                    logger.error(f"Batch {batch_id}: no result was accepted by the challenge server")
+                return False
 
-            # Mark batch as processed
             self.state.mark_batch_evaluated(batch_id)
-            self.state.current_batch_id = None
-            self.state.evaluation_in_progress = False
-            self.state.save_state()
-            
-            logger.info(f"Successfully processed batch {batch_id}")
             return True
-            
+
         except Exception as e:
             logger.error(f"Error processing batch {batch_id}: {e}")
             logger.error(f"Traceback: {traceback.format_exc()}")
-            
+            return False
+        finally:
+            self.state.current_batch_id = None
             self.state.evaluation_in_progress = False
             self.state.save_state()
-            return False

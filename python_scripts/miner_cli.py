@@ -130,6 +130,19 @@ class SolutionSubmitter:
             logger.error(f"Error getting active challenge: {e}")
             return None
     
+    @staticmethod
+    def _paused_message(response) -> Optional[str]:
+        """The subnet's message when submissions are paused (HTTP 503 with detail.paused), else None."""
+        if response.status_code != 503:
+            return None
+        try:
+            detail = response.json().get('detail')
+        except ValueError:
+            return None
+        if isinstance(detail, dict) and detail.get('paused'):
+            return str(detail.get('reason') or detail.get('message') or 'no reason given')
+        return None
+
     def generate_submission_id(self, challenge_id: str) -> Optional[Dict]:
         """Generate submission ID for the challenge"""
         try:
@@ -145,9 +158,12 @@ class SolutionSubmitter:
                 result = response.json()
                 logger.info(f"Generated submission ID: {result['submission_id']}")
                 return result
+            paused = self._paused_message(response)
+            if paused:
+                logger.error(f"Submissions are paused by the subnet: {paused}. Try again later.")
             else:
                 logger.error(f"Failed to generate submission ID: {response.status_code} - {response.text}")
-                return None
+            return None
                 
         except Exception as e:
             logger.error(f"Error generating submission ID: {e}")
@@ -220,10 +236,13 @@ class SolutionSubmitter:
                 logger.info(f"Submission ID: {result.get('submission_id')}")
                 logger.info(f"Status: {result.get('status')}")
                 return True
-            else:
-                logger.error(f"Failed to submit solution: {response.status_code}")
-                logger.error(f"Error: {response.text}")
+            paused = self._paused_message(response)
+            if paused:
+                logger.error(f"Submissions are paused by the subnet: {paused}. Try again later.")
                 return False
+            logger.error(f"Failed to submit solution: {response.status_code}")
+            logger.error(f"Error: {response.text}")
+            return False
                 
         except Exception as e:
             logger.error(f"Error submitting solution: {e}")
@@ -369,11 +388,18 @@ class MinerCLI:
             if response.status_code != 200:
                 logger.error(f"Challenge package not available: {response.status_code} {response.text[:200]}")
                 return False
+            if len(response.content) > 200 * 1024 * 1024:
+                logger.error("Challenge package refused: larger than 200 MB")
+                return False
             package = output_dir / f"{challenge_id}.zip"
             package.write_bytes(response.content)
             logger.info(f"Challenge package downloaded to: {package}")
             try:
                 with zipfile.ZipFile(package) as zf:
+                    members = zf.infolist()   # zip bombs: bounded entries and size (zipfile strips '..' paths)
+                    if len(members) > 10000 or sum(m.file_size for m in members) > 1024 * 1024 * 1024:
+                        logger.error("Challenge package refused: too many entries or larger than 1 GB unpacked")
+                        return False
                     zf.extractall(output_dir)
                 logger.info(f"Extracted to: {output_dir}")
             except zipfile.BadZipFile:

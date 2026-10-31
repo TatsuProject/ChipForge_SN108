@@ -15,11 +15,10 @@ import aiohttp
 import logging
 import traceback
 import argparse
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 # Import validator utilities
 from validator_utils import (
-    EmissionManager,
     ValidatorState,
     BatchProcessor,
     WeightManager,
@@ -31,7 +30,9 @@ from validator_utils import (
 from chipforge.heartbeat import heartbeat_loop
 from validator_utils.weight_manager import WeightTarget
 from validator_utils.reward_ladder import RewardLadder
-from validator_utils.logutil import RewardLog, info_on_change
+from validator_utils.logutil import info_on_change
+from validator_utils.status_reporter import StatusReporter
+from validator_utils.evaluator_manager import EvaluatorManager
 
 # How often the validator logs what is on chain and what it wants (seconds)
 WEIGHT_STATUS_SECONDS = int(os.getenv("WEIGHT_STATUS_SECONDS", "300"))
@@ -40,11 +41,15 @@ from validator_utils.api_client import parse_server_time
 # Configure logging with daily rotation
 setup_validator_logging(log_level="INFO")
 logger = logging.getLogger(__name__)
-reward_log = RewardLog(logger)   # own-winner reward path: DEBUG while the record ladder decides
 
 
 class ChipForgeValidator:
-    """ChipForge Subnet Validator with modular architecture"""
+    """ChipForge Subnet Validator.
+
+    Each cycle: follow the active quest, keep the evaluator the challenge server asks for installed on
+    the EDA server (EvaluatorManager), evaluate the designs the server hands out with it, and report what
+    it is doing (StatusReporter). Weights always come from the server's record ladder (reward_ladder.py):
+    the server decides records from every validator's results."""
 
     async def sync_banned_coldkeys(self, challenge_id: str) -> None:
         """Fetch banned coldkeys from server and update local cache.
@@ -71,46 +76,31 @@ class ChipForgeValidator:
         except Exception as e:
             logger.error(f"Unexpected error during banned coldkeys sync: {e}")
 
-    def _update_batch_window_config(self, challenge_info: dict) -> None:
-        self.state.update_batch_windows(challenge_info)
-
     def _active_banned_coldkeys(self):
         """Return the set of banned coldkeys to enforce for this weight cycle."""
         return self.banned_coldkeys.get_active_ban_set(self.state.last_challenge_id)
 
-    def set_weight_target(self, target: WeightTarget):
-        """Record what should be rewarded. The chain is updated by apply_weights(), which
-        runs after every cycle (and so right after a batch that found a new winner).
-        While the server runs the record ladder, the ladder decides instead (see effective_target)."""
-        if target != self.weight_target:
-            note = " - not used: the record ladder decides" if self.reward_ladder.active else ""
-            log = logger.debug if note else logger.info
-            log(f"Weight target: {target.describe()} ({target.reason}){note}")
-        self.weight_target = target
-
     def refresh_reward_ladder(self):
-        """Adopt the reward_ladder of the last /validator/sync. A server reached without one (an older
-        version) turns the ladder off and the validator rewards its own challenge winner again."""
+        """Adopt the reward_ladder of the last /validator/sync. Kept on disk, so the weights keep following
+        it while the server is unreachable. A server reached without one burns."""
         state = self.api_client._sync_state if self.api_client else None
         if state is None:
             return                                   # server not reached yet: keep what is on disk
         if 'reward_ladder' in state:
             self.reward_ladder.update(state['reward_ladder'])
         elif self.reward_ladder.active:
-            logger.warning("Challenge server sends no reward_ladder: back to rewarding this validator's own winner")
+            logger.warning("Challenge server sends no reward_ladder: burning until it does")
             self.reward_ladder.clear()
-        RewardLog.ladder_active = self.reward_ladder.active
-        # Sent outside the challenge too, so an emissions ban applies between quests (older servers
-        # send it only with the active challenge, handled where the challenge is polled)
+        # Sent outside the challenge too, so an emissions ban applies between quests
         if 'ban_emissions' in state and bool(state['ban_emissions']) != self.state.ban_emissions:
             logger.warning(f"Emissions ban status changed: {self.state.ban_emissions} -> {bool(state['ban_emissions'])}")
             self.state.ban_emissions = bool(state['ban_emissions'])
             self.state.save_state()
 
     def effective_target(self) -> WeightTarget:
-        """The ladder's places at this moment when the server runs the ladder, else the legacy target."""
+        """The ladder's places at this moment (burn when there is no ladder)."""
         if not self.reward_ladder.active:
-            return self.weight_target
+            return WeightTarget.burn("no record ladder from the challenge server")
         held = self.reward_ladder.places()
         waiting = self.reward_ladder.in_probation()
         reason = "record ladder" + (f", {waiting} record(s) in probation" if waiting else "")
@@ -127,15 +117,6 @@ class ChipForgeValidator:
             for line in lines:
                 logger.info(line)
         return target
-
-    def set_weights_with_ban_check(self, context: str = "", winner_hotkey: str = None):
-        """Reward winner_hotkey (or burn when None). Bans, ban_emissions and the emission
-        split are applied by WeightManager.build() when the weights are submitted."""
-        self.set_weight_target(WeightTarget.winner(winner_hotkey, context) if winner_hotkey
-                               else WeightTarget.burn(context))
-
-    def burn_weights(self, context: str = ""):
-        self.set_weight_target(WeightTarget.burn(context))
 
     async def apply_weights(self):
         """Submit the current target if it changed or a refresh is due (see WeightManager)."""
@@ -189,795 +170,229 @@ class ChipForgeValidator:
                 logger.warning(f"The challenge server sets the miner emission percentage to {effective:g}%; "
                                f"this validator's MINER_EMISSION_PERCENTAGE={local:g} is not used")
             self.weight_manager.miner_emission_percentage = effective
-            self.emission_manager.miner_emission_percentage = effective
         return effective
 
     def request_stop(self):
         logger.info("Shutdown requested")
         self._stop.set()
-    
+
     def __init__(self, config):
         self.config = config
         self.wallet = bt.Wallet(config=config)
         self.subtensor = bt.Subtensor(config=config)
         self.metagraph = self.subtensor.metagraph(config.netuid)
         self.dendrite = bt.Dendrite(wallet=self.wallet)
-        
-        # Initialize components
+
         self.state = ValidatorState()
         self.banned_coldkeys = BannedColdkeysManager()
-        self.emission_manager = EmissionManager(
-            miner_emission_percentage=config.miner_emission_percentage
-        )
         self.weight_manager = WeightManager(
             self.wallet, self.subtensor, self.metagraph, self.config,
             miner_emission_percentage=config.miner_emission_percentage,
             refresh_seconds=int(os.getenv("WEIGHTS_REFRESH_SECONDS", "1200")),
         )
-        self.weight_target = WeightTarget.burn("startup")
-        # Record ladder from the challenge server (kept on disk); decides the weights when active
+        # Record ladder from the challenge server (kept on disk): decides the weights
         self.reward_ladder = RewardLadder()
-        RewardLog.ladder_active = self.reward_ladder.active
         self._last_ladder_target = None
         self._last_ladder_report = None
         self.metagraph_sync_seconds = int(os.getenv("METAGRAPH_SYNC_SECONDS", "600"))
         self._last_metagraph_sync = datetime.now(timezone.utc)
         self._stop = asyncio.Event()
-        self._challenge_ended_grace_period_start = None
-        self._last_expiration_check = {}
+        self._last_info_check = {}
         self._last_banned_sync = {}
         self._background_tasks = set()
         self._last_weight_status = 0.0
-        
-        # Initialize subnet
-        self.emission_manager.initialize_subnet()
-        
-        # Session for HTTP requests
+
         self.session = None
-        
-        # API client and other components will be initialized after session creation
+        # Created with the HTTP session (initialize_components)
         self.api_client = None
         self.batch_processor = None
         self.miner_comms = None
-        
-        # Batch timing
-        self.next_batch_check = datetime.now(timezone.utc)
-        self.consecutive_errors = 0
-        self.batch_processing_timeout = 2700  # seconds
-        
-        logger.info(f"ChipForge Validator initialized")
-        logger.info(f"Validator hotkey: {self.wallet.hotkey.ss58_address}")
-    
+        self.status = None
+        self.evaluators = None
+
+        logger.info(f"ChipForge Validator initialized, hotkey {self.wallet.hotkey.ss58_address}")
+
     def initialize_components(self):
         """Initialize components that require the HTTP session"""
         self.api_client = APIClient(self.config, self.wallet, self.session, state=self.state)
-        self.batch_processor = BatchProcessor(
-            self.api_client, self.state, self.emission_manager, self.set_weight_target
-        )
+        self.status = StatusReporter(self.api_client)
+        self.evaluators = EvaluatorManager(self.api_client, self.status)
+        self.batch_processor = BatchProcessor(self.api_client, self.state, self.status)
         self.miner_comms = MinerCommunications(self.dendrite, self.metagraph)
-    
-    async def recover_from_crash(self):
-        """Enhanced crash recovery with current challenge focus"""
-        try:
-            logger.info("Starting enhanced crash recovery...")
-            
-            # Check if there's a currently active challenge
-            challenge = await self.api_client.get_active_challenge()
-            current_challenge_active = challenge not in [None, {"status": "no_active_challenge"}, {"status": "None"}]
-            
-            if current_challenge_active:
-                challenge_id = challenge['challenge_id']
 
-                # Fetch baseline score for the challenge
-                try:
-                    challenge_info = await self.api_client.get_challenge_info(challenge_id)
-                    if challenge_info and 'winner_baseline_score' in challenge_info:
-                        self.state.winner_baseline_score = challenge_info['winner_baseline_score']
-                        logger.info(f"Crash recovery: Loaded baseline score {self.state.winner_baseline_score}")
-                        self.state.save_state()
-                    if challenge_info:
-                        self._update_batch_window_config(challenge_info)
-                except Exception as e:
-                    logger.error(f"Error fetching baseline score during crash recovery: {e}")
+    # ------------------------------------------------------------------
+    # Quest
+    # ------------------------------------------------------------------
 
-                # Sync banned coldkeys for this challenge
-                await self.sync_banned_coldkeys(challenge_id)
-
-                # Check if it's the same challenge we were working on
-                if self.state.last_challenge_id == challenge_id:
-                    logger.info(f"Continuing with same challenge {challenge_id}")
-                    # Keep current challenge best, unless the subnet voided a record or changed the
-                    # score to beat while this validator was down (weights are restored below)
-                    if challenge_info:
-                        self.apply_baseline_epoch(challenge_info, retarget=False)
-                else:
-                    logger.info(f"New challenge {challenge_id} detected during crash recovery")
-                    # Reset for new challenge
-                    self.state.current_challenge_best = (None, 0.0)
-                    self.state.last_challenge_id = challenge_id
-                    self.state.save_state()
-
-                challenge_info = await self.api_client.get_challenge_info(challenge_id)
-                remaining_time = challenge_info.get('remaining_time') if challenge_info else None
-                if remaining_time and remaining_time > 0:
-                    logger.info(f"Active challenge {challenge_id}: {remaining_time/3600:.1f}h remaining")
-                    self.next_batch_check = datetime.now(timezone.utc) + timedelta(seconds=10)
-                else:
-                    logger.info(f"Challenge {challenge_id} found but expired")
-                    current_challenge_active = False
-            else:
-                logger.info("No active challenge found")
-                # Reset current challenge since no challenge is active
-                self.state.current_challenge_best = (None, 0.0)
-                self.state.last_challenge_id = None
-                self.state.save_state()
-                
-            # Recover emission state - pass current challenge winner if any
-            current_challenge_winner = self.state.current_challenge_best[0]
-            current_challenge_score = self.state.current_challenge_best[1]
-            
-            self.emission_manager.recover_emission_state_after_crash(
-                current_challenge_active, 
-                (current_challenge_winner, current_challenge_score) if current_challenge_winner else None
-            )
-            
-            # Log the recovery status
-            if not current_challenge_active and self.emission_manager.current_winner:
-                remaining_time = None
-                if self.emission_manager.winner_reward_start_time:
-                    end_time = self.emission_manager.winner_reward_start_time + timedelta(hours=self.emission_manager.total_hours_for_winner_reward)
-                    remaining_seconds = (end_time - datetime.now(timezone.utc)).total_seconds()
-                    if remaining_seconds > 0:
-                        remaining_time = remaining_seconds / 3600
-                
-                if remaining_time and remaining_time > 0:
-                    reward_log.info(f"Challenge has expired, decided winner {self.emission_manager.current_winner[:12]}... is taking reward, remaining time {remaining_time:.1f}h")
-                else:
-                    logger.info("Challenge has expired, winner reward period also expired")
-            
-            # Restore winner state if we have current challenge winner
-            if self.state.current_challenge_best[0]:
-                winner_hotkey, winner_score = self.state.current_challenge_best
-
-                # Check if this winner should still be getting rewards
-                reward_hotkey = self.emission_manager.get_reward_hotkey(winner_hotkey, winner_score)
-                if reward_hotkey:
-                    # Try to set weights for the winner if they're still on subnet
-                    uid = self.weight_manager.get_hotkey_uid(winner_hotkey)
-                    if uid is not None:
-                        logger.info(f"Crash recovery: Restoring weights for current challenge winner {winner_hotkey[:12]}... (UID {uid})")
-                        self.set_weights_with_ban_check(context="crash recovery - current challenge winner", winner_hotkey=winner_hotkey)
-                    else:
-                        logger.warning(f"Crash recovery: Current challenge winner {winner_hotkey[:12]}... not found on subnet")
-            
-            # If no current challenge winner but we have historical winners, check emission manager
-            elif self.emission_manager.current_winner:
-                winner_hotkey = self.emission_manager.current_winner
-                winner_score = self.emission_manager.current_winner_score
-
-                # Check if this historical winner should still be getting rewards
-                reward_hotkey = self.emission_manager.get_reward_hotkey(winner_hotkey, winner_score)
-                if reward_hotkey:
-                    uid = self.weight_manager.get_hotkey_uid(winner_hotkey)
-                    if uid is not None:
-                        logger.info(f"Crash recovery: Restoring weights for emission manager winner {winner_hotkey[:12]}... (UID {uid})")
-                        self.set_weights_with_ban_check(context="crash recovery - emission manager winner", winner_hotkey=winner_hotkey)
-                    else:
-                        logger.warning(f"Crash recovery: Emission manager winner {winner_hotkey[:12]}... not found on subnet")
-            
-            # Set appropriate next check time
-            if not current_challenge_active:
-                self.next_batch_check = datetime.now(timezone.utc) + timedelta(seconds=30)
-            
-            logger.info("Enhanced crash recovery completed")
-                        
-        except Exception as e:
-            logger.error(f"Error during enhanced crash recovery: {e}")
-            logger.error(traceback.format_exc())
-
-    async def check_challenge_expiration_update(self, challenge_id: str):
-        """Check if challenge expiration time has been updated by admin"""
-        try:
-            # Get current challenge info from API
-            challenge = await self.api_client.get_active_challenge()
-            
-            if challenge in [None, {"status": "no_active_challenge"}, {"status": "None"}] or challenge['challenge_id'] != challenge_id:
-                return  # Challenge no longer active or different challenge
-            
-            if 'expires_at' not in challenge:
-                return  # No expiration time in response
-            
-            # Parse new expiration time
-            new_expires_at = datetime.fromisoformat(challenge['expires_at'].replace('Z', '+00:00'))
-            
-            # Check if we have a stored expiration time and compare
-            if self.state.current_challenge_expires_at:
-                stored_expires_at = self.state.current_challenge_expires_at
-                
-                # Check if expiration time has changed
-                if new_expires_at != stored_expires_at:
-                    time_diff = new_expires_at - stored_expires_at
-                    hours_diff = time_diff.total_seconds() / 3600
-                    
-                    if hours_diff > 0:
-                        logger.info(f"Challenge {challenge_id} deadline extended by {hours_diff:.2f} hours")
-                        logger.info(f"Old expiration: {stored_expires_at}")
-                        logger.info(f"New expiration: {new_expires_at}")
-                    else:
-                        logger.info(f"Challenge {challenge_id} deadline shortened by {abs(hours_diff):.2f} hours")
-                    
-                    # Update stored expiration time
-                    self.state.current_challenge_expires_at = new_expires_at
-                    self.state.save_state()
-                    
-                    logger.info(f"Updated challenge {challenge_id} expiration time in validator state")
-            
-        except Exception as e:
-            logger.error(f"Error checking challenge expiration update: {e}")
-            # Don't raise exception - this is a non-critical update check
-
-    
-    def apply_baseline_epoch(self, info: dict, retarget: bool = True) -> bool:
-        """The challenge server bumps baseline_epoch when it voids a record (exploit, cheating) or an
-        admin changes the score to beat. Then this validator's local challenge best and winner are
-        reset to the server's: otherwise a voided score would stay the bar to beat here, and a
-        voided miner would keep being rewarded. Returns True when a reset happened."""
-        epoch = info.get('baseline_epoch')
-        if epoch is None:                        # older server
-            return False
-        if self.state.baseline_epoch is None:    # first time seen: remember it, nothing to undo
-            self.state.baseline_epoch = epoch
-            self.state.save_state()
-            return False
-        if epoch == self.state.baseline_epoch:
-            return False
-        server_score = float(info.get('winner_baseline_score') or 0.0)
-        cw = info.get('current_winner') or None
-        old = self.state.current_challenge_best
-        logger.warning(
-            f"The subnet changed the score to beat (epoch {self.state.baseline_epoch} -> {epoch}, e.g. a voided "
-            f"record): local best {old[0][:12] if old[0] else 'None'}... {old[1]} -> "
-            f"{(cw['hotkey'][:12] + '... ' + str(cw['score'])) if cw else 'no winner'}, score to beat {server_score}")
-        self.state.winner_baseline_score = server_score
-        em = self.emission_manager
-        # The bar here is exactly the server's score to beat (also after a manual change), so this
-        # validator and the server always agree on what a new winner must beat
-        if cw:
-            self.state.current_challenge_best = (cw['hotkey'], server_score)
-            now = datetime.now(timezone.utc)
-            ends = parse_server_time(cw.get('reward_expires_at'))
-            hours = float(em.total_hours_for_winner_reward or 0)
-            if ends is not None and hours > 0:
-                # The server's reward end (a restored record resumes only its unpaid hours)
-                start = ends - timedelta(hours=hours)
-            else:
-                start = parse_server_time(cw.get('qualified_at')) or now
-            self.state.current_challenge_best_timestamp = start
-            em.current_winner = cw['hotkey']
-            em.current_winner_score = float(cw['score'])
-            em.winner_qualified_baseline = server_score
-            em.winner_reward_start_time = start
-            em.current_phase = "winner_reward"
-        else:
-            self.state.current_challenge_best = (None, server_score)
-            self.state.current_challenge_best_timestamp = None
-            em.current_winner = None
-            em.current_winner_score = 0.0
-            em.current_phase = "burn_until_submission"
-        em.save_state()
-        self.state.baseline_epoch = epoch
+    async def start_challenge(self, challenge: dict):
+        """A quest this validator has not worked on yet (or after a restart)."""
+        challenge_id = challenge['challenge_id']
+        expires = parse_server_time(challenge.get('expires_at'))
+        logger.info(f"Quest {challenge_id} active" + (f" until {expires.isoformat()}" if expires else ""))
+        if self.state.last_challenge_id != challenge_id and challenge.get('github_url'):
+            self._background(self.miner_comms.notify_miners_challenge_active(challenge_id, challenge['github_url']))
+        self.state.last_challenge_id = challenge_id
+        self.state.current_challenge_expires_at = expires
         self.state.save_state()
-        if retarget:
-            self._target_current_challenge_reward()
-        return True
+        await self.sync_banned_coldkeys(challenge_id)
+        self._last_banned_sync[challenge_id] = datetime.now(timezone.utc)
 
-    def _target_current_challenge_reward(self):
-        """Weight target while no batch is being evaluated: keep rewarding the current
-        challenge winner during its reward window, otherwise burn."""
-        current_best_hotkey, current_best_score = self.state.current_challenge_best
-        if self.emission_manager.should_burn_emissions(current_best_score):
-            info_on_change(logger, "reward_target", "Burning emissions - no submissions in current challenge")
-            self.burn_weights("no reward target")
-            return
-        reward_hotkey = self.emission_manager.get_reward_hotkey(current_best_hotkey, current_best_score)
-        if reward_hotkey:
-            info_on_change(reward_log, "reward_target", f"Rewarding current challenge winner {reward_hotkey[:12]}... (reward window active)")
-            self.set_weights_with_ban_check(context="current challenge winner", winner_hotkey=reward_hotkey)
-        else:
-            info_on_change(reward_log, "reward_target", "No winner in its reward window - burning emissions")
-            self.burn_weights("no reward target")
+    async def refresh_challenge(self, challenge_id: str):
+        """Batch windows and the emissions ban every minute, bans every 10 minutes (all from the cached sync)."""
+        now = datetime.now(timezone.utc)
+        if (now - self._last_info_check.get(challenge_id, datetime.min.replace(tzinfo=timezone.utc))).total_seconds() > 60:
+            self._last_info_check[challenge_id] = now
+            info = await self.api_client.get_challenge_info(challenge_id)
+            if info:
+                self.state.update_batch_windows(info)
+                if 'ban_emissions' in info and bool(info['ban_emissions']) != self.state.ban_emissions:
+                    logger.warning(f"Emissions ban status changed: {self.state.ban_emissions} -> {info['ban_emissions']}")
+                    self.state.ban_emissions = bool(info['ban_emissions'])
+                    self.state.save_state()
+                # Quest 1 (EDA_API=v1) only: the v2 evaluator is installed by EvaluatorManager
+                if self.api_client.needs_testcases and info.get('download_new_testcases'):
+                    await self.api_client.download_test_cases(challenge_id)
+        if (now - self._last_banned_sync.get(challenge_id, datetime.min.replace(tzinfo=timezone.utc))).total_seconds() > 600:
+            await self.sync_banned_coldkeys(challenge_id)
+            self._last_banned_sync[challenge_id] = now
+
+    # ------------------------------------------------------------------
+    # Evaluation
+    # ------------------------------------------------------------------
 
     async def run_evaluation_cycle(self):
-        """Main evaluation cycle with dynamic scheduling"""
+        """One pass: quest, evaluator, then at most one batch (split mode: one design)."""
+        await self.maybe_sync_metagraph()
         try:
-            now = datetime.now(timezone.utc)
-            
-            # Sync metagraph to see current miners (throttled, off the event loop)
-            await self.maybe_sync_metagraph()
-            
-            # Check if challenge server is accessible
-            try:
-                challenge = await self.api_client.get_active_challenge()
-                server_accessible = True
-                
-                # Check if response indicates no active challenge
-                if isinstance(challenge, dict) and challenge.get('status') in ['no_active_challenge']:
-                    logger.debug("Server accessible: no active challenge")
-                    challenge = None  # Convert to None for easier handling below
+            challenge = await self.api_client.get_active_challenge()
+        except ConnectionError as e:
+            info_on_change(logger, "server", f"Challenge server unreachable ({e}) - weights keep following the stored ladder")
+            return
+        info_on_change(logger, "server", "Challenge server reachable")
+        self.apply_emission_percentage(*self.api_client.server_miner_emission_percentage(challenge))
 
-            except ConnectionError as e:
-                logger.error(f"Challenge server unreachable: {e}")
-                challenge = None
-                server_accessible = False
-            except Exception as e:
-                logger.error(f"Error getting challenge: {e}")
-                challenge = None
-                server_accessible = False
-
-            if server_accessible:
-                self.apply_emission_percentage(*self.api_client.server_miner_emission_percentage(challenge))
-            
-            # Handle case: had challenge before, but not now
-            if not challenge and self.state.last_challenge_id:
-                
-                if not server_accessible:
-                    # SERVER UNREACHABLE - use cached state
-                    logger.warning("Challenge server unreachable - using cached local state")
-                    
-                    if self.state.current_challenge_expires_at:
-                        now = datetime.now(timezone.utc)
-                        remaining = (self.state.current_challenge_expires_at - now).total_seconds() / 3600
-                        
-                        if remaining > 0:
-                            logger.info(f"Cached state: {self.state.last_challenge_id} has {remaining:.1f}h remaining")
-                            
-                            # Check emission manager for reward eligibility (even when server unreachable)
-                            current_challenge_score = self.state.current_challenge_best[1]
-                            
-                            if self.emission_manager.should_burn_emissions(current_challenge_score):
-                                reward_log.info("Server unreachable - burning emissions (reward period expired)")
-                                self.burn_weights("no reward target")
-                            else:
-                                # Get reward hotkey from emission manager (respects timer)
-                                current_best_hotkey = self.state.current_challenge_best[0]
-                                current_best_score = self.state.current_challenge_best[1]
-                                
-                                reward_hotkey = self.emission_manager.get_reward_hotkey(current_best_hotkey, current_best_score)
-                                if reward_hotkey:
-                                    reward_log.info(f"Server unreachable - using cached winner {reward_hotkey[:12]}... (reward period active)")
-                                    self.set_weights_with_ban_check(context="server unreachable - cached winner", winner_hotkey=reward_hotkey)
-                                else:
-                                    reward_log.info("Server unreachable - no qualified winner, burning emissions")
-                                    self.burn_weights("no reward target")
-                        else:
-                            logger.info(f"Cached state: {self.state.last_challenge_id} expired locally")
-                            # Handle expiration based on local time
-                            if self.state.current_challenge_best[0]:
-                                winner_hotkey = self.state.current_challenge_best[0]
-                                winner_score = self.state.current_challenge_best[1]
-                                winner_discovery_time = self.state.current_challenge_best_timestamp or datetime.now(timezone.utc)
-                                self.emission_manager.update_winner(winner_hotkey, winner_score, self.state.winner_baseline_score, winner_discovery_time)
-                            else:
-                                self.emission_manager.mark_challenge_ended()
-                            
-                            self.state.last_challenge_id = None
-                            self.state.current_challenge_expires_at = None
-                            self.state.save_state()
-                    
-                    self.next_batch_check = datetime.now(timezone.utc) + timedelta(seconds=30)
-                    return
-                
-                else:
-                    # SERVER ACCESSIBLE but no challenge
-                    # Start or continue grace period
-                    if self._challenge_ended_grace_period_start is None:
-                        # Start 10-minute grace period
-                        self._challenge_ended_grace_period_start = datetime.now(timezone.utc)
-                        logger.info(f"Server accessible but no challenge - starting 10-minute grace period for {self.state.last_challenge_id}")
-                        
-                        # Check emission manager for reward eligibility
-                        current_challenge_score = self.state.current_challenge_best[1]
-                        
-                        if self.emission_manager.should_burn_emissions(current_challenge_score):
-                            reward_log.info("Grace period started - burning emissions (no active reward period)")
-                            self.burn_weights("no reward target")
-                        else:
-                            # Get reward hotkey from emission manager (respects timer)
-                            current_best_hotkey = self.state.current_challenge_best[0]
-                            current_best_score = self.state.current_challenge_best[1]
-                            
-                            reward_hotkey = self.emission_manager.get_reward_hotkey(current_best_hotkey, current_best_score)
-                            if reward_hotkey:
-                                reward_log.info(f"Grace period: Using cached winner {reward_hotkey[:12]}... (reward period active)")
-                                self.set_weights_with_ban_check(context="grace period - cached winner", winner_hotkey=reward_hotkey)
-                            else:
-                                reward_log.info("Grace period: No qualified winner - burning emissions")
-                                self.burn_weights("no reward target")
-
-                        self.next_batch_check = datetime.now(timezone.utc) + timedelta(seconds=30)
-                        return
-                    else:
-                        # Check if grace period expired
-                        grace_period_elapsed = (datetime.now(timezone.utc) - self._challenge_ended_grace_period_start).total_seconds()
-                        grace_period_minutes = grace_period_elapsed / 60
-                        
-                        if grace_period_elapsed < 600:  # 10 minutes = 600 seconds
-                            info_on_change(logger, "grace_period", f"Grace period active (up to 10 min) - waiting for {self.state.last_challenge_id}")
-                            
-                            # Check emission manager for reward eligibility
-                            current_challenge_score = self.state.current_challenge_best[1]
-                            
-                            if self.emission_manager.should_burn_emissions(current_challenge_score):
-                                reward_log.info("Grace period active - burning emissions (reward period expired)")
-                                self.burn_weights("no reward target")
-                            else:
-                                # Get reward hotkey from emission manager (respects timer)
-                                current_best_hotkey = self.state.current_challenge_best[0]
-                                current_best_score = self.state.current_challenge_best[1]
-                                
-                                reward_hotkey = self.emission_manager.get_reward_hotkey(current_best_hotkey, current_best_score)
-                                if reward_hotkey:
-                                    reward_log.info(f"Grace period: Using cached winner {reward_hotkey[:12]}... (reward period active)")
-                                    self.set_weights_with_ban_check(context="grace period - cached winner", winner_hotkey=reward_hotkey)
-                                else:
-                                    reward_log.info("Grace period: Reward period expired - burning emissions")
-                                    self.burn_weights("no reward target")
-                            
-                            self.next_batch_check = datetime.now(timezone.utc) + timedelta(seconds=30)
-                            return
-                        else:
-                            # Grace period expired - challenge truly ended
-                            logger.info(f"Grace period expired (10 min) - {self.state.last_challenge_id} confirmed expired")
-                            self._challenge_ended_grace_period_start = None  # Reset timer
-                            
-                            # Handle challenge expiration
-                            if self.state.current_challenge_expires_at:
-                                now = datetime.now(timezone.utc)
-                                if now >= self.state.current_challenge_expires_at:
-                                    logger.info("Challenge expired naturally")
-                                else:
-                                    remaining = (self.state.current_challenge_expires_at - now).total_seconds() / 3600
-                                    logger.info(f"Challenge completed manually ({remaining:.1f}h before expiration)")
-                            
-                            # Start winner reward
-                            if self.state.current_challenge_best[0]:
-                                winner_hotkey = self.state.current_challenge_best[0]
-                                winner_score = self.state.current_challenge_best[1]
-                                winner_discovery_time = self.state.current_challenge_best_timestamp or datetime.now(timezone.utc)
-                                
-                                logger.info(f"Starting winner reward period for {winner_hotkey[:12]}... (score: {winner_score})")
-                                self.emission_manager.update_winner(winner_hotkey, winner_score, self.state.winner_baseline_score, winner_discovery_time)
-                            else:
-                                logger.info(f"Challenge {self.state.last_challenge_id} completed but no winner found")
-                                self.emission_manager.mark_challenge_ended()
-                            
-                            self.state.last_challenge_id = None
-                            self.state.current_challenge_expires_at = None
-                            self.state.save_state()
-
-            if not challenge or challenge=={"status": "no_active_challenge"} or challenge=={"status": "None"}:
-                # No active challenge (confirmed by server)
-                current_winner = self.emission_manager.current_winner
-                
-                if self.emission_manager.should_burn_emissions(0.0):
-                    if current_winner:
-                        reward_log.info(f"No active challenge, winner {current_winner[:12]}... reward period expired - burning emissions")
-                    else:
-                        reward_log.info("No active challenge, no submissions found - burning emissions")
-                    self.burn_weights("no reward target")
-                else:
-                    reward_hotkey = self.emission_manager.get_reward_hotkey()
-
-                    if reward_hotkey:
-                        info_on_change(reward_log, "reward_target", f"No active challenge, but rewarding winner {reward_hotkey[:12]}... (emission manager active)")
-                        self.set_weights_with_ban_check(context="no active challenge - emission manager winner", winner_hotkey=reward_hotkey)
-                    else:
-                        reward_log.info("No active challenge, no winner reward period - burning emissions")
-                        self.burn_weights("no reward target")
-                
-                self.next_batch_check = datetime.now(timezone.utc) + timedelta(seconds=10)
-                return
-            
-            # Challenge exists - check if it's the same one or new one
-            challenge_id = challenge['challenge_id']
-
-            if 'winner_reward_hours' in challenge:
-                self.emission_manager.update_winner_reward_hours_from_server(challenge['winner_reward_hours'])
-            else:
-                # Server didn't provide value, use local fallback
-                logger.warning("Challenge server didn't provide winner_reward_hours, using local .env fallback")
-                self.emission_manager.update_winner_reward_hours_from_server(None)
-            
-            if self._challenge_ended_grace_period_start is not None:
-                # We were in grace period, but challenge appeared
-                if self.state.last_challenge_id == challenge_id:
-                    # Same challenge reappeared - reset grace period and continue
-                    logger.info(f"Challenge {challenge_id} reappeared during grace period - continuing with cached state")
-                    self._challenge_ended_grace_period_start = None
-                    # Continue with existing state (don't reset)
-                else:
-                    # Different challenge appeared - previous challenge expired
-                    logger.info(f"New challenge {challenge_id} appeared - previous challenge {self.state.last_challenge_id} expired")
-                    self._challenge_ended_grace_period_start = None
-                    
-                    # Handle previous challenge expiration
-                    if self.state.current_challenge_best[0]:
-                        winner_hotkey = self.state.current_challenge_best[0]
-                        winner_score = self.state.current_challenge_best[1]
-                        winner_discovery_time = self.state.current_challenge_best_timestamp or datetime.now(timezone.utc)
-                        
-                        logger.info(f"Starting winner reward for previous challenge winner {winner_hotkey[:12]}... (score: {winner_score})")
-                        self.emission_manager.update_winner(winner_hotkey, winner_score, self.state.winner_baseline_score, winner_discovery_time)
-
-            # Check for expiration time and baseline score updates periodically (every 1 minute)
-
-            current_time = datetime.now(timezone.utc)
-            last_check = self._last_expiration_check.get(challenge_id, datetime.min.replace(tzinfo=timezone.utc))
-
-            if (current_time - last_check).total_seconds() > 60:
-                await self.check_challenge_expiration_update(challenge_id)
-
-                # Also update baseline score and ban_emissions periodically since they can change
-                try:
-                    challenge_info = await self.api_client.get_challenge_info(challenge_id)
-                    if challenge_info:
-                        # Update baseline score
-                        if 'winner_baseline_score' in challenge_info:
-                            if self.state.winner_baseline_score != challenge_info['winner_baseline_score']:
-                                logger.info(f"Baseline score updated: {self.state.winner_baseline_score} -> {challenge_info['winner_baseline_score']}")
-                                self.state.winner_baseline_score = challenge_info['winner_baseline_score']
-                                self.state.save_state()
-                        
-                        # A voided record or a manual change of the score to beat
-                        self.apply_baseline_epoch(challenge_info)
-
-                        # Update ban_emissions flag
-                        if 'ban_emissions' in challenge_info:
-                            if self.state.ban_emissions != challenge_info['ban_emissions']:
-                                logger.warning(f"Emissions ban status changed: {self.state.ban_emissions} -> {challenge_info['ban_emissions']}")
-                                self.state.ban_emissions = challenge_info['ban_emissions']
-                                self.state.save_state()
-
-                        # Update batch window configuration
-                        self._update_batch_window_config(challenge_info)
-
-                        # Download new testcases if server signals update
-                        if challenge_info.get('download_new_testcases'):
-                            logger.info(f"Server signaled new testcases available for challenge {challenge_id}, downloading...")
-                            try:
-                                if await self.api_client.download_test_cases(challenge_id):
-                                    logger.info(f"Successfully downloaded new testcases for challenge {challenge_id}")
-                                else:
-                                    logger.warning(f"Failed to download new testcases for challenge {challenge_id}")
-                            except Exception as e:
-                                logger.error(f"Error downloading new testcases: {e}")
-                except Exception as e:
-                    logger.error(f"Error updating challenge info: {e}")
-
-                self._last_expiration_check[challenge_id] = current_time
-
-            # Periodic banned coldkeys refresh (every 10 minutes, independent of expiration check)
-            last_banned_sync = self._last_banned_sync.get(challenge_id, datetime.min.replace(tzinfo=timezone.utc))
-            if (current_time - last_banned_sync).total_seconds() > 600:
-                await self.sync_banned_coldkeys(challenge_id)
-                self._last_banned_sync[challenge_id] = current_time
-
-            # NEW CHALLENGE DETECTED - Reset both validator state AND emission manager
-            if self.state.last_challenge_id != challenge_id:
-                self._background(self.miner_comms.notify_miners_challenge_active(challenge_id, challenge['github_url']))
-
-                # Download test cases for new challenge
-                logger.info(f"Downloading test cases for new challenge {challenge_id}")
-                try:
-                    test_cases_success = await self.api_client.download_test_cases(challenge_id)
-                    if test_cases_success:
-                        logger.info(f"Successfully downloaded and extracted test cases for challenge {challenge_id}")
-                    else:
-                        logger.warning(f"Failed to download test cases for challenge {challenge_id}")
-                except Exception as e:
-                    logger.error(f"Error downloading test cases for challenge {challenge_id}: {e}")
-
-                # Fetch challenge info including baseline score
-                logger.info(f"Fetching challenge info for {challenge_id}")
-                try:
-                    challenge_info = await self.api_client.get_challenge_info(challenge_id)
-                    if challenge_info:
-                        if 'winner_baseline_score' in challenge_info:
-                            self.state.winner_baseline_score = challenge_info['winner_baseline_score']
-                            logger.info(f"Updated winner baseline score: {self.state.winner_baseline_score}")
-                        else:
-                            logger.warning(f"Challenge info missing winner_baseline_score, keeping previous: {self.state.winner_baseline_score}")
-                        self._update_batch_window_config(challenge_info)
-                    else:
-                        logger.warning(f"Failed to fetch challenge info for {challenge_id}")
-                except Exception as e:
-                    logger.error(f"Error fetching challenge info: {e}")
-
-                # Sync banned coldkeys for the new challenge
-                await self.sync_banned_coldkeys(challenge_id)
-                self._last_banned_sync[challenge_id] = datetime.now(timezone.utc)
-
-                # Store challenge expiration time
-                if 'expires_at' in challenge:
-                    challenge_expires_at = datetime.fromisoformat(challenge['expires_at'].replace('Z', '+00:00'))
-                    self.state.current_challenge_expires_at = challenge_expires_at
-                    logger.info(f"Challenge {challenge_id} expires at: {challenge_expires_at}")
-
-                # Reset validator state for new challenge
-                logger.info(f"New challenge {challenge_id} started - resetting current challenge best score")
-                self.state.current_challenge_best = (None, 0.0)
-                
-                # CRITICAL: Also reset emission manager score for new challenge
-                logger.info("Resetting emission manager winner score for new challenge")
-                self.emission_manager.current_winner_score = 0.0
-                self.emission_manager.save_state()
-                
-                self.state.last_challenge_id = challenge_id
+        if not isinstance(challenge, dict) or not challenge.get('challenge_id'):
+            if self.state.last_challenge_id:
+                logger.info(f"Quest {self.state.last_challenge_id} ended")
+                self.state.last_challenge_id = None
+                self.state.current_challenge_expires_at = None
                 self.state.save_state()
+            self.status.set("idle", "no active quest")
+            return
+        challenge_id = challenge['challenge_id']
+        if self.state.last_challenge_id != challenge_id:
+            await self.start_challenge(challenge)
+        await self.refresh_challenge(challenge_id)
+        if self.api_client.needs_testcases and not self.api_client.check_testcase_files_exist(challenge_id):
+            await self.api_client.download_test_cases(challenge_id)
 
-            # Check if test cases exist before processing batch
-            if not self.api_client.check_testcase_files_exist(challenge_id):
-                logger.info(f"Test case files missing for challenge {challenge_id}, downloading...")
-                try:
-                    test_cases_success = await self.api_client.download_test_cases(challenge_id)
-                    if test_cases_success:
-                        logger.info(f"Successfully downloaded test cases for challenge {challenge_id}")
-                except Exception as e:
-                    logger.error(f"Error downloading test cases for challenge {challenge_id}: {e}")
-            
-            # Get current batch
-            batch = await self.api_client.get_current_batch(challenge_id)
-            already_processed_batch = False
-            if batch:
-                # Validate batch structure
-                if not isinstance(batch, dict):
-                    logger.error(f"Invalid batch response type: {type(batch)}")
-                    batch = None
-                elif 'batch_id' not in batch:
-                    logger.error(f"Batch missing 'batch_id' field: {batch}")
-                    batch = None
-                else:
-                    batch_id = batch['batch_id']
-                    if batch_id in self.state.evaluated_batches:
-                        info_on_change(logger, "batch_processed", f"Batch {batch_id} already processed")
-                        already_processed_batch = True
+        # The evaluator the server asks for must be ready on the EDA server before asking for work
+        target = (self.api_client._sync_state or {}).get('evaluator')
+        eda_up, ready = await self.evaluators.ready_sha(target)
+        if not eda_up:
+            self.status.set("eda_offline")
+            return
+        if ready is None:
+            if self.status.state not in ("downloading_evaluator", "installing_evaluator", "install_failed"):
+                self.status.set("waiting_for_evaluator", f"v{target.get('version')}" if target
+                                else "the EDA server has no evaluator ready")
+            return
 
-            if not batch or already_processed_batch:
-                # No batch available
-                self._target_current_challenge_reward()
+        batch = await self.api_client.get_current_batch(challenge_id, claim=True, evaluator_sha256=ready)
+        if not isinstance(batch, dict) or not batch.get('batch_id') or batch['batch_id'] in self.state.evaluated_batches:
+            self.status.set("idle")
+            return
+        batch_id = batch['batch_id']
+
+        # A batch names its evaluator (all mode can still finish an older version's designs)
+        evaluator = batch.get('evaluator') or None
+        sha = (evaluator or {}).get('sha256') or ready
+        if evaluator and sha != ready:
+            _, other = await self.evaluators.ready_sha(evaluator)
+            if other != sha:
+                info_on_change(logger, "batch_evaluator",
+                               f"Batch {batch_id} uses {self.evaluators.describe(evaluator)}, not ready here - skipped")
+                self.status.set("waiting_for_evaluator", f"v{evaluator.get('version')}")
                 return
 
-            batch_id = batch['batch_id']
-            logger.info(f"Processing batch {batch_id} with {len(batch.get('submissions', []))} submissions")
-
-            # Pre-flight: never claim a batch we can't evaluate (other validators will). Claiming
-            # it anyway would record failed evaluations and use up the miners' rebatch attempts.
-            if not await self.api_client.eda_server_ready():
-                logger.error(f"EDA server not reachable - skipping batch {batch_id}")
-                self._target_current_challenge_reward()
+        # Time budget: the server's deadline for this batch. Results are accepted until results_due_at
+        # (the deadline plus the server's grace); the EDA evaluations themselves stop before evaluation_ends_at.
+        deadline = parse_server_time(batch.get('results_due_at')) or parse_server_time(batch.get('evaluation_ends_at'))
+        if deadline is not None:
+            batch_timeout = (deadline - datetime.now(timezone.utc)).total_seconds() - 15
+            if batch_timeout < int(os.getenv("MIN_BATCH_SECONDS", "180")):
+                info_on_change(logger, "batch_late", f"Batch {batch_id} closes in {batch_timeout:.0f}s - too late to evaluate, skipped")
                 return
-            if not self.api_client.check_testcase_files_exist(challenge_id):
-                logger.error(f"Test cases for {challenge_id} unavailable - skipping batch {batch_id}")
-                self._target_current_challenge_reward()
-                return
+        else:
+            dl, ev = self.state.batch_download_window_seconds, self.state.batch_evaluation_window_seconds
+            batch_timeout = (dl + ev - 45) if dl > 0 and ev > 0 else 2700
+        logger.info(f"Batch {batch_id}: {len(batch.get('submissions', []))} design(s), "
+                    f"{self.evaluators.describe(evaluator) if evaluator else 'evaluator ' + sha[:12]}, "
+                    f"{batch_timeout / 60:.0f} min left")
 
-            # Time budget: the server's evaluation deadline for this batch, not our pickup time. Results
-            # are accepted until results_due_at (the deadline plus the server's grace for submitting
-            # them); the EDA evaluations themselves stop before evaluation_ends_at (api_client).
-            _BATCH_SAFETY_BUFFER = 15
-            _MIN_BATCH_SECONDS = int(os.getenv("MIN_BATCH_SECONDS", "180"))
-            deadline = parse_server_time(batch.get('results_due_at')) or parse_server_time(batch.get('evaluation_ends_at'))
-            if deadline is not None:
-                batch_timeout = (deadline - datetime.now(timezone.utc)).total_seconds() - _BATCH_SAFETY_BUFFER
-                if batch_timeout < _MIN_BATCH_SECONDS:
-                    logger.warning(f"Batch {batch_id} closes in {batch_timeout:.0f}s - too late to evaluate, skipping")
-                    self._target_current_challenge_reward()
-                    return
-                logger.info(f"Batch timeout from server deadline: {batch_timeout:.0f}s")
-            else:
-                dl_window = self.state.batch_download_window_seconds
-                eval_window = self.state.batch_evaluation_window_seconds
-                batch_timeout = (dl_window + eval_window - 45) if dl_window > 0 and eval_window > 0 \
-                    else self.batch_processing_timeout
-                logger.info(f"Batch timeout from batch windows (no server deadline): {batch_timeout:.0f}s")
-            try:
-                success = await asyncio.wait_for(
-                    self.batch_processor.process_batch(challenge_id, batch),
-                    timeout=batch_timeout
-                )
-                logger.info(f"Batch processing completed with success: {success}")
-            except asyncio.TimeoutError:
-                logger.error(f"Batch processing timed out for batch {batch_id}")
-                success = False
-                # Submit 0 scores with timeout_occurred=true so miners get timeout feedback;
-                # the challenge server uses this flag to allow a later successful submission to overwrite.
-                try:
-                    timeout_evaluations = {
-                        s['submission_id']: self.api_client.build_timeout_evaluation(s['submission_id'], batch_timeout)
-                        for s in batch.get('submissions', [])
-                    }
-                    if timeout_evaluations:
-                        logger.info(f"Submitting timeout evaluations for {len(timeout_evaluations)} submissions in timed-out batch {batch_id}")
-                        await self.api_client.submit_all_evaluations(challenge_id, timeout_evaluations)
-                except Exception as timeout_submit_err:
-                    logger.error(f"Failed to submit timeout evaluations for batch {batch_id}: {timeout_submit_err}")
-            except Exception as e:
-                logger.error(f"Exception during batch processing: {e}")
-                logger.error(f"Traceback: {traceback.format_exc()}")
-                success = False
-            
-            if success:
-                self._background(self.miner_comms.notify_miners_batch_complete(batch_id))
-            
-            if not success:
-                # Fallback
-                # Same rule as when idle: the current winner only while its reward window lasts
-                reward_log.info("Batch processing failed - keeping the current reward target")
-                self._target_current_challenge_reward()
-
-            self.consecutive_errors = 0
-            
+        # Split mode: heartbeats while evaluating, so a validator that dies mid-run is noticed early
+        heartbeat = asyncio.create_task(self.api_client.heartbeat_loop(batch_id)) \
+            if str(batch_id).startswith("split-") else None
+        try:
+            success = await asyncio.wait_for(self.batch_processor.process_batch(challenge_id, batch, sha),
+                                             timeout=batch_timeout)
+        except asyncio.TimeoutError:
+            logger.error(f"Batch {batch_id} timed out after {batch_timeout:.0f}s")
+            success = False
+            # Zero scores with timeout_occurred=true: the miner sees the timeout, and the server allows a
+            # later result to replace it
+            timeouts = {s['submission_id']: {**self.api_client.build_timeout_evaluation(s['submission_id'], batch_timeout),
+                                             'evaluator_sha256': sha}
+                        for s in batch.get('submissions', [])}
+            if timeouts:
+                await self.api_client.submit_all_evaluations(challenge_id, timeouts)
         except Exception as e:
-            self.consecutive_errors += 1
-            backoff_time = min(300, 30 * (2 ** min(self.consecutive_errors - 1, 4)))
-            
-            logger.error(f"Error in evaluation cycle (#{self.consecutive_errors}): {e}")
+            logger.error(f"Batch {batch_id} failed: {e}")
             logger.error(traceback.format_exc())
-            logger.info(f"Will retry in {backoff_time} seconds")
-            
-            self.next_batch_check = datetime.now(timezone.utc) + timedelta(seconds=backoff_time)
-            
-            # Fallback after many errors
-            if self.consecutive_errors >= 5:
-                logger.warning("Multiple consecutive errors, applying fallback emission logic")
-                
-                if self.emission_manager.should_burn_emissions(0.0):
-                    self.burn_weights("no reward target")
-                elif self.state.current_challenge_best[0]:
-                    current_winner = self.state.current_challenge_best[0]
-                    logger.info(f"Error fallback: Using current challenge winner {current_winner[:12]}...")
-                    self.set_weights_with_ban_check(context="current challenge winner - error fallback", winner_hotkey=current_winner)
-                else:
-                    self.burn_weights("no reward target")
+            success = False
+        finally:
+            if heartbeat is not None:
+                heartbeat.cancel()
+        if success:
+            self._background(self.miner_comms.notify_miners_batch_complete(batch_id))
+        self.status.set("idle")
 
     async def run(self):
         """Main validator loop"""
         logger.info("Starting ChipForge Validator")
-        
-        # Create HTTP session
         connector = aiohttp.TCPConnector(limit=100, limit_per_host=30)
-        timeout = aiohttp.ClientTimeout(total=300)
-        self.session = aiohttp.ClientSession(connector=connector, timeout=timeout)
-
-        # Initialize components that depend on the session
+        self.session = aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=300))
         self.initialize_components()
 
         # Liveness file for the container healthcheck (goes stale if the loop blocks)
         self._background(heartbeat_loop("validator", self._stop))
+        self._background(self.status.loop(self._stop))
+        if self.reward_ladder.active:
+            logger.info("Weights follow the stored record ladder until the challenge server is reached")
 
-        # Add crash recovery logic here
-        await self.recover_from_crash()
-        
+        consecutive_errors = 0
         try:
             while not self._stop.is_set():
+                pause = 10
                 try:
                     await self.run_evaluation_cycle()
+                    consecutive_errors = 0
                 except Exception as e:
-                    logger.error(f"Error in validator loop: {e}")
+                    consecutive_errors += 1
+                    pause = min(300, 30 * (2 ** min(consecutive_errors - 1, 4)))
+                    logger.error(f"Error in evaluation cycle (#{consecutive_errors}): {e}; retrying in {pause}s")
+                    logger.error(traceback.format_exc())
 
-                # Put the current target on chain (immediately after a batch that found
-                # a new winner; otherwise only on change / periodic refresh)
+                # Put the current target on chain (on change or periodic refresh)
                 await self.apply_weights()
 
-                # Sleep 10 seconds before next check (wakes early on shutdown)
                 try:
-                    await asyncio.wait_for(self._stop.wait(), timeout=10)
+                    await asyncio.wait_for(self._stop.wait(), timeout=pause)
                 except asyncio.TimeoutError:
                     pass
-
         finally:
             self.state.save_state()
-            self.emission_manager.save_state()
+            await self.evaluators.close()
             await self.session.close()
             logger.info("ChipForge Validator stopped")
 

@@ -113,12 +113,11 @@ def _validator(tmp_path, monkeypatch, sync_state):
     v.weight_manager = _manager(10.0)
     v.banned_coldkeys = SimpleNamespace(get_active_ban_set=lambda challenge_id: set())
     v.state = SimpleNamespace(last_challenge_id="c", ban_emissions=False)
-    v.weight_target = WeightTarget.winner("HC", "own winner")
     v.api_client = SimpleNamespace(_sync_state=sync_state)
     return v
 
 
-def test_validator_follows_the_ladder_and_falls_back_on_an_old_server(tmp_path, monkeypatch):
+def test_validator_follows_the_ladder_and_burns_on_a_server_without_one(tmp_path, monkeypatch):
     soon = datetime.now(timezone.utc)
     paying = {"submission_id": "p", "hotkey": "HD", "score": 1, "qualified_at": (soon - timedelta(hours=30)).isoformat(),
               "pays_from": (soon - timedelta(hours=6)).isoformat(), "pays_until": (soon + timedelta(hours=18)).isoformat()}
@@ -130,9 +129,10 @@ def test_validator_follows_the_ladder_and_falls_back_on_an_old_server(tmp_path, 
     v.refresh_reward_ladder()
     assert v.effective_target().places == (("HD", 1.0),)
 
-    v.api_client._sync_state = {"challenge": None}          # older server: no ladder
+    v.api_client._sync_state = {"challenge": None}          # a server without a ladder: burn
     v.refresh_reward_ladder()
-    assert not v.reward_ladder.active and v.effective_target() == WeightTarget.winner("HC", "own winner")
+    target = v.effective_target()
+    assert not v.reward_ladder.active and target.winner_hotkey is None and not target.places
 
 
 def test_all_records_in_probation_means_burn(tmp_path, monkeypatch):
@@ -175,27 +175,19 @@ def test_report_names_uids_states_and_unpayable_places():
         "Reward ladder: no record in probation or being paid - the miners' share is burned"]
 
 
-def test_ladder_report_is_logged_once_per_change_and_legacy_lines_go_to_debug(tmp_path, monkeypatch, caplog):
+def test_ladder_report_is_logged_once_per_change(tmp_path, monkeypatch, caplog):
     import logging
-    from validator_utils.logutil import RewardLog
     soon = datetime.now(timezone.utc)
     paying = {"submission_id": "p", "hotkey": "HD", "score": 1, "qualified_at": (soon - timedelta(hours=30)).isoformat(),
               "pays_from": (soon - timedelta(hours=6)).isoformat(), "pays_until": (soon + timedelta(hours=18)).isoformat()}
     v = _validator(tmp_path, monkeypatch, {"reward_ladder": {"size": 3, "decay_ratio": 0.6, "records": [paying]}})
     v.refresh_reward_ladder()
-    assert RewardLog.ladder_active
     with caplog.at_level(logging.INFO):
         v.effective_target()
         v.effective_target()
-        RewardLog(logging.getLogger("validator_utils.emission_manager")).info("Winner reward active: ...")
     infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
     assert sum(m.startswith("Reward ladder (") for m in infos) == 1
     assert any("#1 UID 2 HD... score 1: 100.0% of the miners' share -> 10.00% of all weight" in m for m in infos)
-    assert not any("Winner reward active" in m for m in infos)
-
-    v.api_client._sync_state = {"challenge": None}          # older server: the own-winner logs are back
-    v.refresh_reward_ladder()
-    assert not RewardLog.ladder_active
 
 
 # --- corner cases (audit 2026-10-15): bans, emissions ban, voids, restarts, boundaries -------------
@@ -391,3 +383,27 @@ def test_repeat_hotkeys_comes_from_the_server_schedule(tmp_path, monkeypatch):
     assert len(ladder.places(NOW)) == 3
     sig, lines = ladder.report(lambda hk: _manager(10.0).payability(hk), 10.0, now=NOW)
     assert "repeat hotkeys" in lines[0]
+
+
+@pytest.mark.parametrize("bad", [
+    {"decay_ratio": -1}, {"decay_ratio": 0}, {"decay_ratio": float("nan")}, {"decay_ratio": 2},
+    {"size": 0}, {"size": 10_000},
+])
+def test_malformed_ladder_settings_are_rejected_and_previous_kept(tmp_path, monkeypatch, bad):
+    from validator_utils.reward_ladder import RewardLadder
+    monkeypatch.setenv("CHIPFORGE_DATA_DIR", str(tmp_path))
+    good = {"size": 3, "decay_ratio": 0.6, "records": []}
+    ladder = RewardLadder()
+    assert ladder.update(good)
+    assert not ladder.update({**good, **bad})
+    assert ladder.schedule == good
+
+
+@pytest.mark.parametrize("record_patch", [{"hotkey": 5}, {"hotkey": ""}, {"submission_id": 7}, {"score": "x"},
+                                          {"score": float("inf")}])
+def test_malformed_ladder_records_are_rejected(tmp_path, monkeypatch, record_patch):
+    from validator_utils.reward_ladder import RewardLadder
+    monkeypatch.setenv("CHIPFORGE_DATA_DIR", str(tmp_path))
+    rec = {"hotkey": "5H", "submission_id": "s", "score": 1.0, "qualified_at": "2026-10-01T00:00:00+00:00",
+           "pays_from": "2026-10-01T00:00:00+00:00", "pays_until": "2026-10-02T00:00:00+00:00"}
+    assert not RewardLadder().update({"size": 3, "decay_ratio": 0.6, "records": [{**rec, **record_patch}]})
