@@ -109,6 +109,7 @@ def _validator(tmp_path, monkeypatch, sync_state):
     v = ChipForgeValidator.__new__(ChipForgeValidator)
     v.reward_ladder = rl.RewardLadder()
     v._last_ladder_target = None
+    v._ladder_withheld = None
     v._last_ladder_report = None
     v.weight_manager = _manager(10.0)
     v.banned_coldkeys = SimpleNamespace(get_active_ban_set=lambda challenge_id: set())
@@ -133,6 +134,27 @@ def test_validator_follows_the_ladder_and_burns_on_a_server_without_one(tmp_path
     v.refresh_reward_ladder()
     target = v.effective_target()
     assert not v.reward_ladder.active and target.winner_hotkey is None and not target.places
+
+
+def test_a_withheld_ladder_burns_and_says_why(tmp_path, monkeypatch, caplog):
+    soon = datetime.now(timezone.utc)
+    paying = {"submission_id": "p", "hotkey": "HD", "score": 1, "qualified_at": (soon - timedelta(hours=30)).isoformat(),
+              "pays_from": (soon - timedelta(hours=6)).isoformat(), "pays_until": (soon + timedelta(hours=18)).isoformat()}
+    ladder = {"size": 3, "decay_ratio": 0.6, "records": [paying]}
+    v = _validator(tmp_path, monkeypatch, {"reward_ladder": ladder})
+    v.refresh_reward_ladder()
+    assert v.effective_target().places == (("HD", 1.0),)
+    why = "this validator's EDA server has not reported an evaluator of q2 ready in the last 120 min"
+    caplog.set_level("INFO")
+    v.api_client._sync_state = {"challenge": None, "reward_ladder_withheld": why}
+    v.refresh_reward_ladder()
+    v.refresh_reward_ladder()
+    assert not v.reward_ladder.active and not v.effective_target().places
+    assert caplog.text.count("withholds the reward ladder") == 1 and why in caplog.text      # logged once
+    assert "sends no reward_ladder" not in caplog.text
+    v.api_client._sync_state = {"reward_ladder": ladder}
+    v.refresh_reward_ladder()
+    assert v.effective_target().places == (("HD", 1.0),) and "sends the reward ladder again" in caplog.text
 
 
 def test_all_records_in_probation_means_burn(tmp_path, monkeypatch):

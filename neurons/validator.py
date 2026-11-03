@@ -86,10 +86,20 @@ class ChipForgeValidator:
         state = self.api_client._sync_state if self.api_client else None
         if state is None:
             return                                   # server not reached yet: keep what is on disk
+        withheld = state.get('reward_ladder_withheld')
+        if withheld != self._ladder_withheld:
+            if withheld:
+                # the server sends weights only to validators whose EDA server is evaluating
+                logger.warning(f"Challenge server withholds the reward ladder: {withheld}. Burning until this "
+                               f"validator's EDA server has the quest's evaluator ready (make start)")
+            elif self._ladder_withheld:
+                logger.info("Challenge server sends the reward ladder again")
+            self._ladder_withheld = withheld
         if 'reward_ladder' in state:
             self.reward_ladder.update(state['reward_ladder'])
         elif self.reward_ladder.active:
-            logger.warning("Challenge server sends no reward_ladder: burning until it does")
+            if not withheld:
+                logger.warning("Challenge server sends no reward_ladder: burning until it does")
             self.reward_ladder.clear()
         # Sent outside the challenge too, so an emissions ban applies between quests
         if 'ban_emissions' in state and bool(state['ban_emissions']) != self.state.ban_emissions:
@@ -193,6 +203,7 @@ class ChipForgeValidator:
         # Record ladder from the challenge server (kept on disk): decides the weights
         self.reward_ladder = RewardLadder()
         self._last_ladder_target = None
+        self._ladder_withheld = None              # the server's reason for sending no reward ladder (logged on change)
         self._last_ladder_report = None
         self.metagraph_sync_seconds = int(os.getenv("METAGRAPH_SYNC_SECONDS", "600"))
         self._last_metagraph_sync = datetime.now(timezone.utc)
