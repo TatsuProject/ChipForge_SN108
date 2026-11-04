@@ -6,21 +6,23 @@ synthesizes every submission. The EDA server sets the hardware needs.
 
 ## Hardware
 
-|                 | Physical CPU cores | RAM   | Disk        |
-|-----------------|--------------------|-------|-------------|
-| **Recommended** | 24                 | 48 GB | 100 GB SSD  |
-| **Minimum**     | 16                 | 32 GB | 100 GB SSD  |
+|                 | CPU                        | RAM   | Disk        |
+|-----------------|----------------------------|-------|-------------|
+| **Recommended** | 16 cores / 32 threads      | 64 GB | 300 GB SSD  |
+| **Minimum**     | 16 cores / 32 threads      | 64 GB | 300 GB SSD  |
 
-- **Physical cores, not vCPUs.** Most cloud instances count 2 vCPUs per physical core
-  (hyperthreading), so 16 physical cores is usually 32 vCPUs. AWS AMD 7th-generation instances
-  (`c7a`, `m7a`) are the exception: there 1 vCPU = 1 physical core, e.g. `c7a.4xlarge` = 16 cores / 32 GB.
-- **Why:** synthesis of one submission is a long single-threaded run that needs up to about 10 GB of
-  RAM, and simulation spreads across the remaining cores. More cores and memory let the EDA server
-  evaluate more submissions at the same time. It sizes itself to the machine automatically.
-- **Measured:** on the minimum spec (16 cores, 32 GB), eight NPU submissions evaluated in parallel
-  finished in about 22 minutes, inside the evaluation window of a batch.
+- **16 physical cores with 2 threads each (32 vCPUs on most cloud instances).** Example: AWS
+  `c7i.8xlarge` (Intel, 32 vCPUs = 16 cores / 32 threads, 64 GB). AWS AMD 7th-generation instances
+  (`c7a`, `m7a`) have 1 vCPU per physical core and no second thread: pick one with 32 vCPUs there.
+- **Why:** a full evaluation runs for hours, and single stages of it (e.g. timing analysis) can use more
+  than 20 GB of RAM on their own. With less memory, evaluations fail as "host ran out of resources",
+  count as failures of your validator, and the design goes to another validator.
+- **Disk:** the evaluator's install check refuses to install with less than 100 GB free on the EDA
+  server's data disk; each installed evaluator version and each interrupted evaluation leave files
+  behind, so plan 300 GB.
 - **x86-64 only.** The EDA toolchain images do not run on ARM (e.g. AWS Graviton, Apple Silicon).
-- Don't run other heavy workloads on the same machine: a synthesis run that runs out of memory fails.
+- Use the machine only for the validator and its EDA server: other heavy workloads take the memory an
+  evaluation needs.
 
 ## Software and network
 
