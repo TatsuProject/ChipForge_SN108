@@ -143,14 +143,16 @@ class SolutionSubmitter:
             return str(detail.get('reason') or detail.get('message') or 'no reason given')
         return None
 
-    def generate_submission_id(self, challenge_id: str) -> Optional[Dict]:
-        """Generate submission ID for the challenge"""
+    def generate_submission_id(self, challenge_id: str, replaces: Optional[str] = None) -> Optional[Dict]:
+        """Generate submission ID for the challenge (replaces: the queued submission it will replace)"""
         try:
             url = f"{self.api_url}/api/v1/challenges/{challenge_id}/generate-submission-id"
             
             data = {
                 'hotkey': self.miner_hotkey
             }
+            if replaces:
+                data['replaces'] = replaces
             
             response = requests.post(url, json=data, timeout=30)
             
@@ -169,8 +171,9 @@ class SolutionSubmitter:
             logger.error(f"Error generating submission ID: {e}")
             return None
     
-    def submit_solution(self, challenge_id: str, submission_data: Dict, solution_zip_path: Path) -> bool:
-        """Submit solution to challenge server"""
+    def submit_solution(self, challenge_id: str, submission_data: Dict, solution_zip_path: Path,
+                        replaces: Optional[str] = None) -> bool:
+        """Submit solution to challenge server (replaces: a queued submission of ours it replaces)"""
         try:
             url = f"{self.api_url}/api/v1/challenges/{challenge_id}/submit"
             
@@ -215,6 +218,8 @@ class SolutionSubmitter:
                     'submission_tool': 'chipforge_miner_cli'
                 })
             }
+            if replaces:
+                data['replaces'] = replaces
             
             # Prepare file
             files = {
@@ -667,10 +672,11 @@ class MinerCLI:
         logger.info(f"Saved {path} ({len(result['content']):,} bytes, sha256 {result['sha256'][:16]}...)")
 
     def submit_solution(self, solution_file: str, challenge_id: Optional[str] = None, 
-                       check_status: bool = False, dry_run: bool = False):
-        """Submit a solution file"""
+                       check_status: bool = False, dry_run: bool = False, replace: bool = False,
+                       replaces: Optional[str] = None):
+        """Submit a solution file. replace=True: replace a queued submission (replaces, or our only queued one)"""
         logger.info("=" * 80)
-        logger.info("Submit Solution")
+        logger.info("Replace Queued Submission" if replace else "Submit Solution")
         logger.info("=" * 80)
         logger.info("")
         
@@ -725,9 +731,24 @@ class MinerCLI:
             logger.info("=" * 80)
             return
         
+        # Replacing: which queued submission (the only one still queued, unless given)
+        if replace and not replaces:
+            queued = [s for s in self.submitter.get_miner_submissions(challenge_id)
+                      if str(s.get('status', '')).lower() == 'pending']
+            if len(queued) != 1:
+                logger.error(f"You have {len(queued)} pending submissions: give the one to replace with --submission-id")
+                for s in queued:
+                    logger.error(f"  {s.get('submission_id')}")
+                sys.exit(1)
+            replaces = queued[0].get('submission_id')
+        if replace:
+            logger.info(f"Replacing: {replaces} (it keeps its place in the queue; only possible while no validator "
+                        f"has picked it up)")
+            logger.info("")
+
         # Generate submission ID
         logger.info("Generating submission ID...")
-        submission_data = self.submitter.generate_submission_id(challenge_id)
+        submission_data = self.submitter.generate_submission_id(challenge_id, replaces=replaces if replace else None)
         if not submission_data:
             logger.error("Failed to generate submission ID")
             sys.exit(1)
@@ -737,7 +758,8 @@ class MinerCLI:
         
         # Submit solution
         logger.info("Submitting solution...")
-        success = self.submitter.submit_solution(challenge_id, submission_data, solution_path)
+        success = self.submitter.submit_solution(challenge_id, submission_data, solution_path,
+                                                 replaces=replaces if replace else None)
         
         if success:
             logger.info("✅ Solution submitted successfully!")
@@ -824,6 +846,14 @@ Examples:
     submit_parser.add_argument('--challenge_id', type=str, help='Challenge ID (default: active challenge)')
     submit_parser.add_argument('--check_status', action='store_true', help='Check status of previous submissions')
     submit_parser.add_argument('--dry_run', action='store_true', help='Validate ZIP but don\'t submit')
+
+    # Replace command: a queued submission no validator has picked up yet, keeping its place in the queue
+    replace_parser = subparsers.add_parser('replace', parents=[sub_common],
+                                           help='Replace your queued submission (keeps its place in the queue)')
+    replace_parser.add_argument('file', type=str, help='Path to the new solution ZIP file')
+    replace_parser.add_argument('--submission-id', dest='replace_id', type=str,
+                                help='Submission to replace (default: your only pending one)')
+    replace_parser.add_argument('--challenge_id', type=str, help='Challenge ID (default: active challenge)')
     
     args = parser.parse_args()
     
@@ -867,6 +897,13 @@ Examples:
                 challenge_id=getattr(args, 'challenge_id', None),
                 check_status=getattr(args, 'check_status', False),
                 dry_run=getattr(args, 'dry_run', False)
+            )
+        elif args.command == 'replace':
+            cli.submit_solution(
+                solution_file=args.file,
+                challenge_id=getattr(args, 'challenge_id', None),
+                replace=True,
+                replaces=getattr(args, 'replace_id', None)
             )
         else:
             parser.print_help()

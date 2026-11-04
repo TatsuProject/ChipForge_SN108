@@ -209,6 +209,21 @@ python3 python_scripts/miner_cli.py submit solution.zip \
 
 ---
 
+### 5. `replace` - Replace Your Queued Submission
+
+Replace a submission that is still **queued** (no validator has picked it up yet) with a new design. The new design
+keeps the old one's **place in the queue** and does not use another submission slot. It draws new hidden tests, like
+any new submission. Each design can be replaced a limited number of times (3 by default), and replacing usually still
+works while submissions are paused.
+
+```bash
+python python_scripts/miner_cli.py replace path/to/new_design.zip                       # your only pending submission
+python python_scripts/miner_cli.py replace path/to/new_design.zip --submission-id <id>  # a specific one
+```
+
+Once a validator has started evaluating a submission it can no longer be replaced (the server answers 409).
+The replaced submission disappears from the leaderboard; only the new one is shown.
+
 ## Using with .env File
 
 Create a `.env` file in the project root:
