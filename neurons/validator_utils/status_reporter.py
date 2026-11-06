@@ -38,6 +38,7 @@ class StatusReporter:
         self.disk_total_gib: Optional[float] = None
         self.cleanup_at: Optional[str] = None
         self.cleanup_freed_gib: Optional[float] = None
+        self.eda_version: Optional[str] = None
         self._dirty = True
         self._sent_at = 0.0
         self._supported = True
@@ -70,6 +71,13 @@ class StatusReporter:
     def disk(self, health: Optional[dict]) -> None:
         """Free disk of the EDA server and its last cleanup of old evaluator versions (EDA /v2/health). A new
         cleanup is logged once; the free space is sent with the status (not a change by itself: it moves)."""
+        version = (health or {}).get('eda_version')
+        version = version if isinstance(version, str) and re.fullmatch(r"[0-9A-Za-z.+-]{1,40}", version) else None
+        if version != self.eda_version:
+            if version:
+                logger.info(f"EDA server version {version}")
+            self.eda_version = version
+            self._dirty = True
         disk = (health or {}).get('disk') or {}
         cleanup = (health or {}).get('last_cleanup') or {}
         try:
@@ -95,7 +103,8 @@ class StatusReporter:
                 "started_at": self.started_at.isoformat() if self.started_at else None,
                 "neuron_version": NEURON_VERSION,
                 "disk_free_gib": self.disk_free_gib, "disk_total_gib": self.disk_total_gib,
-                "cleanup_at": self.cleanup_at, "cleanup_freed_gib": self.cleanup_freed_gib}
+                "cleanup_at": self.cleanup_at, "cleanup_freed_gib": self.cleanup_freed_gib,
+                "eda_version": self.eda_version}
 
     async def flush(self, force: bool = False) -> bool:
         """Send the status if it changed or every `every` seconds. Never raises."""

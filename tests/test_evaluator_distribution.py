@@ -369,13 +369,13 @@ async def test_without_a_quest_the_status_still_says_whether_the_eda_server_is_u
 async def test_eda_disk_and_cleanup_go_into_the_status_and_a_cleanup_is_logged_once(tmp_path, monkeypatch, caplog):
     caplog.set_level("INFO")
     eda = FakeEDA(active=SHA)
-    health = {"ready": True, "active_evaluator": SHA, "mock": False,
+    health = {"ready": True, "active_evaluator": SHA, "mock": False, "eda_version": "1.0.0",
               "disk": {"free_gib": 29.7, "total_gib": 290.0, "evaluator_versions": 4}, "last_cleanup": None}
     eda.eda_health = AsyncMock(side_effect=lambda: health)
     m, api, status = manager(tmp_path, monkeypatch, eda)
     await m.ready_sha(None)
     p = status.payload()
-    assert (p["disk_free_gib"], p["disk_total_gib"], p["cleanup_at"]) == (29.7, 290.0, None)
+    assert (p["disk_free_gib"], p["disk_total_gib"], p["cleanup_at"], p["eda_version"]) == (29.7, 290.0, None, "1.0.0")
     health["disk"]["free_gib"] = 245.1
     health["last_cleanup"] = {"at": "2026-11-06T12:30:00Z", "reason": "periodic", "freed_gib": 215.4,
                               "free_gib": 245.1, "evaluators": ["b" * 64, "c" * 64]}
@@ -389,6 +389,6 @@ async def test_eda_disk_and_cleanup_go_into_the_status_and_a_cleanup_is_logged_o
 def test_an_older_eda_server_without_disk_info_sends_nothing():
     r = StatusReporter(SimpleNamespace())
     r.disk({"ready": True})
-    r.disk({"disk": {"free_gib": "x"}})
+    r.disk({"disk": {"free_gib": "x"}, "eda_version": "<script>"})
     p = r.payload()
-    assert p["disk_free_gib"] is None and p["cleanup_at"] is None
+    assert p["disk_free_gib"] is None and p["cleanup_at"] is None and p["eda_version"] is None
