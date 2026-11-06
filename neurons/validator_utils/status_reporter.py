@@ -34,6 +34,10 @@ class StatusReporter:
         self.target_sha256: Optional[str] = None
         self.eda_ready = False
         self.eda_mock = False
+        self.disk_free_gib: Optional[float] = None
+        self.disk_total_gib: Optional[float] = None
+        self.cleanup_at: Optional[str] = None
+        self.cleanup_freed_gib: Optional[float] = None
         self._dirty = True
         self._sent_at = 0.0
         self._supported = True
@@ -63,13 +67,35 @@ class StatusReporter:
             (self.evaluator_sha256, self.evaluator_ready, self.target_sha256, self.eda_ready, self.eda_mock) = values
             self._dirty = True
 
+    def disk(self, health: Optional[dict]) -> None:
+        """Free disk of the EDA server and its last cleanup of old evaluator versions (EDA /v2/health). A new
+        cleanup is logged once; the free space is sent with the status (not a change by itself: it moves)."""
+        disk = (health or {}).get('disk') or {}
+        cleanup = (health or {}).get('last_cleanup') or {}
+        try:
+            free = float(disk['free_gib']) if disk.get('free_gib') is not None else None
+            total = float(disk['total_gib']) if disk.get('total_gib') is not None else None
+            freed = float(cleanup['freed_gib']) if cleanup.get('freed_gib') is not None else None
+        except (TypeError, ValueError):
+            return
+        self.disk_free_gib, self.disk_total_gib = free, total
+        at = cleanup.get('at') if isinstance(cleanup.get('at'), str) else None
+        if at and at != self.cleanup_at:
+            if self.cleanup_at is not None or freed:
+                logger.info(f"EDA server deleted {len(cleanup.get('evaluators') or [])} old evaluator version(s), "
+                            f"freed {freed or 0:.1f} GiB ({free if free is not None else '?'} GiB free)")
+            self.cleanup_at, self.cleanup_freed_gib = at, freed
+            self._dirty = True
+
     def payload(self) -> dict:
         return {"state": self.state, "detail": self.detail,
                 "evaluator_sha256": self.evaluator_sha256, "evaluator_ready": self.evaluator_ready,
                 "target_sha256": self.target_sha256, "eda_ready": self.eda_ready, "eda_mock": self.eda_mock,
                 "submission_id": self.submission_id,
                 "started_at": self.started_at.isoformat() if self.started_at else None,
-                "neuron_version": NEURON_VERSION}
+                "neuron_version": NEURON_VERSION,
+                "disk_free_gib": self.disk_free_gib, "disk_total_gib": self.disk_total_gib,
+                "cleanup_at": self.cleanup_at, "cleanup_freed_gib": self.cleanup_freed_gib}
 
     async def flush(self, force: bool = False) -> bool:
         """Send the status if it changed or every `every` seconds. Never raises."""

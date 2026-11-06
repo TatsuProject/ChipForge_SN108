@@ -57,6 +57,7 @@ class EvaluatorManager:
             self.status.evaluator(sha256=None, ready=False, target=(target or {}).get('sha256'), eda_ready=False)
             return False, None
         self.mock = bool(health.get('mock'))
+        self.status.disk(health)
         active = health.get('active_evaluator') if health.get('ready') else None
         if not target:
             self.status.evaluator(sha256=active, ready=active is not None, target=None, eda_ready=True, mock=self.mock)
