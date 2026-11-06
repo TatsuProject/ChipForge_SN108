@@ -50,7 +50,7 @@ btcli subnets register --netuid 108 --network finney --wallet-name mywallet --ho
 The folder name you chose (`mywallet`) is what goes in `VALIDATOR_WALLET_NAME` / `MINER_WALLET_NAME`.
 
 Validators additionally need:
-- **hardware** (minimum and recommended): 16 cores / 32 threads, 64 GB RAM, 300 GB SSD (x86-64); see
+- **hardware**: 16 cores / 32 threads, 64 GB RAM, 300 GB SSD minimum (500 GB recommended), x86-64; see
   [docs/validator_requirements.md](docs/validator_requirements.md);
 - a **validator permit**, which the chain gives to the top-staked hotkeys of the subnet: stake to your hotkey
   with `btcli stake add --netuid 108 ...`. Your influence on who gets paid is proportional to your stake;

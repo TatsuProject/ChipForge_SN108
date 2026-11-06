@@ -8,7 +8,7 @@ synthesizes every submission. The EDA server sets the hardware needs.
 
 |                 | CPU                        | RAM   | Disk        |
 |-----------------|----------------------------|-------|-------------|
-| **Recommended** | 16 cores / 32 threads      | 64 GB | 300 GB SSD  |
+| **Recommended** | 16 cores / 32 threads      | 64 GB | 500 GB SSD  |
 | **Minimum**     | 16 cores / 32 threads      | 64 GB | 300 GB SSD  |
 
 - **16 physical cores with 2 threads each (32 vCPUs on most cloud instances).** Example: AWS
@@ -18,8 +18,11 @@ synthesizes every submission. The EDA server sets the hardware needs.
   than 20 GB of RAM on their own. With less memory, evaluations fail as "host ran out of resources",
   count as failures of your validator, and the design goes to another validator.
 - **Disk:** the evaluator's install check refuses to install with less than 100 GB free on the EDA
-  server's data disk; each installed evaluator version and each interrupted evaluation leave files
-  behind, so plan 300 GB.
+  server's data disk, and evaluations leave files behind. The EDA server (1.0.0 and later) deletes old
+  evaluator versions automatically; plan 300 GB at least, 500 GB recommended. Your free disk is shown on
+  your card on the website's validators page.
+- **Time:** each design gets the whole machine for up to the evaluation window (currently 7 hours). A
+  slower machine times out on designs a full-spec one finishes.
 - **x86-64 only.** The EDA toolchain images do not run on ARM (e.g. AWS Graviton, Apple Silicon).
 - Use the machine only for the validator and its EDA server: other heavy workloads take the memory an
   evaluation needs.
