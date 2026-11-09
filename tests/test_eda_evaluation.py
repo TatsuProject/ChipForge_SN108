@@ -355,10 +355,11 @@ def _v2_result(status="PASSED", s=4.06, projection="7a" * 32, problems=()):
 
 class V2Server:
     """Fake v2 EDA server: health, evaluate (202), status (202 `polls` times, then the result)."""
-    def __init__(self, result, polls=1, health=None, evaluate_status=202):
+    def __init__(self, result, polls=1, health=None, evaluate_status=202, running=()):
         self.result, self.polls, self.forms = result, polls, []
         self.health = health or {"ready": True, "active_evaluator": V2_SHA}
         self.evaluate_status = evaluate_status
+        self.known = set(running)                           # request IDs it holds (e.g. started before an update)
 
     def __call__(self, kw):
         url = kw.get("url", "")
@@ -367,8 +368,11 @@ class V2Server:
         if "data" in kw:                                    # POST /v2/evaluate
             fields = {f[0]["name"]: f[2] for f in kw["data"]._fields}
             self.forms.append(fields)
+            self.known.add(fields["request_id"])
             return FakeResponse(status=self.evaluate_status, json_data={"request_id": fields["request_id"], "phase": "running"}
                                 if self.evaluate_status == 202 else {"error": {"code": "INVALID_CHAIN_COMMIT"}})
+        if "/v2/status/" in url and url.rsplit("/", 1)[-1] not in self.known:
+            return FakeResponse(status=404, json_data={"error": {"code": "NOT_FOUND"}})
         if self.polls > 0:
             self.polls -= 1
             return FakeResponse(status=202, json_data={"phase": "running"})
@@ -473,3 +477,14 @@ async def test_each_assignment_gets_its_own_eda_request_id(v2_client):
     rid = client.eda_request_id("d" * 32, "b" * 40, "a" * 64)
     assert re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}", rid)          # what the EDA server accepts
     assert client.eda_request_id("s1", None, V2_SHA).startswith("s1-")
+
+
+async def test_updated_mid_evaluation_waits_for_the_running_one(v2_client):
+    """Restarted on 1.0.4+ while the EDA server still runs the design under the old request ID: no second
+    evaluation is started; the running one's result is reported."""
+    legacy = f"s1-{v2_client(V2Server(_v2_result())).validator_hotkey[:10]}"
+    server = V2Server(_v2_result(), running=[legacy])
+    client = v2_client(server)
+    client.chain_commits["s1"] = _commit(b"PK")
+    ev = (await client.evaluate_submissions_with_eda_server("c1", {"s1": b"PK"}, batch_id="split-abc"))["s1"]
+    assert server.forms == [] and ev["overall_score"] == 4.06

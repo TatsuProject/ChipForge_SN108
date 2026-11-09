@@ -934,6 +934,21 @@ class APIClient:
             evaluations[result[0]] = result[1]
         return evaluations
 
+    async def _legacy_running(self, submission_id: str, sha: str) -> Optional[str]:
+        """The pre-1.0.4 request ID (<submission>-<hotkey>) when the EDA server is still running this design under
+        it with this evaluator (the validator was updated mid-evaluation). Only a running one: a finished one may be
+        a stale result from an earlier evaluation (why 1.0.4 changed the ID)."""
+        legacy = re.sub(r"[^A-Za-z0-9._-]", "", f"{submission_id}-{self.validator_hotkey[:10]}")[:128]
+        try:
+            async with self.session.get(f"{self.eda_server_url}/v2/status/{legacy}",
+                                        timeout=aiohttp.ClientTimeout(total=30)) as response:
+                if response.status != 202:
+                    return None
+                ran = (response.headers.get('X-CF-Evaluator-Sha256') or '').strip().lower()
+                return legacy if not ran or ran == sha else None
+        except Exception:
+            return None
+
     def eda_request_id(self, submission_id: str, batch_id: Optional[str], sha: str) -> str:
         """The EDA server's request ID for one evaluation. The EDA server keeps every request ID it has seen
         and answers a repeated ID with that request's stored result (or REQUEST_ID_CONFLICT when it named another
@@ -966,6 +981,11 @@ class APIClient:
             return self._v2_failure(submission_id, 'VALIDATOR_EDA_NOT_READY', "The validator's EDA server is not ready.")
         submitter = json.loads(chain_commit).get('hotkey') if chain_commit else None
         rid = self.eda_request_id(submission_id, batch_id, sha)
+        legacy = await self._legacy_running(submission_id, sha)
+        if legacy:                      # started before the update to 1.0.4: wait for that run, start no second one
+            logger.info(f"{submission_id}: the EDA server is still running it under its pre-1.0.4 request ID; "
+                        "waiting for that evaluation")
+            rid = legacy
         form = aiohttp.FormData()
         form.add_field('design_zip', data, filename=f'{submission_id}.zip', content_type='application/zip')
         form.add_field('mode', self.eda_mode)
@@ -979,15 +999,16 @@ class APIClient:
         logger.debug(f"Sending {submission_id} to the EDA server ({len(data)} bytes, {self.eda_mode}, request {rid}, "
                      f"evaluator {sha[:12]}, up to {budget:.0f}s)")
         try:
-            async with self.session.post(f"{self.eda_server_url}/v2/evaluate", data=form,
-                                         timeout=aiohttp.ClientTimeout(total=min(900, max(60, budget)))) as response:
-                body = await json_capped(response)
-                if response.status not in (200, 202):
-                    code = (body.get('error') or {}).get('code') if isinstance(body, dict) else None
-                    return self._v2_failure(submission_id, code or 'VALIDATOR_EDA_HTTP_ERROR',
-                                            f"The EDA server refused the evaluation (HTTP {response.status}). Not a "
-                                            "property of the submission.", http_status=response.status,
-                                            where='eda_server')
+            if not legacy:
+                async with self.session.post(f"{self.eda_server_url}/v2/evaluate", data=form,
+                                             timeout=aiohttp.ClientTimeout(total=min(900, max(60, budget)))) as response:
+                    body = await json_capped(response)
+                    if response.status not in (200, 202):
+                        code = (body.get('error') or {}).get('code') if isinstance(body, dict) else None
+                        return self._v2_failure(submission_id, code or 'VALIDATOR_EDA_HTTP_ERROR',
+                                                f"The EDA server refused the evaluation (HTTP {response.status}). Not a "
+                                                "property of the submission.", http_status=response.status,
+                                                where='eda_server')
             while True:
                 async with self.session.get(f"{self.eda_server_url}/v2/status/{rid}",
                                             timeout=aiohttp.ClientTimeout(total=60)) as response:
