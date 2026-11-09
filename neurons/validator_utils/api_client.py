@@ -791,7 +791,8 @@ class APIClient:
     async def evaluate_submissions_with_eda_server(self, challenge_id: str, submissions: Dict[str, bytes],
                                                    deadline: Optional[datetime] = None,
                                                    window_start: Optional[datetime] = None,
-                                                   evaluator_sha256: Optional[str] = None) -> Dict[str, Dict]:
+                                                   evaluator_sha256: Optional[str] = None,
+                                                   batch_id: Optional[str] = None) -> Dict[str, Dict]:
         """Evaluate submissions on the EDA server, at most EDA_MAX_CONCURRENCY at a time, each
         within the time left before the server's evaluation deadline. The EDA server is told that time
         (time_limit_s) and the time every submission of the batch is entitled to (fair_limit_s), so it
@@ -801,7 +802,7 @@ class APIClient:
         if self.use_dummy_evaluation:
             return await self._dummy_evaluate_submissions(submissions)
         if self.eda_api == "v2":
-            return await self._evaluate_v2(submissions, deadline, evaluator_sha256)
+            return await self._evaluate_v2(submissions, deadline, evaluator_sha256, batch_id)
 
         evaluator_zip_path = self.get_testcase_files(challenge_id)
         if not evaluator_zip_path.exists():
@@ -918,12 +919,12 @@ class APIClient:
         return sha
 
     async def _evaluate_v2(self, submissions: Dict[str, bytes], deadline: Optional[datetime],
-                           evaluator_sha256: Optional[str] = None) -> Dict[str, Dict]:
+                           evaluator_sha256: Optional[str] = None, batch_id: Optional[str] = None) -> Dict[str, Dict]:
         semaphore = asyncio.Semaphore(self.eda_max_concurrency)
 
         async def one(submission_id: str, data: bytes) -> tuple:
             async with semaphore:
-                return submission_id, await self._evaluate_v2_one(submission_id, data, deadline, evaluator_sha256)
+                return submission_id, await self._evaluate_v2_one(submission_id, data, deadline, evaluator_sha256, batch_id)
 
         evaluations = {}
         for result in await asyncio.gather(*[one(s, d) for s, d in submissions.items()], return_exceptions=True):
@@ -933,13 +934,23 @@ class APIClient:
             evaluations[result[0]] = result[1]
         return evaluations
 
+    def eda_request_id(self, submission_id: str, batch_id: Optional[str], sha: str) -> str:
+        """The EDA server's request ID for one evaluation. The EDA server keeps every request ID it has seen
+        and answers a repeated ID with that request's stored result (or REQUEST_ID_CONFLICT when it named another
+        evaluator), so each evaluation needs its own ID: the batch (split: the assignment) and the evaluator are
+        part of it. The same assignment keeps its ID, so after a restart the validator finds its running
+        evaluation again instead of starting a second one."""
+        tag = re.sub(r"[^A-Za-z0-9]", "", (batch_id or "").removeprefix("split-"))[:16] or "nobatch"
+        raw = f"{submission_id}-{self.validator_hotkey[:10]}-{tag}-{sha[:8]}"
+        return re.sub(r"[^A-Za-z0-9._-]", "", raw)[:96]
+
     def _v2_failure(self, submission_id: str, code: str, message: str, **extra) -> Dict:
         return self._generate_fallback_evaluation(submission_id, evaluation_details={
             'status': 'eda_system_error', 'code': code, 'where': extra.pop('where', 'validator'),
             'message': message, **extra})
 
     async def _evaluate_v2_one(self, submission_id: str, data: bytes, deadline: Optional[datetime],
-                               evaluator_sha256: Optional[str] = None) -> Dict:
+                               evaluator_sha256: Optional[str] = None, batch_id: Optional[str] = None) -> Dict:
         budget = self._eda_time_budget(deadline)
         if budget - self.eda_answer_margin < self.eda_min_limit:
             return self._generate_fallback_evaluation(submission_id, evaluation_details=self._timeout_details(
@@ -954,7 +965,7 @@ class APIClient:
         if sha is None:
             return self._v2_failure(submission_id, 'VALIDATOR_EDA_NOT_READY', "The validator's EDA server is not ready.")
         submitter = json.loads(chain_commit).get('hotkey') if chain_commit else None
-        rid = re.sub(r"[^A-Za-z0-9._-]", "", f"{submission_id}-{self.validator_hotkey[:10]}")[:128]
+        rid = self.eda_request_id(submission_id, batch_id, sha)
         form = aiohttp.FormData()
         form.add_field('design_zip', data, filename=f'{submission_id}.zip', content_type='application/zip')
         form.add_field('mode', self.eda_mode)

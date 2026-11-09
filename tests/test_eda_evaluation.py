@@ -454,3 +454,22 @@ async def test_v2_report_is_sent_with_its_signed_sha(client_factory, monkeypatch
     assert await client.submit_evaluation("c1", "s1", ev)
     assert sent["files"]["public_report"][1] == gz
     assert sent["form"]["public_report_sha256"] == hashlib.sha256(gz).hexdigest()
+
+
+async def test_each_assignment_gets_its_own_eda_request_id(v2_client):
+    """The EDA server keeps every request ID: a design evaluated again (a later assignment, a reset, a new
+    evaluator) must not reuse the old ID (REQUEST_ID_CONFLICT, or the old stored result); the same assignment
+    keeps its ID (a restarted validator finds its running evaluation)."""
+    import re
+    server = V2Server(_v2_result())
+    client = v2_client(server)
+    client.chain_commits["s1"] = _commit(b"PK")
+    for batch in ("split-aaaa1111bbbb2222cccc3333dddd4444", "split-eeee5555ffff6666aaaa7777bbbb8888"):
+        await client.evaluate_submissions_with_eda_server("c1", {"s1": b"PK"}, batch_id=batch)
+    first, second = (f["request_id"] for f in server.forms)
+    assert first != second and first.startswith("s1-") and "aaaa1111" in first and "eeee5555" in second
+    assert client.eda_request_id("s1", "split-aaaa1111bbbb2222cccc3333dddd4444", V2_SHA) == first   # stable
+    assert client.eda_request_id("s1", "split-aaaa1111bbbb2222cccc3333dddd4444", "f" * 64) != first  # evaluator
+    rid = client.eda_request_id("d" * 32, "b" * 40, "a" * 64)
+    assert re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}", rid)          # what the EDA server accepts
+    assert client.eda_request_id("s1", None, V2_SHA).startswith("s1-")

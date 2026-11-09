@@ -75,7 +75,8 @@ class BatchProcessor:
             self._status("evaluating", f"{len(downloaded)} design(s)" if not one else None, one)
             evaluations = await self.api_client.evaluate_submissions_with_eda_server(
                 challenge_id, downloaded, deadline=parse_server_time(batch.get('evaluation_ends_at')),
-                window_start=parse_server_time(batch.get('expires_at')), evaluator_sha256=evaluator_sha256)
+                window_start=parse_server_time(batch.get('expires_at')), evaluator_sha256=evaluator_sha256,
+                batch_id=batch_id)
             if not evaluations:
                 logger.error(f"Batch {batch_id}: the EDA server returned no evaluation")
                 return False
