@@ -10,6 +10,7 @@ import json
 import argparse
 import requests
 import hashlib
+import secrets
 import zipfile
 from pathlib import Path
 from datetime import datetime, timezone
@@ -68,6 +69,28 @@ class SolutionSubmitter:
         """Query params for signed miner endpoints: signature over f"{hotkey}{timestamp}"."""
         timestamp = datetime.now(timezone.utc).isoformat()
         return {"signature": self.create_signature(f"{self.miner_hotkey}{timestamp}"), "timestamp": timestamp}
+
+    def signed_headers(self, method: str, path: str, form: Dict[str, str]) -> Dict[str, str]:
+        """v2 signature for requests that change something (the server's verify_miner_signature_v2): method, path,
+        hotkey, unix timestamp, a single-use nonce and the sha256 of the key-sorted form fields."""
+        ts, nonce = str(int(datetime.now(timezone.utc).timestamp())), secrets.token_hex(16)
+        digest = hashlib.sha256("&".join(f"{k}={v}" for k, v in sorted(form.items())).encode()).hexdigest()
+        message = f"chipforge-sn108:v2:{method.upper()}:{path}:{self.miner_hotkey}:{ts}:{nonce}:{digest}"
+        return {"X-Signature-Version": "2", "X-Signature": self.create_signature(message), "X-Timestamp": ts, "X-Nonce": nonce}
+
+    def withdraw_submission(self, challenge_id: str, submission_id: str) -> Optional[Dict]:
+        """Withdraw a queued submission no validator has picked up (its attempt is refunded)."""
+        path = f"/api/v1/challenges/{challenge_id}/submissions/{submission_id}/withdraw"
+        form = {"hotkey": self.miner_hotkey}
+        response = requests.post(f"{self.api_url}{path}", data=form, headers=self.signed_headers("POST", path, form), timeout=30)
+        if response.status_code == 200:
+            return response.json()
+        try:
+            detail = response.json().get("detail")
+        except ValueError:
+            detail = response.text[:200]
+        logger.error(f"Could not withdraw {submission_id}: {response.status_code} {detail}")
+        return None
 
     def calculate_file_hash(self, file_path: Path) -> str:
         """Calculate SHA256 hash of file"""
@@ -671,6 +694,41 @@ class MinerCLI:
         path.write_bytes(result["content"])
         logger.info(f"Saved {path} ({len(result['content']):,} bytes, sha256 {result['sha256'][:16]}...)")
 
+    def withdraw(self, submission_id: Optional[str] = None, challenge_id: Optional[str] = None, yes: bool = False):
+        """Withdraw a queued submission (submission_id, or our only pending one): it leaves the competition and the
+        attempt is refunded."""
+        logger.info("=" * 80)
+        logger.info("Withdraw Queued Submission")
+        logger.info("=" * 80)
+        if not challenge_id:
+            challenge = self.get_active_challenge()
+            if not challenge:
+                logger.error("No active challenge found")
+                sys.exit(1)
+            challenge_id = challenge['challenge_id']
+        if not submission_id:
+            queued = [s for s in self.submitter.get_miner_submissions(challenge_id)
+                      if str(s.get('status', '')).lower() == 'pending']
+            if len(queued) != 1:
+                logger.error(f"You have {len(queued)} pending submissions: give the one to withdraw with --submission-id")
+                for s in queued:
+                    logger.error(f"  {s.get('submission_id')}")
+                sys.exit(1)
+            submission_id = queued[0].get('submission_id')
+        logger.info(f"Challenge ID: {challenge_id}")
+        logger.info(f"Withdrawing: {submission_id}")
+        logger.info("It leaves the competition for good and your attempt is refunded. Only possible while no validator")
+        logger.info("has picked it up.")
+        if not yes and input("Type 'withdraw' to confirm: ").strip().lower() != "withdraw":
+            logger.info("Not withdrawn.")
+            return
+        out = self.submitter.withdraw_submission(challenge_id, submission_id)
+        if not out:
+            sys.exit(1)
+        logger.info(f"✅ Withdrawn. Submissions left: {out.get('remaining_submissions')}, "
+                    f"withdrawals left this challenge: {out.get('withdrawals_left')}")
+        logger.info("=" * 80)
+
     def submit_solution(self, solution_file: str, challenge_id: Optional[str] = None, 
                        check_status: bool = False, dry_run: bool = False, replace: bool = False,
                        replaces: Optional[str] = None):
@@ -854,6 +912,14 @@ Examples:
     replace_parser.add_argument('--submission-id', dest='replace_id', type=str,
                                 help='Submission to replace (default: your only pending one)')
     replace_parser.add_argument('--challenge_id', type=str, help='Challenge ID (default: active challenge)')
+
+    # Withdraw command: a queued submission no validator has picked up yet; the attempt is refunded
+    withdraw_parser = subparsers.add_parser('withdraw', parents=[sub_common],
+                                            help='Withdraw your queued submission (your attempt is refunded)')
+    withdraw_parser.add_argument('--submission-id', dest='withdraw_id', type=str,
+                                 help='Submission to withdraw (default: your only pending one)')
+    withdraw_parser.add_argument('--challenge_id', type=str, help='Challenge ID (default: active challenge)')
+    withdraw_parser.add_argument('--yes', action='store_true', help='Do not ask for confirmation')
     
     args = parser.parse_args()
     
@@ -905,6 +971,9 @@ Examples:
                 replace=True,
                 replaces=getattr(args, 'replace_id', None)
             )
+        elif args.command == 'withdraw':
+            cli.withdraw(submission_id=getattr(args, 'withdraw_id', None),
+                         challenge_id=getattr(args, 'challenge_id', None), yes=getattr(args, 'yes', False))
         else:
             parser.print_help()
             sys.exit(1)

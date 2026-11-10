@@ -273,3 +273,44 @@ def test_cli_wallet_defaults_come_from_miner_settings(cli_parse, monkeypatch, tm
     assert (cfg.wallet.name, cfg.wallet.hotkey, cfg.wallet.path) == ("m_wallet", "m_hot", str(tmp_path))
     monkeypatch.delenv("MINER_WALLET_NAME")
     assert cli_parse(["status"]).wallet.name == "old_style"
+
+
+def test_cli_withdraw_is_signed_the_way_the_server_verifies(monkeypatch):
+    """server: verify_miner_signature_v2: f"chipforge-sn108:v2:{METHOD}:{path}:{hotkey}:{ts}:{nonce}:{sha256(sorted form)}" """
+    import hashlib
+    from python_scripts import miner_cli
+
+    kp = Keypair.create_from_mnemonic(Keypair.generate_mnemonic())
+    sub = miner_cli.SolutionSubmitter.__new__(miner_cli.SolutionSubmitter)
+    sub.api_url, sub.miner_hotkey = API, kp.ss58_address
+    sub.wallet = SimpleNamespace(hotkey=SimpleNamespace(sign=lambda data: kp.sign(data)))
+    seen = {}
+
+    def fake_post(url, data=None, headers=None, timeout=None):
+        seen.update(url=url, data=data, headers=headers)
+        return SimpleNamespace(status_code=200, json=lambda: {"withdrawn": True, "withdrawals_left": 2, "remaining_submissions": 1})
+    monkeypatch.setattr(miner_cli.requests, "post", fake_post)
+    assert sub.withdraw_submission("c1", "s1")["withdrawn"]
+    path = "/api/v1/challenges/c1/submissions/s1/withdraw"
+    assert seen["url"] == f"{API}{path}" and seen["data"] == {"hotkey": kp.ss58_address}
+    h = seen["headers"]
+    digest = hashlib.sha256(f"hotkey={kp.ss58_address}".encode()).hexdigest()
+    msg = f"chipforge-sn108:v2:POST:{path}:{kp.ss58_address}:{h['X-Timestamp']}:{h['X-Nonce']}:{digest}"
+    assert h["X-Signature-Version"] == "2" and kp.verify(msg.encode(), bytes.fromhex(h["X-Signature"]))
+
+
+def test_cli_withdraw_command_parses(monkeypatch):
+    from python_scripts import miner_cli
+    got = {}
+
+    class FakeCLI:
+        def __init__(self, config):
+            pass
+
+        def withdraw(self, submission_id=None, challenge_id=None, yes=False):
+            got.update(submission_id=submission_id, challenge_id=challenge_id, yes=yes)
+
+    monkeypatch.setattr(miner_cli, "MinerCLI", FakeCLI)
+    monkeypatch.setattr(sys, "argv", ["miner_cli.py", "withdraw", "--submission-id", "abc", "--yes"])
+    miner_cli.main()
+    assert got == {"submission_id": "abc", "challenge_id": None, "yes": True}

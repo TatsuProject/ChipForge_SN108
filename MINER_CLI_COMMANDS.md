@@ -224,6 +224,23 @@ python python_scripts/miner_cli.py replace path/to/new_design.zip --submission-i
 Once a validator has started evaluating a submission it can no longer be replaced (the server answers 409).
 The replaced submission disappears from the leaderboard; only the new one is shown.
 
+---
+
+### 6. `withdraw` - Withdraw Your Queued Submission
+
+Not confident in a design you submitted? Withdraw it while it is still **queued** (no validator has picked it up yet).
+It leaves the competition for good, disappears from the leaderboard, and your **submission attempt is refunded**, so
+you can submit again right away (no cooldown follows a withdrawn design). You can withdraw up to 3 submissions per
+challenge (the server's limit; `withdrawals_per_hotkey` in the public rules).
+
+```bash
+python python_scripts/miner_cli.py withdraw                          # your only pending submission (asks to confirm)
+python python_scripts/miner_cli.py withdraw --submission-id <id>     # a specific one
+python python_scripts/miner_cli.py withdraw --submission-id <id> --yes   # no confirmation prompt
+```
+
+Once a validator has started evaluating a submission it can no longer be withdrawn (the server answers 409).
+
 ## Using with .env File
 
 Create a `.env` file in the project root:
