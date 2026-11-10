@@ -40,6 +40,7 @@ class FakeSession:
 
     def post(self, url, **kwargs):
         self.calls.append((url, kwargs))
+        kwargs = {"url": url, **kwargs}
         session = self
 
         class _Ctx:
@@ -354,20 +355,32 @@ def _v2_result(status="PASSED", s=4.06, projection="7a" * 32, problems=()):
 
 
 class V2Server:
-    """Fake v2 EDA server: health, evaluate (202), status (202 `polls` times, then the result)."""
-    def __init__(self, result, polls=1, health=None, evaluate_status=202, running=()):
+    """Fake v2 EDA server: health, evaluate (202), status (202 `polls` times, then the result). EDA server 1.0.2+
+    (jobs=True): GET /v2/jobs lists `unfinished` and POST /v2/cancel/<id> is recorded; older ones answer 404."""
+    def __init__(self, result, polls=1, health=None, evaluate_status=202, running=(), jobs=True, phase="running",
+                 unfinished=()):
         self.result, self.polls, self.forms = result, polls, []
         self.health = health or {"ready": True, "active_evaluator": V2_SHA}
         self.evaluate_status = evaluate_status
         self.known = set(running)                           # request IDs it holds (e.g. started before an update)
+        self.jobs, self.phase, self.unfinished = jobs, phase, [dict(j) for j in unfinished]
+        self.cancelled, self.headers = [], []
 
     def __call__(self, kw):
         url = kw.get("url", "")
         if url.endswith("/v2/health"):
             return FakeResponse(json_data=self.health)
+        if url.endswith("/v2/jobs"):
+            return FakeResponse(json_data={"jobs": self.unfinished}) if self.jobs else FakeResponse(status=404, json_data={})
+        if "/v2/cancel/" in url:
+            if not self.jobs:
+                return FakeResponse(status=404, json_data={})
+            self.cancelled.append(url.rsplit("/", 1)[-1])
+            return FakeResponse(json_data={"cancelled": True})
         if "data" in kw:                                    # POST /v2/evaluate
             fields = {f[0]["name"]: f[2] for f in kw["data"]._fields}
             self.forms.append(fields)
+            self.headers.append(kw.get("headers") or {})
             self.known.add(fields["request_id"])
             return FakeResponse(status=self.evaluate_status, json_data={"request_id": fields["request_id"], "phase": "running"}
                                 if self.evaluate_status == 202 else {"error": {"code": "INVALID_CHAIN_COMMIT"}})
@@ -375,7 +388,7 @@ class V2Server:
             return FakeResponse(status=404, json_data={"error": {"code": "NOT_FOUND"}})
         if self.polls > 0:
             self.polls -= 1
-            return FakeResponse(status=202, json_data={"phase": "running"})
+            return FakeResponse(status=202, json_data={"phase": self.phase}, headers={"X-CF-Phase": self.phase})
         # the loader names the evaluator it ran
         return FakeResponse(json_data=self.result, headers={"X-CF-Evaluator-Sha256": V2_SHA})
 
@@ -488,3 +501,102 @@ async def test_updated_mid_evaluation_waits_for_the_running_one(v2_client):
     client.chain_commits["s1"] = _commit(b"PK")
     ev = (await client.evaluate_submissions_with_eda_server("c1", {"s1": b"PK"}, batch_id="split-abc"))["s1"]
     assert server.forms == [] and ev["overall_score"] == 4.06
+
+
+# --- an evaluation nobody waits for must not hold the EDA server (EDA server 1.0.2+) -------------------------
+
+def _short(client, seconds):
+    """A deadline `seconds` away with no margins, so a test gives up quickly."""
+    client.eda_deadline_buffer = client.eda_answer_margin = client.eda_min_limit = 0
+    return datetime.now(timezone.utc) + timedelta(seconds=seconds)
+
+
+async def test_the_deadline_goes_with_the_evaluation(v2_client):
+    server = V2Server(_v2_result())
+    client = v2_client(server)
+    client.chain_commits["s1"] = _commit(b"PK")
+    deadline = _short(client, 3600)
+    await client.evaluate_submissions_with_eda_server("c1", {"s1": b"PK"}, deadline=deadline, batch_id="split-abc")
+    h = server.headers[0]
+    assert h["X-CF-Request-Id"] == server.forms[0]["request_id"]
+    assert abs(float(h["X-CF-Deadline"]) - deadline.timestamp()) < 5
+
+
+async def test_out_of_time_after_running_is_a_timeout_and_the_run_is_cancelled(v2_client):
+    server = V2Server(_v2_result(), polls=10 ** 6, phase="running")
+    client = v2_client(server)
+    client.chain_commits["s1"] = _commit(b"PK")
+    ev = (await client.evaluate_submissions_with_eda_server("c1", {"s1": b"PK"}, deadline=_short(client, 0.4),
+                                                            batch_id="split-abc"))["s1"]
+    assert ev["timeout_occurred"] is True
+    details = json.loads(ev["evaluation_details"])
+    assert details["code"] == "VALIDATOR_EDA_NO_RESULT" and details["timing"]["waited_s"] < 1
+    assert server.cancelled == [server.forms[0]["request_id"]]          # the EDA server is free for the next design
+
+
+async def test_a_design_that_never_got_the_machine_is_not_blamed(v2_client):
+    server = V2Server(_v2_result(), polls=10 ** 6, phase="queued")
+    client = v2_client(server)
+    client.chain_commits["s1"] = _commit(b"PK")
+    ev = (await client.evaluate_submissions_with_eda_server("c1", {"s1": b"PK"}, deadline=_short(client, 0.4),
+                                                            batch_id="split-abc"))["s1"]
+    details = json.loads(ev["evaluation_details"])
+    assert not ev.get("timeout_occurred") and details["code"] == "VALIDATOR_EDA_BUSY"
+    assert "FAILED" in ev["evaluation_notes"].upper()                   # the server: a validator fault, requeued
+    assert server.cancelled == [server.forms[0]["request_id"]]
+
+
+async def test_a_design_started_late_is_not_blamed(v2_client):
+    import time as _t
+    server = V2Server(_v2_result(), polls=10 ** 6, phase="running")
+    client = v2_client(server)
+    client.chain_commits["s1"] = _commit(b"PK")
+    rid = client.eda_request_id("s1", "split-abc", V2_SHA)
+    # the EDA server's record (it survives a validator restart): sent 2 h ago, started 30 min ago
+    server.unfinished = [{"request_id": rid, "phase": "running", "sent_unix": _t.time() - 7200, "started_unix": _t.time() - 1800}]
+    ev = (await client.evaluate_submissions_with_eda_server("c1", {"s1": b"PK"}, deadline=_short(client, 0.4),
+                                                            batch_id="split-abc"))["s1"]
+    details = json.loads(ev["evaluation_details"])
+    assert details["code"] == "VALIDATOR_EDA_BUSY" and details["timing"]["waited_s"] > 5000
+
+
+async def test_abandoned_evaluations_are_cancelled_before_a_new_design(v2_client):
+    me = v2_client(V2Server(_v2_result())).validator_hotkey[:10]
+    server = V2Server(_v2_result(), unfinished=[
+        {"request_id": f"old1-{me}-aaaa-abababab"}, {"request_id": f"old2-{me}-bbbb-abababab"},
+        {"request_id": "other-5SomeoneEl-cccc-abababab"}])                  # not this validator's: left to the EDA server
+    client = v2_client(server)
+    client.chain_commits["s1"] = _commit(b"PK")
+    ev = (await client.evaluate_submissions_with_eda_server("c1", {"s1": b"PK"}, batch_id="split-abc"))["s1"]
+    assert ev["overall_score"] == 4.06
+    assert server.cancelled == [f"old1-{me}-aaaa-abababab", f"old2-{me}-bbbb-abababab"]
+
+
+async def test_a_batch_keeps_all_its_designs(v2_client):
+    server = V2Server(_v2_result())
+    client = v2_client(server)
+    for s in ("s1", "s2"):
+        client.chain_commits[s] = _commit(s.encode())
+    rid2 = client.eda_request_id("s2", "batch-1", V2_SHA)
+    server.unfinished = [{"request_id": rid2}]                          # sent earlier in this same batch
+    await client.evaluate_submissions_with_eda_server("c1", {"s1": b"s1", "s2": b"s2"}, batch_id="batch-1")
+    assert server.cancelled == []
+
+
+async def test_an_older_eda_server_still_works(v2_client):
+    server = V2Server(_v2_result(), polls=10 ** 6, jobs=False)
+    client = v2_client(server)
+    client.chain_commits["s1"] = _commit(b"PK")
+    ev = (await client.evaluate_submissions_with_eda_server("c1", {"s1": b"PK"}, deadline=_short(client, 0.4),
+                                                            batch_id="split-abc"))["s1"]
+    assert ev["timeout_occurred"] is True and server.cancelled == []   # it cannot cancel: the old behaviour
+
+
+async def test_the_eda_server_enforced_the_deadline_first(v2_client):
+    cancelled = _v2_result("ERROR", None, problems=[{"code": "EVALUATION_CANCELLED", "fault": "system"}])
+    server = V2Server(cancelled, polls=40, phase="running")
+    client = v2_client(server)
+    client.chain_commits["s1"] = _commit(b"PK")
+    ev = (await client.evaluate_submissions_with_eda_server("c1", {"s1": b"PK"}, deadline=_short(client, 0.3),
+                                                            batch_id="split-abc"))["s1"]
+    assert ev["timeout_occurred"] is True                              # it ran its time: a timeout, as if we gave up

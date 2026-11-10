@@ -315,6 +315,17 @@ server evaluates it again in a later batch. Timeouts on the validator's side are
 (`VALIDATOR_NO_TIME_TO_START`, `VALIDATOR_EDA_NO_RESPONSE`, `VALIDATOR_BATCH_TIMEOUT`). An EDA server
 older than this ignores the two fields and applies its own `EVAL_TIMEOUT_S`.
 
+**npu-v2 (Quest 2): an evaluation nobody waits for is stopped.** The v2 evaluator runs one evaluation at a
+time and never stops one by itself. With every design the validator sends its deadline (`X-CF-Deadline`,
+the server's evaluation deadline minus `EDA_DEADLINE_BUFFER_SECONDS`); when it runs out of time it cancels
+the run (`POST /v2/cancel`), and before each new design it cancels its own other unfinished evaluations
+(`GET /v2/jobs`). The EDA server (1.0.2+) also enforces the deadline by itself, so a validator that crashed or
+restarted leaves nothing running. A design that ran its time and did not finish timed out (the design's
+fault); one the EDA server never started, or started more than `EDA_LATE_START_SECONDS` (900) late because it
+was busy, is reported as `VALIDATOR_EDA_BUSY` (the validator's fault: the design is evaluated again). With an
+older EDA server nothing can be cancelled: update it (`git pull && docker compose up -d --build eda-gateway`
+in `chipforge_eda_server`, which does not interrupt the evaluation in progress).
+
 **Record ladder.** The challenge server decides the records (when a batch closes, from every
 validator's results) and sends, in `/validator/sync`, the ladder rules and every record in probation or
 being paid, each with its window (`pays_from` = end of probation, `pays_until`). The validator computes

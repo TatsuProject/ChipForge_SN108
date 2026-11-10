@@ -154,6 +154,9 @@ class APIClient:
         self._pending_testcases_version: Dict[str, Optional[str]] = {}
         
         self.eda_max_concurrency = max(1, int(os.getenv("EDA_MAX_CONCURRENCY", "4")))
+        # A design the EDA server started this much later than it was sent (it waited for the machine) and that then
+        # ran out of time is not held against it: a validator fault, not a timeout (EDA server 1.0.2+ reports starts)
+        self.eda_late_start_seconds = float(os.getenv("EDA_LATE_START_SECONDS", "900"))
         # Requests to the challenge server in progress at once (it refuses more than VALIDATOR_MAX_IN_FLIGHT)
         self._server_slots = asyncio.Semaphore(max(1, int(os.getenv("SERVER_MAX_PARALLEL", "4"))))
         # Seconds kept free before the server's evaluation deadline for submitting scores
@@ -918,9 +921,51 @@ class APIClient:
         self._v2_evaluator = (sha, time.monotonic())
         return sha
 
+    async def _v2_jobs(self) -> Optional[list]:
+        """Unfinished evaluations on the EDA server (GET /v2/jobs, EDA server 1.0.2+); None when it cannot say."""
+        try:
+            async with self.session.get(f"{self.eda_server_url}/v2/jobs",
+                                        timeout=aiohttp.ClientTimeout(total=30)) as response:
+                if response.status != 200:
+                    return None
+                body = await json_capped(response)
+                return body.get('jobs') if isinstance(body, dict) and isinstance(body.get('jobs'), list) else None
+        except Exception:
+            return None
+
+    async def _v2_cancel(self, rid: str, reason: str) -> bool:
+        """Stop an evaluation on the EDA server (POST /v2/cancel, EDA server 1.0.2+): a design nobody waits for must
+        not hold the machine (the evaluator runs one at a time). False when the EDA server cannot cancel."""
+        try:
+            async with self.session.post(f"{self.eda_server_url}/v2/cancel/{rid}", headers={'X-CF-Reason': reason[:150]},
+                                         timeout=aiohttp.ClientTimeout(total=660)) as response:
+                ok = response.status == 200
+        except Exception as e:
+            logger.warning(f"Could not cancel EDA request {rid}: {e}")
+            return False
+        if ok:
+            logger.info(f"Cancelled EDA request {rid}: {reason}")
+        return ok
+
+    async def _v2_reconcile(self, keep: set) -> None:
+        """Before a new design: cancel this validator's other unfinished evaluations. It works on one assignment (one
+        batch) at a time, so any other is one it gave up on (deadline passed, restart, the server moved on), and the
+        EDA server would run it before the new design."""
+        jobs = await self._v2_jobs()
+        mine = f"-{re.sub(r'[^A-Za-z0-9._-]', '', self.validator_hotkey[:10])}"
+        for job in jobs or []:
+            rid = str(job.get('request_id') or '')
+            if rid and rid not in keep and mine in rid:
+                await self._v2_cancel(rid, "the validator moved on to another design")
+
     async def _evaluate_v2(self, submissions: Dict[str, bytes], deadline: Optional[datetime],
                            evaluator_sha256: Optional[str] = None, batch_id: Optional[str] = None) -> Dict[str, Dict]:
         semaphore = asyncio.Semaphore(self.eda_max_concurrency)
+        sha = evaluator_sha256 or await self._v2_active_evaluator()
+        if sha:
+            keep = {self.eda_request_id(s, batch_id, sha) for s in submissions}
+            keep |= {re.sub(r"[^A-Za-z0-9._-]", "", f"{s}-{self.validator_hotkey[:10]}")[:128] for s in submissions}
+            await self._v2_reconcile(keep)
 
         async def one(submission_id: str, data: bytes) -> tuple:
             async with semaphore:
@@ -1000,7 +1045,9 @@ class APIClient:
                      f"evaluator {sha[:12]}, up to {budget:.0f}s)")
         try:
             if not legacy:
-                async with self.session.post(f"{self.eda_server_url}/v2/evaluate", data=form,
+                # the EDA server (1.0.2+) cancels it by itself at this deadline, even if this validator is gone
+                eda_headers = {'X-CF-Request-Id': rid, 'X-CF-Deadline': f"{time.time() + budget:.0f}"}
+                async with self.session.post(f"{self.eda_server_url}/v2/evaluate", data=form, headers=eda_headers,
                                              timeout=aiohttp.ClientTimeout(total=min(900, max(60, budget)))) as response:
                     body = await json_capped(response)
                     if response.status not in (200, 202):
@@ -1009,11 +1056,18 @@ class APIClient:
                                                 f"The EDA server refused the evaluation (HTTP {response.status}). Not a "
                                                 "property of the submission.", http_status=response.status,
                                                 where='eda_server')
+            sent_wall, ran_wall = time.time(), None
             while True:
                 async with self.session.get(f"{self.eda_server_url}/v2/status/{rid}",
                                             timeout=aiohttp.ClientTimeout(total=60)) as response:
+                    if response.status == 202 and ran_wall is None and \
+                            (response.headers.get('X-CF-Phase') or '').lower() == 'running':
+                        ran_wall = time.time()
                     if response.status == 200:
                         result = await json_capped(response)
+                        if self._was_cancelled(result) and time.monotonic() - started + self.eda_poll_seconds > budget:
+                            # the EDA server enforced the deadline itself just before this validator gave up
+                            return await self._v2_gave_up(submission_id, rid, budget, sent_wall, ran_wall, cancel=False)
                         # the loader names the evaluator it ran in X-CF-Evaluator-Sha256 (the mock too)
                         ran = (response.headers.get('X-CF-Evaluator-Sha256') or '').strip().lower() or None
                         if ran and ran != sha:
@@ -1027,10 +1081,7 @@ class APIClient:
                                                 f"The EDA server answered HTTP {response.status} for the status. Not a "
                                                 "property of the submission.", http_status=response.status)
                 if time.monotonic() - started + self.eda_poll_seconds > budget:
-                    logger.error(f"{submission_id}: no EDA result within {budget:.0f}s")
-                    return self._generate_fallback_evaluation(submission_id, evaluation_details=self._timeout_details(
-                        'VALIDATOR_EDA_NO_RESULT', f"The evaluation did not finish within the {budget:.0f}s the "
-                        "validator had for it.", budget=budget), timeout_occurred=True)
+                    return await self._v2_gave_up(submission_id, rid, budget, sent_wall, ran_wall)
                 await asyncio.sleep(self.eda_poll_seconds)
         except (ResponseTooLarge, ValueError) as e:
             return self._v2_failure(submission_id, 'VALIDATOR_EDA_BAD_RESPONSE', f"Unreadable EDA response: {e}")
@@ -1041,6 +1092,45 @@ class APIClient:
             return self._v2_failure(submission_id, 'VALIDATOR_EDA_UNREACHABLE',
                                     "The validator could not reach its EDA server. Not a property of the submission.",
                                     error=str(e)[:300])
+
+    @staticmethod
+    def _was_cancelled(result) -> bool:
+        return isinstance(result, dict) and any(isinstance(p, dict) and p.get('code') == 'EVALUATION_CANCELLED'
+                                                for p in (result.get('problems') or []))
+
+    async def _v2_gave_up(self, submission_id: str, rid: str, budget: float, sent_wall: float,
+                          ran_wall: Optional[float], cancel: bool = True) -> Dict:
+        """Out of time: stop the EDA run (so the next design does not wait behind it) and say whose fault it is. A
+        design that never got the machine, or got it late, is not held against it (a validator fault); one that ran
+        for the time it was given timed out (the design's fault, judged on two validators)."""
+        started_at = ran_wall
+        for job in await self._v2_jobs() or []:              # the EDA server's own record survives a restart
+            if job.get('request_id') != rid:
+                continue
+            if job.get('sent_unix'):
+                sent_wall = min(sent_wall, float(job['sent_unix']))
+            if job.get('started_unix'):
+                started_at = min(started_at or float(job['started_unix']), float(job['started_unix']))
+        if cancel:
+            await self._v2_cancel(rid, "out of time: the validator gave up on it")
+        waited = (started_at - sent_wall) if started_at else budget
+        ran = (time.time() - started_at) if started_at else 0.0
+        timing = {'budget_s': round(max(0.0, budget), 1), 'waited_s': round(max(0.0, waited), 1),
+                  'ran_s': round(max(0.0, ran), 1)}
+        if started_at is None or waited > self.eda_late_start_seconds:
+            logger.error(f"{submission_id}: out of time, but the EDA server "
+                         + ("never started it" if started_at is None else f"started it {waited / 60:.0f} min late")
+                         + ": a validator fault, not the design's")
+            return self._v2_failure(submission_id, 'VALIDATOR_EDA_BUSY',
+                                    "The validator's EDA server was busy with another evaluation and "
+                                    + ("never started this design" if started_at is None else
+                                       f"started it {waited / 60:.0f} min late") + ". Not a property of the submission.",
+                                    timing=timing, where='validator')
+        logger.error(f"{submission_id}: no EDA result within {budget:.0f}s (it ran {ran / 60:.0f} min)")
+        details = self._timeout_details('VALIDATOR_EDA_NO_RESULT', f"The evaluation did not finish within the "
+                                        f"{budget:.0f}s the validator had for it (it ran {ran / 60:.0f} min).", budget=budget)
+        details['timing'] = timing
+        return self._generate_fallback_evaluation(submission_id, evaluation_details=details, timeout_occurred=True)
 
     @staticmethod
     def _v2_score(result: Dict) -> Optional[float]:
