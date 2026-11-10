@@ -314,3 +314,26 @@ def test_cli_withdraw_command_parses(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["miner_cli.py", "withdraw", "--submission-id", "abc", "--yes"])
     miner_cli.main()
     assert got == {"submission_id": "abc", "challenge_id": None, "yes": True}
+
+
+def test_cli_picks_only_designs_that_can_still_change(monkeypatch):
+    from python_scripts import miner_cli
+    cli = miner_cli.MinerCLI.__new__(miner_cli.MinerCLI)
+    subs = [{"submission_id": "a", "status": "pending", "changeable": False},
+            {"submission_id": "b", "status": "pending", "changeable": True}]
+    cli.submitter = SimpleNamespace(get_miner_submissions=lambda cid: subs)
+    assert [s["submission_id"] for s in cli.changeable_submissions("c")] == ["b"]
+    old = [{"submission_id": "a", "status": "pending"}, {"submission_id": "x", "status": "fully_evaluated"}]
+    cli.submitter = SimpleNamespace(get_miner_submissions=lambda cid: old)      # an older server
+    assert [s["submission_id"] for s in cli.changeable_submissions("c")] == ["a"]
+
+
+def test_cli_withdraw_without_a_terminal_needs_yes(monkeypatch):
+    from python_scripts import miner_cli
+    cli = miner_cli.MinerCLI.__new__(miner_cli.MinerCLI)
+    called = []
+    cli.submitter = SimpleNamespace(withdraw_submission=lambda c, s: called.append(s))
+    monkeypatch.setattr(miner_cli.sys.stdin, "isatty", lambda: False, raising=False)
+    with pytest.raises(SystemExit):
+        cli.withdraw(submission_id="s1", challenge_id="c1")
+    assert called == []

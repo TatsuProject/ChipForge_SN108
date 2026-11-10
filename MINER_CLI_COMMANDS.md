@@ -217,7 +217,7 @@ any new submission. Each design can be replaced a limited number of times (3 by 
 works while submissions are paused.
 
 ```bash
-python python_scripts/miner_cli.py replace path/to/new_design.zip                       # your only pending submission
+python python_scripts/miner_cli.py replace path/to/new_design.zip                       # your only queued submission
 python python_scripts/miner_cli.py replace path/to/new_design.zip --submission-id <id>  # a specific one
 ```
 
@@ -234,7 +234,7 @@ you can submit again right away (no cooldown follows a withdrawn design). You ca
 challenge (the server's limit; `withdrawals_per_hotkey` in the public rules).
 
 ```bash
-python python_scripts/miner_cli.py withdraw                          # your only pending submission (asks to confirm)
+python python_scripts/miner_cli.py withdraw                          # your only queued submission (asks to confirm)
 python python_scripts/miner_cli.py withdraw --submission-id <id>     # a specific one
 python python_scripts/miner_cli.py withdraw --submission-id <id> --yes   # no confirmation prompt
 ```

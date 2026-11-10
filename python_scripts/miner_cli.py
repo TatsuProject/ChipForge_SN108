@@ -694,6 +694,14 @@ class MinerCLI:
         path.write_bytes(result["content"])
         logger.info(f"Saved {path} ({len(result['content']):,} bytes, sha256 {result['sha256'][:16]}...)")
 
+    def changeable_submissions(self, challenge_id: str) -> List[Dict]:
+        """Our submissions that can still be replaced or withdrawn (queued, no validator has touched them). Servers
+        that do not say (no 'changeable' field): every pending one."""
+        subs = self.submitter.get_miner_submissions(challenge_id)
+        if any('changeable' in s for s in subs):
+            return [s for s in subs if s.get('changeable')]
+        return [s for s in subs if str(s.get('status', '')).lower() == 'pending']
+
     def withdraw(self, submission_id: Optional[str] = None, challenge_id: Optional[str] = None, yes: bool = False):
         """Withdraw a queued submission (submission_id, or our only pending one): it leaves the competition and the
         attempt is refunded."""
@@ -707,10 +715,10 @@ class MinerCLI:
                 sys.exit(1)
             challenge_id = challenge['challenge_id']
         if not submission_id:
-            queued = [s for s in self.submitter.get_miner_submissions(challenge_id)
-                      if str(s.get('status', '')).lower() == 'pending']
+            queued = self.changeable_submissions(challenge_id)
             if len(queued) != 1:
-                logger.error(f"You have {len(queued)} pending submissions: give the one to withdraw with --submission-id")
+                logger.error(f"You have {len(queued)} submissions that can still be withdrawn (queued, not picked up "
+                             f"by a validator): give the one to withdraw with --submission-id")
                 for s in queued:
                     logger.error(f"  {s.get('submission_id')}")
                 sys.exit(1)
@@ -719,6 +727,9 @@ class MinerCLI:
         logger.info(f"Withdrawing: {submission_id}")
         logger.info("It leaves the competition for good and your attempt is refunded. Only possible while no validator")
         logger.info("has picked it up.")
+        if not yes and not sys.stdin.isatty():
+            logger.error("Not withdrawn: no terminal to confirm in. Run it again with --yes.")
+            sys.exit(1)
         if not yes and input("Type 'withdraw' to confirm: ").strip().lower() != "withdraw":
             logger.info("Not withdrawn.")
             return
@@ -791,10 +802,10 @@ class MinerCLI:
         
         # Replacing: which queued submission (the only one still queued, unless given)
         if replace and not replaces:
-            queued = [s for s in self.submitter.get_miner_submissions(challenge_id)
-                      if str(s.get('status', '')).lower() == 'pending']
+            queued = self.changeable_submissions(challenge_id)
             if len(queued) != 1:
-                logger.error(f"You have {len(queued)} pending submissions: give the one to replace with --submission-id")
+                logger.error(f"You have {len(queued)} submissions that can still be replaced (queued, not picked up "
+                             f"by a validator): give the one to replace with --submission-id")
                 for s in queued:
                     logger.error(f"  {s.get('submission_id')}")
                 sys.exit(1)
