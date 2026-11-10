@@ -157,6 +157,7 @@ class APIClient:
         # A design the EDA server started this much later than it was sent (it waited for the machine) and that then
         # ran out of time is not held against it: a validator fault, not a timeout (EDA server 1.0.2+ reports starts)
         self.eda_late_start_seconds = float(os.getenv("EDA_LATE_START_SECONDS", "900"))
+        self._bg_cancels: set = set()          # cancels in flight (a reference keeps each task alive)
         # Requests to the challenge server in progress at once (it refuses more than VALIDATOR_MAX_IN_FLIGHT)
         self._server_slots = asyncio.Semaphore(max(1, int(os.getenv("SERVER_MAX_PARALLEL", "4"))))
         # Seconds kept free before the server's evaluation deadline for submitting scores
@@ -921,11 +922,24 @@ class APIClient:
         self._v2_evaluator = (sha, time.monotonic())
         return sha
 
+    @staticmethod
+    def _eda_admin_headers() -> Dict[str, str]:
+        """The EDA server's admin token (V2_ADMIN_TOKEN there, EDA_ADMIN_TOKEN here), if the operator set one."""
+        token = os.getenv("EDA_ADMIN_TOKEN", "").strip()
+        return {'Authorization': f"Bearer {token}"} if token else {}
+
+    def _cancel_later(self, rid: str, reason: str) -> None:
+        """Cancel in the background: stopping a running stage can take minutes, and the result must reach the
+        challenge server before its deadline (the EDA server enforces the deadline itself as well)."""
+        task = asyncio.create_task(self._v2_cancel(rid, reason))
+        self._bg_cancels.add(task)
+        task.add_done_callback(self._bg_cancels.discard)
+
     async def _v2_jobs(self) -> Optional[list]:
         """Unfinished evaluations on the EDA server (GET /v2/jobs, EDA server 1.0.2+); None when it cannot say."""
         try:
-            async with self.session.get(f"{self.eda_server_url}/v2/jobs",
-                                        timeout=aiohttp.ClientTimeout(total=30)) as response:
+            async with self.session.get(f"{self.eda_server_url}/v2/jobs", headers=self._eda_admin_headers(),
+                                        timeout=aiohttp.ClientTimeout(total=10)) as response:
                 if response.status != 200:
                     return None
                 body = await json_capped(response)
@@ -937,7 +951,8 @@ class APIClient:
         """Stop an evaluation on the EDA server (POST /v2/cancel, EDA server 1.0.2+): a design nobody waits for must
         not hold the machine (the evaluator runs one at a time). False when the EDA server cannot cancel."""
         try:
-            async with self.session.post(f"{self.eda_server_url}/v2/cancel/{rid}", headers={'X-CF-Reason': reason[:150]},
+            async with self.session.post(f"{self.eda_server_url}/v2/cancel/{rid}",
+                                         headers={'X-CF-Reason': reason[:150], **self._eda_admin_headers()},
                                          timeout=aiohttp.ClientTimeout(total=660)) as response:
                 ok = response.status == 200
         except Exception as e:
@@ -956,7 +971,7 @@ class APIClient:
         for job in jobs or []:
             rid = str(job.get('request_id') or '')
             if rid and rid not in keep and mine in rid:
-                await self._v2_cancel(rid, "the validator moved on to another design")
+                self._cancel_later(rid, "the validator moved on to another design")
 
     async def _evaluate_v2(self, submissions: Dict[str, bytes], deadline: Optional[datetime],
                            evaluator_sha256: Optional[str] = None, batch_id: Optional[str] = None) -> Dict[str, Dict]:
@@ -1112,7 +1127,7 @@ class APIClient:
             if job.get('started_unix'):
                 started_at = min(started_at or float(job['started_unix']), float(job['started_unix']))
         if cancel:
-            await self._v2_cancel(rid, "out of time: the validator gave up on it")
+            self._cancel_later(rid, "out of time: the validator gave up on it")
         waited = (started_at - sent_wall) if started_at else budget
         ran = (time.time() - started_at) if started_at else 0.0
         timing = {'budget_s': round(max(0.0, budget), 1), 'waited_s': round(max(0.0, waited), 1),

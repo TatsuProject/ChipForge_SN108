@@ -531,6 +531,7 @@ async def test_out_of_time_after_running_is_a_timeout_and_the_run_is_cancelled(v
     assert ev["timeout_occurred"] is True
     details = json.loads(ev["evaluation_details"])
     assert details["code"] == "VALIDATOR_EDA_NO_RESULT" and details["timing"]["waited_s"] < 1
+    await asyncio.gather(*client._bg_cancels)
     assert server.cancelled == [server.forms[0]["request_id"]]          # the EDA server is free for the next design
 
 
@@ -543,6 +544,7 @@ async def test_a_design_that_never_got_the_machine_is_not_blamed(v2_client):
     details = json.loads(ev["evaluation_details"])
     assert not ev.get("timeout_occurred") and details["code"] == "VALIDATOR_EDA_BUSY"
     assert "FAILED" in ev["evaluation_notes"].upper()                   # the server: a validator fault, requeued
+    await asyncio.gather(*client._bg_cancels)
     assert server.cancelled == [server.forms[0]["request_id"]]
 
 
@@ -569,7 +571,8 @@ async def test_abandoned_evaluations_are_cancelled_before_a_new_design(v2_client
     client.chain_commits["s1"] = _commit(b"PK")
     ev = (await client.evaluate_submissions_with_eda_server("c1", {"s1": b"PK"}, batch_id="split-abc"))["s1"]
     assert ev["overall_score"] == 4.06
-    assert server.cancelled == [f"old1-{me}-aaaa-abababab", f"old2-{me}-bbbb-abababab"]
+    await asyncio.gather(*client._bg_cancels)
+    assert sorted(server.cancelled) == [f"old1-{me}-aaaa-abababab", f"old2-{me}-bbbb-abababab"]
 
 
 async def test_a_batch_keeps_all_its_designs(v2_client):
@@ -600,3 +603,37 @@ async def test_the_eda_server_enforced_the_deadline_first(v2_client):
     ev = (await client.evaluate_submissions_with_eda_server("c1", {"s1": b"PK"}, deadline=_short(client, 0.3),
                                                             batch_id="split-abc"))["s1"]
     assert ev["timeout_occurred"] is True                              # it ran its time: a timeout, as if we gave up
+
+
+async def test_a_slow_cancel_does_not_delay_the_report(v2_client):
+    """Pen test: stopping a running stage can take minutes; the result must not wait for it."""
+    import time as _t
+    server = V2Server(_v2_result(), polls=10 ** 6, phase="running")
+    client = v2_client(server)
+    client.chain_commits["s1"] = _commit(b"PK")
+    started = []
+
+    async def slow_cancel(rid, reason):
+        started.append(rid)
+        await asyncio.sleep(3)
+        return True
+    client._v2_cancel = slow_cancel
+    t0 = _t.monotonic()
+    ev = (await client.evaluate_submissions_with_eda_server("c1", {"s1": b"PK"}, deadline=_short(client, 0.5),
+                                                            batch_id="split-abc"))["s1"]
+    assert _t.monotonic() - t0 < 1.5 and ev["timeout_occurred"] is True
+    assert started == [server.forms[0]["request_id"]]                  # the cancel was started, not awaited
+    for t in list(client._bg_cancels):
+        t.cancel()
+
+
+async def test_the_admin_token_goes_with_jobs_and_cancel(v2_client, monkeypatch):
+    monkeypatch.setenv("EDA_ADMIN_TOKEN", "s3cret")
+    seen = []
+    server = V2Server(_v2_result())
+    client = v2_client(lambda kw: (seen.append(kw), server(kw))[1])
+    assert client._eda_admin_headers() == {"Authorization": "Bearer s3cret"}
+    await client._v2_jobs()
+    await client._v2_cancel("r1", "test")
+    assert all(k.get("headers", {}).get("Authorization") == "Bearer s3cret" for k in seen
+               if k.get("url", "").endswith(("/v2/jobs", "/v2/cancel/r1")))
