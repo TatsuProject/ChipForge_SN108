@@ -110,6 +110,8 @@ def parse_server_time(value) -> Optional[datetime]:
         return None
 
 
+MIN_EDA_DEADLINE_BUFFER = 300      # seconds before the server's evaluation deadline the validator stops waiting
+
 class APIClient:
     """Handles API communications for the validator"""
     
@@ -167,7 +169,9 @@ class APIClient:
         # Requests to the challenge server in progress at once (it refuses more than VALIDATOR_MAX_IN_FLIGHT)
         self._server_slots = asyncio.Semaphore(max(1, int(os.getenv("SERVER_MAX_PARALLEL", "4"))))
         # Seconds kept free before the server's evaluation deadline for submitting scores
-        self.eda_deadline_buffer = int(os.getenv("EDA_DEADLINE_BUFFER_SECONDS", "90"))
+        # The validator stops an evaluation this long before the server's deadline, to cancel it on the EDA server
+        # and report in time. At least 300 s: a .env value can raise it, never lower it (older .env files say 30)
+        self.eda_deadline_buffer = max(MIN_EDA_DEADLINE_BUFFER, int(os.getenv("EDA_DEADLINE_BUFFER_SECONDS") or 0))
         # Of an EDA request's budget, the EDA server gets all but this: a run stopped at its limit
         # then answers with where it stopped (EDA_TIMEOUT_<STAGE>) before this validator gives up.
         self.eda_answer_margin = 60

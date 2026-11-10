@@ -317,7 +317,8 @@ older than this ignores the two fields and applies its own `EVAL_TIMEOUT_S`.
 
 **npu-v2 (Quest 2): an evaluation nobody waits for is stopped.** The v2 evaluator runs one evaluation at a
 time and never stops one by itself. With every design the validator sends its deadline (`X-CF-Deadline`,
-the server's evaluation deadline minus `EDA_DEADLINE_BUFFER_SECONDS`); when it runs out of time it cancels
+the server's evaluation deadline minus `EDA_DEADLINE_BUFFER_SECONDS`, at least 300 s, to cancel and report in
+time); when it runs out of time it cancels
 the run (`POST /v2/cancel`), and before each new design it cancels its own other unfinished evaluations
 (`GET /v2/jobs`). The EDA server (1.0.2+) also enforces the deadline by itself, so a validator that crashed or
 restarted leaves nothing running. A design that ran its time and did not finish timed out (the design's

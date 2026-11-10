@@ -712,3 +712,9 @@ async def test_killed_designs_are_not_reported(tmp_path, monkeypatch):
     state = MagicMock()
     ok = await BatchProcessor(Api(), state).process_batch("c1", {"batch_id": "split-x", "submissions": [{"submission_id": "s1"}]})
     assert ok is False and submitted == [] and state.mark_batch_evaluated.called
+
+
+def test_the_validator_keeps_at_least_five_minutes(client_factory, monkeypatch):
+    for env, expected in (("30", 300), ("", 300), ("600", 600)):
+        monkeypatch.setenv("EDA_DEADLINE_BUFFER_SECONDS", env)
+        assert client_factory(lambda kw: FakeResponse()).eda_deadline_buffer == expected
