@@ -372,6 +372,11 @@ class V2Server:
             return FakeResponse(json_data=self.health)
         if url.endswith("/v2/jobs"):
             return FakeResponse(json_data={"jobs": self.unfinished}) if self.jobs else FakeResponse(status=404, json_data={})
+        if url.endswith("/v2/cancel-all"):
+            if not self.jobs:
+                return FakeResponse(status=404, json_data={})
+            self.cancelled.append("ALL")
+            return FakeResponse(json_data={"cancelled": [j.get("request_id") for j in self.unfinished]})
         if "/v2/cancel/" in url:
             if not self.jobs:
                 return FakeResponse(status=404, json_data={})
@@ -637,3 +642,73 @@ async def test_the_admin_token_goes_with_jobs_and_cancel(v2_client, monkeypatch)
     await client._v2_cancel("r1", "test")
     assert all(k.get("headers", {}).get("Authorization") == "Bearer s3cret" for k in seen
                if k.get("url", "").endswith(("/v2/jobs", "/v2/cancel/r1")))
+
+
+
+# --- kill switch -------------------------------------------------------------------------------------------
+
+async def test_a_kill_cancels_everything_once(v2_client):
+    server = V2Server(_v2_result())
+    client = v2_client(server)
+    assert await client.on_kill({"epoch": 1, "active": True, "reason": "evaluator bug"})
+    assert server.cancelled == ["ALL"]
+    assert not await client.on_kill({"epoch": 1, "active": True})              # the same kill: once
+    assert server.cancelled == ["ALL"]
+    # remembered across a restart (a new client on the same data directory)
+    again = v2_client(server)
+    assert again.kill_epoch == 1 and not await again.on_kill({"epoch": 1, "active": True})
+
+
+async def test_a_kill_that_already_ended_is_only_remembered(v2_client):
+    server = V2Server(_v2_result())
+    client = v2_client(server)
+    assert not await client.on_kill({"epoch": 4, "active": False})
+    assert server.cancelled == [] and client.kill_epoch == 4
+
+
+async def test_a_kill_stops_the_evaluation_in_progress(v2_client):
+    server = V2Server(_v2_result(), polls=10 ** 6, phase="running")
+    client = v2_client(server)
+    client.chain_commits["s1"] = _commit(b"PK")
+
+    async def kill_soon():
+        await asyncio.sleep(0.2)
+        await client.on_kill({"epoch": 1, "active": True})
+    killer = asyncio.create_task(kill_soon())
+    ev = (await client.evaluate_submissions_with_eda_server("c1", {"s1": b"PK"}, deadline=_short(client, 60),
+                                                            batch_id="split-abc"))["s1"]
+    await killer
+    assert json.loads(ev["evaluation_details"])["code"] == "VALIDATOR_KILLED" and not ev.get("timeout_occurred")
+    assert "ALL" in server.cancelled
+
+
+async def test_the_kill_watch_reads_the_sync(v2_client):
+    server = V2Server(_v2_result())
+    client = v2_client(server)
+    states = iter([{"kill": {"epoch": 0}}, {"kill": {"epoch": 2, "active": True, "reason": "x"}}])
+
+    async def fake_sync(fresh=False):
+        return next(states, {"kill": {"epoch": 2, "active": True}})
+    client._sync = fake_sync
+    stop = asyncio.Event()
+    task = asyncio.create_task(client.kill_watch(stop, every_seconds=0.05))
+    await asyncio.sleep(0.3)
+    stop.set(); await task
+    assert server.cancelled == ["ALL"] and client.kill_epoch == 2
+
+
+async def test_killed_designs_are_not_reported(tmp_path, monkeypatch):
+    from validator_utils.batch_processor import BatchProcessor
+    monkeypatch.setenv("CHIPFORGE_DATA_DIR", str(tmp_path))
+    submitted = []
+    killed = {"overall_score": 0.0, "evaluation_details": json.dumps({"code": "VALIDATOR_KILLED"})}
+
+    class Api:
+        already_evaluated = set()
+        async def download_batch_submissions(self, cid, batch): return {"s1": b"PK"}
+        async def evaluate_submissions_with_eda_server(self, *a, **k): return {"s1": killed}
+        async def submit_all_evaluations(self, cid, evs):
+            submitted.append(evs); return {s: True for s in evs}
+    state = MagicMock()
+    ok = await BatchProcessor(Api(), state).process_batch("c1", {"batch_id": "split-x", "submissions": [{"submission_id": "s1"}]})
+    assert ok is False and submitted == [] and state.mark_batch_evaluated.called

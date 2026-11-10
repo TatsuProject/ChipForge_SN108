@@ -158,6 +158,12 @@ class APIClient:
         # ran out of time is not held against it: a validator fault, not a timeout (EDA server 1.0.2+ reports starts)
         self.eda_late_start_seconds = float(os.getenv("EDA_LATE_START_SECONDS", "900"))
         self._bg_cancels: set = set()          # cancels in flight (a reference keeps each task alive)
+        # Kill switch: the newest kill (challenge server KILL_EVALUATIONS) this validator has acted on
+        self._kill_file = data_path('kill_epoch.json')
+        try:
+            self.kill_epoch = int(json.loads(self._kill_file.read_text()).get('epoch', 0))
+        except (OSError, ValueError, AttributeError):
+            self.kill_epoch = 0
         # Requests to the challenge server in progress at once (it refuses more than VALIDATOR_MAX_IN_FLIGHT)
         self._server_slots = asyncio.Semaphore(max(1, int(os.getenv("SERVER_MAX_PARALLEL", "4"))))
         # Seconds kept free before the server's evaluation deadline for submitting scores
@@ -962,6 +968,70 @@ class APIClient:
             logger.info(f"Cancelled EDA request {rid}: {reason}")
         return ok
 
+    async def kill_watch(self, stop: Optional[asyncio.Event] = None, every_seconds: float = 20) -> None:
+        """Kill switch: every `every_seconds`, also while an evaluation runs, look for a new kill in /validator/sync.
+        On one: the evaluation in progress stops without a result (the server took the design back) and the EDA
+        server cancels everything and cleans up."""
+        while stop is None or not stop.is_set():
+            try:
+                state = await self._sync(fresh=True)
+                await self.on_kill((state or {}).get('kill'))
+            except Exception as e:
+                logger.warning(f"Kill switch check failed: {e}")
+            if stop is None:
+                await asyncio.sleep(every_seconds)
+            else:
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=every_seconds)
+                except asyncio.TimeoutError:
+                    pass
+
+    async def on_kill(self, kill: Optional[Dict]) -> bool:
+        """Act on a kill from the challenge server once (its epoch is remembered across restarts). A kill that ended
+        before this validator saw it (e.g. it was offline) is only remembered. True when it acted."""
+        if not isinstance(kill, dict):
+            return False
+        try:
+            epoch = int(kill.get('epoch') or 0)
+        except (TypeError, ValueError):
+            return False
+        if epoch <= self.kill_epoch:
+            return False
+        self.kill_epoch = epoch                     # evaluations in progress stop at their next check
+        try:
+            self._kill_file.parent.mkdir(parents=True, exist_ok=True)
+            self._kill_file.write_text(json.dumps({'epoch': epoch}))
+        except OSError as e:
+            logger.warning(f"Could not remember kill #{epoch}: {e}")
+        if not kill.get('active'):
+            logger.info(f"Kill switch #{epoch} ended before this validator saw it: nothing to do")
+            return False
+        reason = str(kill.get('reason') or 'kill switch')[:150]
+        logger.warning(f"KILL SWITCH #{epoch} from the challenge server ({reason}): stopping every evaluation and "
+                       "cancelling everything on the EDA server")
+        await self._v2_kill_all(f"kill switch #{epoch}: {reason}")
+        return True
+
+    async def _v2_kill_all(self, reason: str) -> None:
+        """Cancel every unfinished evaluation on the EDA server and clean up (POST /v2/cancel-all, EDA server 1.0.2+;
+        an older one has nothing to cancel with)."""
+        try:
+            async with self.session.post(f"{self.eda_server_url}/v2/cancel-all",
+                                         headers={'X-CF-Reason': reason[:150], **self._eda_admin_headers()},
+                                         timeout=aiohttp.ClientTimeout(total=1800)) as response:
+                body = await json_capped(response)
+                if response.status == 200:
+                    logger.warning(f"EDA server: {len((body or {}).get('cancelled') or [])} evaluation(s) cancelled, "
+                                   "disk cleaned up")
+                    return
+                if response.status in (404, 405):
+                    logger.error("The EDA server cannot cancel evaluations (older than 1.0.2): update it "
+                                 "(git pull && docker compose up -d --build eda-gateway in chipforge_eda_server)")
+                    return
+                logger.error(f"EDA server cancel-all: HTTP {response.status} {str(body)[:300]}")
+        except Exception as e:
+            logger.error(f"EDA server cancel-all failed: {e}")
+
     async def _v2_reconcile(self, keep: set) -> None:
         """Before a new design: cancel this validator's other unfinished evaluations. It works on one assignment (one
         batch) at a time, so any other is one it gave up on (deadline passed, restart, the server moved on), and the
@@ -1041,6 +1111,7 @@ class APIClient:
             return self._v2_failure(submission_id, 'VALIDATOR_EDA_NOT_READY', "The validator's EDA server is not ready.")
         submitter = json.loads(chain_commit).get('hotkey') if chain_commit else None
         rid = self.eda_request_id(submission_id, batch_id, sha)
+        kill_epoch_at_start = self.kill_epoch
         legacy = await self._legacy_running(submission_id, sha)
         if legacy:                      # started before the update to 1.0.4: wait for that run, start no second one
             logger.info(f"{submission_id}: the EDA server is still running it under its pre-1.0.4 request ID; "
@@ -1073,6 +1144,10 @@ class APIClient:
                                                 where='eda_server')
             sent_wall, ran_wall = time.time(), None
             while True:
+                if self.kill_epoch > kill_epoch_at_start:
+                    # kill switch: the server took the design back; no result is sent for it
+                    return self._v2_failure(submission_id, 'VALIDATOR_KILLED', "Stopped by the challenge server's "
+                                            "kill switch; the design went back to the queue.")
                 async with self.session.get(f"{self.eda_server_url}/v2/status/{rid}",
                                             timeout=aiohttp.ClientTimeout(total=60)) as response:
                     if response.status == 202 and ran_wall is None and \

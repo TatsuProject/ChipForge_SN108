@@ -35,6 +35,13 @@ def result_line(ev: Dict) -> str:
     return f"not scored ({code or status or 'system fault'})"
 
 
+def _code(ev: Dict) -> Optional[str]:
+    try:
+        return (json.loads(ev.get('evaluation_details') or '{}') or {}).get('code')
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
 class BatchProcessor:
     """Handles batch processing logic for the validator"""
 
@@ -80,6 +87,14 @@ class BatchProcessor:
             if not evaluations:
                 logger.error(f"Batch {batch_id}: the EDA server returned no evaluation")
                 return False
+            killed = [sid for sid, ev in evaluations.items() if _code(ev) == 'VALIDATOR_KILLED']
+            if killed:
+                # kill switch: the server took these designs back; a result for them would be refused
+                logger.warning(f"Batch {batch_id}: {len(killed)} design(s) stopped by the kill switch, not reported")
+                evaluations = {sid: ev for sid, ev in evaluations.items() if sid not in killed}
+                if not evaluations:
+                    self.state.mark_batch_evaluated(batch_id)
+                    return False
 
             # Every result names the evaluator it belongs to, also those the validator made itself (no time
             # left, EDA server unreachable ...): the server refuses a result without it

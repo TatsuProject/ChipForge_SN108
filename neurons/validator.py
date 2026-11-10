@@ -380,6 +380,8 @@ class ChipForgeValidator:
         # Liveness file for the container healthcheck (goes stale if the loop blocks)
         self._background(heartbeat_loop("validator", self._stop))
         self._background(self.status.loop(self._stop))
+        # Kill switch: seen within seconds, also in the middle of an evaluation
+        self._background(self.api_client.kill_watch(self._stop))
         if self.reward_ladder.active:
             logger.info("Weights follow the stored record ladder until the challenge server is reached")
 
