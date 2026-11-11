@@ -298,7 +298,7 @@ What the validator does each cycle:
 - polls the challenge server (`/validator/sync`, one cached request for challenge, batch, bans and test-case version),
 - downloads the exposed batch (each file's sha256 is checked against the hash the miner signed) and evaluates it on the EDA server within the batch's deadline,
 - submits scores,
-- pays the record ladder: puts weights on chain as soon as the places change (a probation ends, a window closes, a new record; within the chain's rate limit) and refreshes them every `WEIGHTS_REFRESH_SECONDS`. The places share `MINER_EMISSION_PERCENTAGE` percent, the rest is burned to UID 0.
+- pays the record ladder: puts weights on chain as soon as the places change (a probation ends, a window closes, a new record; within the chain's rate limit) and refreshes them every `WEIGHTS_REFRESH_SECONDS`. Weights run on their own clock (checked every `WEIGHTS_LOOP_SECONDS`, 60), also while a design is being evaluated. The places share `MINER_EMISSION_PERCENTAGE` percent, the rest is burned to UID 0.
 
 How many submissions a batch holds is set by the challenge server, and the validator evaluates all of
 them. `EDA_MAX_CONCURRENCY` only limits how many it sends to its EDA server at once (the rest wait their

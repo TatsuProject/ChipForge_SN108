@@ -429,3 +429,56 @@ def test_malformed_ladder_records_are_rejected(tmp_path, monkeypatch, record_pat
     rec = {"hotkey": "5H", "submission_id": "s", "score": 1.0, "qualified_at": "2026-10-01T00:00:00+00:00",
            "pays_from": "2026-10-01T00:00:00+00:00", "pays_until": "2026-10-02T00:00:00+00:00"}
     assert not RewardLadder().update({"size": 3, "decay_ratio": 0.6, "records": [{**rec, **record_patch}]})
+
+
+# --- weights on their own clock (neuron 1.0.10) ---------------------------------------------------
+
+async def test_weights_go_on_chain_while_a_design_is_evaluated(tmp_path, monkeypatch):
+    """The evaluation cycle can take hours; weights must not wait for it (a probation ended at 06:02 reached the
+    chain at 06:52, when an evaluation finished)."""
+    import asyncio
+    soon = datetime.now(timezone.utc)
+    paying = {"submission_id": "p", "hotkey": "HD", "score": 1, "qualified_at": (soon - timedelta(hours=30)).isoformat(),
+              "pays_from": (soon - timedelta(hours=6)).isoformat(), "pays_until": (soon + timedelta(hours=18)).isoformat()}
+    v = _validator(tmp_path, monkeypatch, {"reward_ladder": {"size": 3, "decay_ratio": 0.6, "records": []}})
+    v._weights_lock = asyncio.Lock()
+    v._last_weight_status = 0.0
+    v._last_metagraph_sync = datetime.now(timezone.utc)
+    v.metagraph_sync_seconds = 3600
+    v.config = SimpleNamespace(miner_emission_percentage=10.0)
+    v.api_client.server_miner_emission_percentage = lambda challenge=None: (False, None)
+    applied = []
+
+    async def fake_apply(target, banned, ban_emissions):
+        applied.append(target.places)
+    v.weight_manager.apply = fake_apply
+    v.weight_manager.status_line = lambda *a: ""
+    stop = asyncio.Event()
+
+    async def evaluation():                       # the main loop is busy for the whole test
+        await asyncio.sleep(0.5)
+    loop = asyncio.create_task(v.weights_loop(stop, every_seconds=0.05))
+    busy = asyncio.create_task(evaluation())
+    await asyncio.sleep(0.15)
+    assert applied and applied[-1] == ()          # burning: no record being paid yet
+    v.api_client._sync_state = {"reward_ladder": {"size": 3, "decay_ratio": 0.6, "records": [paying]}}  # probation over
+    await asyncio.sleep(0.15)
+    assert not busy.done() and applied[-1] == (("HD", 1.0),)   # on chain while the evaluation still runs
+    stop.set(); await loop; await busy
+
+
+async def test_weights_are_never_submitted_twice_at_once(tmp_path, monkeypatch):
+    import asyncio
+    v = _validator(tmp_path, monkeypatch, {"reward_ladder": {"size": 3, "decay_ratio": 0.6, "records": []}})
+    v._weights_lock = asyncio.Lock()
+    v._last_weight_status = 0.0
+    inside, most = [0], [0]
+
+    async def slow_apply(target, banned, ban_emissions):
+        inside[0] += 1; most[0] = max(most[0], inside[0])
+        await asyncio.sleep(0.05)
+        inside[0] -= 1
+    v.weight_manager.apply = slow_apply
+    v.weight_manager.status_line = lambda *a: ""
+    await asyncio.gather(*(v.apply_weights() for _ in range(5)))
+    assert most[0] == 1

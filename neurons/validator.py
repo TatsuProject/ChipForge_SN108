@@ -15,6 +15,7 @@ import aiohttp
 import logging
 import traceback
 import argparse
+from typing import Optional
 from datetime import datetime, timezone
 
 # Import validator utilities
@@ -128,8 +129,30 @@ class ChipForgeValidator:
                 logger.info(line)
         return target
 
+    async def weights_loop(self, stop: asyncio.Event, every_seconds: Optional[float] = None) -> None:
+        """Weights go on chain on their own clock, also while a design is evaluated (up to ~7 h): a probation that
+        ends or a new record reaches the chain within a minute, not when the evaluation is over. The ladder comes
+        from the latest /validator/sync, which the kill-switch watcher refreshes every 20 s."""
+        every = every_seconds or float(os.getenv("WEIGHTS_LOOP_SECONDS", "60"))
+        while not stop.is_set():
+            try:
+                await self.maybe_sync_metagraph()
+                if self.api_client is not None:
+                    self.apply_emission_percentage(*self.api_client.server_miner_emission_percentage())
+                await self.apply_weights()
+            except Exception as e:                   # never let the weights loop die
+                logger.error(f"Weights loop: {e}")
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=every)
+            except asyncio.TimeoutError:
+                pass
+
     async def apply_weights(self):
-        """Submit the current target if it changed or a refresh is due (see WeightManager)."""
+        """Submit the current target if it changed or a refresh is due (see WeightManager). One at a time."""
+        async with self._weights_lock:
+            await self._apply_weights()
+
+    async def _apply_weights(self):
         try:
             self.refresh_reward_ladder()
             target = self.effective_target()
@@ -151,7 +174,8 @@ class ChipForgeValidator:
                 (now - self._last_metagraph_sync).total_seconds() < self.metagraph_sync_seconds:
             return
         try:
-            await asyncio.to_thread(self.metagraph.sync, subtensor=self.subtensor)
+            async with self._weights_lock:           # never while weights are being submitted
+                await asyncio.to_thread(self.metagraph.sync, subtensor=self.subtensor)
             self._last_metagraph_sync = now
         except Exception as e:
             logger.error(f"Metagraph sync failed: {e}")
@@ -212,6 +236,7 @@ class ChipForgeValidator:
         self._last_banned_sync = {}
         self._background_tasks = set()
         self._last_weight_status = 0.0
+        self._weights_lock = asyncio.Lock()
 
         self.session = None
         # Created with the HTTP session (initialize_components)
@@ -382,6 +407,8 @@ class ChipForgeValidator:
         self._background(self.status.loop(self._stop))
         # Kill switch: seen within seconds, also in the middle of an evaluation
         self._background(self.api_client.kill_watch(self._stop))
+        # Weights on their own clock: also while a design is evaluated (the cycle below can take hours)
+        self._background(self.weights_loop(self._stop))
         if self.reward_ladder.active:
             logger.info("Weights follow the stored record ladder until the challenge server is reached")
 
@@ -397,9 +424,6 @@ class ChipForgeValidator:
                     pause = min(300, 30 * (2 ** min(consecutive_errors - 1, 4)))
                     logger.error(f"Error in evaluation cycle (#{consecutive_errors}): {e}; retrying in {pause}s")
                     logger.error(traceback.format_exc())
-
-                # Put the current target on chain (on change or periodic refresh)
-                await self.apply_weights()
 
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=pause)
